@@ -1,4 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 100">
+  <defs>
+    <!-- Angular 2023 gradient (red → purple, diagonal) -->
+    <linearGradient id="ng-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#F44336"/>
+      <stop offset="50%" stop-color="#E91E63"/>
+      <stop offset="100%" stop-color="#9C27B0"/>
+    </linearGradient>
+  </defs>
+
   <!-- Background -->
   <rect width="720" height="100" fill="#0d1117" rx="12"/>
 
@@ -18,13 +27,13 @@
     <animateTransform attributeName="transform" type="translate" dur="12s" repeatCount="indefinite"
       keyTimes="0;0.1667;0.1833;0.187;0.9833;1"
       values="0 0;0 0;0 -15;0 15;0 15;0 0"/>
+    <!-- Angular 2023 shield with gradient -->
     <g transform="translate(100, 50)">
-      <path d="M0,-22 L20,-13 L17,12 L0,22 L-17,12 L-20,-13 Z" fill="#DD0031"/>
-      <path d="M0,-22 L0,22 L17,12 L20,-13 Z" fill="#C3002F"/>
-      <path d="M0,-11 L-7,10 L-4,10 L-2.5,4.5 L2.5,4.5 L4,10 L7,10 Z" fill="white"/>
-      <rect x="-3" y="0.5" width="6" height="2.5" rx="0.5" fill="#DD0031"/>
+      <path d="M0,-24 C1,-24 3,-23.5 4,-23 L21,-14 C22.5,-13 23,-11.5 23,-10 L20,13 C19.5,15 18.5,16.5 17,17.5 L2,25 C0.5,25.5 -0.5,25.5 -2,25 L-17,17.5 C-18.5,16.5 -19.5,15 -20,13 L-23,-10 C-23,-11.5 -22.5,-13 -21,-14 L-4,-23 C-3,-23.5 -1,-24 0,-24 Z" fill="url(#ng-grad)"/>
+      <path d="M0,-12 L-8,11 L-4.5,11 L-2.5,5 L2.5,5 L4.5,11 L8,11 Z" fill="white" opacity="0.9"/>
+      <rect x="-3.5" y="0" width="7" height="2.5" rx="0.5" fill="url(#ng-grad)"/>
     </g>
-    <text x="135" y="54" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="bold" fill="#DD0031">Angular</text>
+    <text x="135" y="54" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="bold" fill="#E91E63">Angular</text>
   </g>
 
   <!-- REACT -->
