@@ -64,11 +64,17 @@
     <text x="135" y="54" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="bold" fill="#41B883">Vue.js</text>
   </g>
 
-  <!-- ==================== CENTER ARROW ==================== -->
-  <g transform="translate(360, 50)">
-    <line x1="-40" y1="0" x2="40" y2="0" stroke="#8b949e" stroke-width="2.5" stroke-linecap="round"/>
-    <polygon points="-40,0 -30,-6 -30,6" fill="#8b949e"/>
-    <polygon points="40,0 30,-6 30,6" fill="#8b949e"/>
+  <!-- ==================== CENTER: SHUFFLE ICON ==================== -->
+  <g transform="translate(360, 50)" fill="none" stroke="#8b949e" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Arrow 1: bottom-left → top-right (passes OVER arrow 2) -->
+    <path d="M-20,12 L-4,12 L16,-12 L20,-12"/>
+    <!-- Arrow 2: top-left → bottom-right (gap where it passes BEHIND arrow 1) -->
+    <path d="M-20,-12 L-4,-12 L-0.5,-7"/>
+    <path d="M5,3 L16,12 L20,12"/>
+    <!-- Arrowhead top-right -->
+    <polyline points="14,-18 20,-12 14,-6" fill="none"/>
+    <!-- Arrowhead bottom-right -->
+    <polyline points="14,6 20,12 14,18" fill="none"/>
   </g>
 
   <!-- ==================== RIGHT SLOT ==================== -->
