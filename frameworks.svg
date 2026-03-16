@@ -65,17 +65,17 @@
   </g>
 
   <!-- ==================== CENTER: SHUFFLE ICON ==================== -->
-  <!-- 4 endpoints form a 3:2 rectangle (30x20), smooth cubic bezier curves -->
-  <g transform="translate(360, 50)" fill="none" stroke="#8b949e" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-    <!-- Arrow 1: top-left → bottom-right (passes BEHIND arrow 2) -->
-    <path d="M-15,-10 C0,-10 -6,4 0,0"/>
-    <path d="M4,4 C10,10 5,10 15,10"/>
-    <!-- Arrow 2: bottom-left → top-right (passes OVER arrow 1) -->
-    <path d="M-15,10 C5,10 -5,-10 15,-10"/>
-    <!-- Arrowhead bottom-right -->
-    <polyline points="10,5 15,10 10,15" fill="none"/>
-    <!-- Arrowhead top-right -->
-    <polyline points="10,-15 15,-10 10,-5" fill="none"/>
+  <!-- 4 endpoints form a 3:2 rectangle, smooth cubic bezier S-curves -->
+  <g transform="translate(360, 50)" fill="none" stroke="#8b949e" stroke-width="3" stroke-linecap="round">
+    <!-- Arrow 1: top-left → bottom-right (BEHIND, wide gap at crossing) -->
+    <path d="M-17,-10 C -11,-10 -8.5,-8.75 -6,-6.5"/>
+    <path d="M6,6.5 C 8.5,8.75 9,10 11,10"/>
+    <!-- Arrow 2: bottom-left → top-right (OVER, continuous S-curve, ends horizontal) -->
+    <path d="M-17,10 C 0,10 0,-10 11,-10"/>
+    <!-- Arrowhead top-right (solid triangle) -->
+    <polygon points="18,-10 11,-15 11,-5" fill="#8b949e" stroke="none"/>
+    <!-- Arrowhead bottom-right (solid triangle) -->
+    <polygon points="18,10 11,5 11,15" fill="#8b949e" stroke="none"/>
   </g>
 
   <!-- ==================== RIGHT SLOT ==================== -->
