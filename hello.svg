@@ -20,6 +20,6 @@
 
   <g transform="translate(330, 30)">
     <text font-size="30">👋</text>
-    <animateTransform attributeName="transform" type="rotate" values="0 345 45;20 345 45;-10 345 45;15 345 45;0 345 45" dur="1.5s" repeatCount="indefinite"/>
+    <animateTransform attributeName="transform" type="rotate" values="0 15 15;20 15 15;-10 15 15;15 15 15;0 15 15" dur="1.5s" repeatCount="indefinite"/>
   </g>
 </svg>
