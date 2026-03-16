@@ -72,7 +72,15 @@
     <path d="M6,6.5 C 8.5,8.75 11,10 17,10"/>
     <!-- Arrow 2: bottom-left → top-right (OVER, continuous S-curve, ends horizontal) -->
     <path d="M-17,10 C 0,10 0,-10 17,-10"/>
-    <!-- Arrowheads temporarily removed for debugging -->
+    <!-- Arrowheads: 2h:1w ratio, height = 3× stroke width (13.5×6.75) -->
+    <!-- Left end of arrow 1 (top-left, pointing left) -->
+    <polygon points="-23.75,-10 -17,-16.75 -17,-3.25" fill="#8b949e" stroke="none"/>
+    <!-- Right end of arrow 1 (bottom-right, pointing right) -->
+    <polygon points="23.75,10 17,3.25 17,16.75" fill="#8b949e" stroke="none"/>
+    <!-- Left end of arrow 2 (bottom-left, pointing left) -->
+    <polygon points="-23.75,10 -17,3.25 -17,16.75" fill="#8b949e" stroke="none"/>
+    <!-- Right end of arrow 2 (top-right, pointing right) -->
+    <polygon points="23.75,-10 17,-16.75 17,-3.25" fill="#8b949e" stroke="none"/>
   </g>
 
   <!-- ==================== RIGHT SLOT ==================== -->
