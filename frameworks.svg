@@ -3,25 +3,25 @@
   <rect width="720" height="120" fill="#0d1117" rx="12"/>
 
   <!--
-    Animation: 12.5s cycle, 5 states with alternating left/right transitions
-    Each state: 2s hold + 0.5s transition = 2.5s per step
+    Animation: 12s cycle, 5 states with alternating left/right transitions
+    Each state: 2s hold + 0.4s transition (0.2s fade-out then 0.2s fade-in, no overlap)
 
     State 0 (0-2s):      Angular <=> Django   then LEFT transition
-    State 1 (2.5-4.5s):  React   <=> Django   then RIGHT transition
-    State 2 (5-7s):      React   <=> Hono     then LEFT transition
-    State 3 (7.5-9.5s):  Vue     <=> Hono     then RIGHT transition
-    State 4 (10-12s):    Vue     <=> Django    then LEFT transition (loop)
+    State 1 (2.4-4.4s):  React   <=> Django   then RIGHT transition
+    State 2 (4.8-6.8s):  React   <=> Hono     then LEFT transition
+    State 3 (7.2-9.2s):  Vue     <=> Hono     then RIGHT transition
+    State 4 (9.6-11.6s): Vue     <=> Django    then LEFT transition (loop)
   -->
 
   <!-- ==================== LEFT SLOT ==================== -->
 
-  <!-- ANGULAR (visible: states 0, wraps from end of 4->0 transition) -->
+  <!-- ANGULAR (visible: state 0, fades in at end from state 4 transition) -->
   <g opacity="0">
-    <animate attributeName="opacity" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.16;0.2;0.96;1"
+    <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.1667;0.1833;0.9833;1"
       values="1;1;0;0;1"/>
-    <animateTransform attributeName="transform" type="translate" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.16;0.2;0.204;0.96;1"
+    <animateTransform attributeName="transform" type="translate" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.1667;0.1833;0.187;0.9833;1"
       values="0 0;0 0;0 -15;0 15;0 15;0 0"/>
     <!-- Angular shield -->
     <g transform="translate(160, 38)">
@@ -35,11 +35,11 @@
 
   <!-- REACT (visible: states 1, 2) -->
   <g opacity="0">
-    <animate attributeName="opacity" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.16;0.2;0.56;0.6;1"
+    <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.1833;0.2;0.5667;0.5833;1"
       values="0;0;1;1;0;0"/>
-    <animateTransform attributeName="transform" type="translate" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.16;0.2;0.56;0.6;0.604;1"
+    <animateTransform attributeName="transform" type="translate" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.1833;0.2;0.5667;0.5833;0.587;1"
       values="0 15;0 15;0 0;0 0;0 -15;0 15;0 15"/>
     <!-- React atom -->
     <g transform="translate(160, 38)">
@@ -53,12 +53,12 @@
 
   <!-- VUE.JS (visible: states 3, 4) -->
   <g opacity="0">
-    <animate attributeName="opacity" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.56;0.6;0.96;1"
-      values="0;0;1;1;0"/>
-    <animateTransform attributeName="transform" type="translate" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.56;0.6;0.96;1"
-      values="0 15;0 15;0 0;0 0;0 -15"/>
+    <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.5833;0.6;0.9667;0.9833;1"
+      values="0;0;1;1;0;0"/>
+    <animateTransform attributeName="transform" type="translate" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.5833;0.6;0.9667;0.9833;0.987;1"
+      values="0 15;0 15;0 0;0 0;0 -15;0 15;0 15"/>
     <!-- Vue chevrons -->
     <g transform="translate(160, 38)">
       <path d="M-24,-24 L0,22 L24,-24 L14.5,-24 L0,2 L-14.5,-24 Z" fill="#34495E"/>
@@ -78,11 +78,11 @@
 
   <!-- DJANGO (visible: states 0, 1, 4 — wraps around) -->
   <g opacity="0">
-    <animate attributeName="opacity" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.36;0.4;0.76;0.8;1"
+    <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.3667;0.3833;0.7833;0.8;1"
       values="1;1;0;0;1;1"/>
-    <animateTransform attributeName="transform" type="translate" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.36;0.4;0.404;0.76;0.8;1"
+    <animateTransform attributeName="transform" type="translate" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.3667;0.3833;0.387;0.7833;0.8;1"
       values="0 0;0 0;0 -15;0 15;0 15;0 0;0 0"/>
     <!-- Django "D" letterform (unmodified style, official green) -->
     <g transform="translate(560, 38)">
@@ -94,11 +94,11 @@
 
   <!-- HONO (visible: states 2, 3) -->
   <g opacity="0">
-    <animate attributeName="opacity" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.36;0.4;0.76;0.8;1"
+    <animate attributeName="opacity" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.3833;0.4;0.7667;0.7833;1"
       values="0;0;1;1;0;0"/>
-    <animateTransform attributeName="transform" type="translate" dur="12.5s" repeatCount="indefinite"
-      keyTimes="0;0.36;0.4;0.76;0.8;0.804;1"
+    <animateTransform attributeName="transform" type="translate" dur="12s" repeatCount="indefinite"
+      keyTimes="0;0.3833;0.4;0.7667;0.7833;0.787;1"
       values="0 15;0 15;0 0;0 0;0 -15;0 15;0 15"/>
     <!-- Hono flame -->
     <g transform="translate(560, 38)">
