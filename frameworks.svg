@@ -3,10 +3,11 @@
   <rect width="720" height="120" fill="#0d1117" rx="12"/>
 
   <!--
-    Animation cycle: 18s total (LCM of 3 left logos × 2 right logos = 6 steps × 3s each)
+    Animation cycle: 18s total (LCM of 3 left logos x 2 right logos = 6 steps x 3s each)
     Each step: 0.5s fade-in + 2s hold + 0.5s fade-out
-    Left:  Angular(0,3) → React(1,4) → Vue(2,5)
-    Right: Django(0,2,4) → Hono(1,3,5)
+    Slide-up: logos slide upward on exit, enter from below on appear (all visible motion is upward)
+    Left:  Angular(0,3) -> React(1,4) -> Vue(2,5)
+    Right: Django(0,2,4) -> Hono(1,3,5)
   -->
 
   <!-- ==================== LEFT SLOT: Frontend Frameworks ==================== -->
@@ -16,6 +17,9 @@
     <animate attributeName="opacity" dur="18s" repeatCount="indefinite"
       keyTimes="0;0.1389;0.1667;0.5;0.5278;0.6389;0.6667;1"
       values="1;1;0;0;1;1;0;0"/>
+    <animateTransform attributeName="transform" type="translate" dur="18s" repeatCount="indefinite"
+      keyTimes="0;0.1389;0.1667;0.17;0.5;0.5278;0.6389;0.6667;0.67;1"
+      values="0 0;0 0;0 -15;0 15;0 15;0 0;0 0;0 -15;0 15;0 15"/>
     <!-- Angular shield -->
     <g transform="translate(160, 38)">
       <path d="M0,-26 L24,-16 L20,14 L0,26 L-20,14 L-24,-16 Z" fill="#DD0031"/>
@@ -31,6 +35,9 @@
     <animate attributeName="opacity" dur="18s" repeatCount="indefinite"
       keyTimes="0;0.1667;0.1944;0.3056;0.3333;0.6667;0.6944;0.8056;0.8333;1"
       values="0;0;1;1;0;0;1;1;0;0"/>
+    <animateTransform attributeName="transform" type="translate" dur="18s" repeatCount="indefinite"
+      keyTimes="0;0.1667;0.1944;0.3056;0.3333;0.34;0.6667;0.6944;0.8056;0.8333;0.84;1"
+      values="0 15;0 15;0 0;0 0;0 -15;0 15;0 15;0 0;0 0;0 -15;0 15;0 15"/>
     <!-- React atom -->
     <g transform="translate(160, 38)">
       <circle cx="0" cy="0" r="4.5" fill="#61DAFB"/>
@@ -46,6 +53,9 @@
     <animate attributeName="opacity" dur="18s" repeatCount="indefinite"
       keyTimes="0;0.3333;0.3611;0.4722;0.5;0.8333;0.8611;0.9722;1"
       values="0;0;1;1;0;0;1;1;0"/>
+    <animateTransform attributeName="transform" type="translate" dur="18s" repeatCount="indefinite"
+      keyTimes="0;0.3333;0.3611;0.4722;0.5;0.51;0.8333;0.8611;0.9722;1"
+      values="0 15;0 15;0 0;0 0;0 -15;0 15;0 15;0 0;0 0;0 -15"/>
     <!-- Vue chevrons -->
     <g transform="translate(160, 38)">
       <path d="M-24,-24 L0,22 L24,-24 L14.5,-24 L0,2 L-14.5,-24 Z" fill="#34495E"/>
@@ -56,11 +66,9 @@
 
   <!-- ==================== CENTER ARROW ==================== -->
   <g transform="translate(360, 48)">
-    <!-- Double arrow  ⟺  -->
     <line x1="-40" y1="0" x2="40" y2="0" stroke="#8b949e" stroke-width="2.5" stroke-linecap="round"/>
     <polygon points="-40,0 -30,-6 -30,6" fill="#8b949e"/>
     <polygon points="40,0 30,-6 30,6" fill="#8b949e"/>
-    <text x="0" y="30" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="10" fill="#8b949e">frontend ⟷ backend</text>
   </g>
 
   <!-- ==================== RIGHT SLOT: Backend Frameworks ==================== -->
@@ -70,14 +78,15 @@
     <animate attributeName="opacity" dur="18s" repeatCount="indefinite"
       keyTimes="0;0.1389;0.1667;0.3333;0.3611;0.4722;0.5;0.6667;0.6944;0.8056;0.8333;1"
       values="1;1;0;0;1;1;0;0;1;1;0;0"/>
+    <animateTransform attributeName="transform" type="translate" dur="18s" repeatCount="indefinite"
+      keyTimes="0;0.1389;0.1667;0.17;0.3333;0.3611;0.4722;0.5;0.51;0.6667;0.6944;0.8056;0.8333;0.84;1"
+      values="0 0;0 0;0 -15;0 15;0 15;0 0;0 0;0 -15;0 15;0 15;0 0;0 0;0 -15;0 15;0 15"/>
     <!-- Django "D" letterform (unmodified style, official green) -->
     <g transform="translate(560, 38)">
       <rect x="-22" y="-24" width="44" height="48" rx="4" fill="#092E20"/>
       <text x="0" y="8" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="32" font-weight="bold" fill="white">D</text>
     </g>
-    <text x="560" y="80" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" fill="#092E20">
-      <tspan fill="#44B78B">django</tspan>
-    </text>
+    <text x="560" y="80" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="13" font-weight="bold" fill="#44B78B">django</text>
   </g>
 
   <!-- HONO (visible at steps 1, 3, 5: 3-6s, 9-12s, 15-18s) -->
@@ -85,6 +94,9 @@
     <animate attributeName="opacity" dur="18s" repeatCount="indefinite"
       keyTimes="0;0.1667;0.1944;0.3056;0.3333;0.5;0.5278;0.6389;0.6667;0.8333;0.8611;0.9722;1"
       values="0;0;1;1;0;0;1;1;0;0;1;1;0"/>
+    <animateTransform attributeName="transform" type="translate" dur="18s" repeatCount="indefinite"
+      keyTimes="0;0.1667;0.1944;0.3056;0.3333;0.34;0.5;0.5278;0.6389;0.6667;0.67;0.8333;0.8611;0.9722;1"
+      values="0 15;0 15;0 0;0 0;0 -15;0 15;0 15;0 0;0 0;0 -15;0 15;0 15;0 0;0 0;0 -15"/>
     <!-- Hono flame -->
     <g transform="translate(560, 38)">
       <path d="M0,24 C-8,14 -18,-2 -14,-16 C-10,-8 -4,-2 0,-8 C4,-2 10,-8 14,-16 C18,-2 8,14 0,24 Z" fill="#FF5B11"/>
