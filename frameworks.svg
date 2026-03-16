@@ -7,8 +7,6 @@
     </linearGradient>
   </defs>
 
-  <!-- Background -->
-  <rect width="720" height="100" fill="#0d1117" rx="12"/>
 
   <!--
     Animation: 12s cycle, 5 states with alternating left/right transitions
