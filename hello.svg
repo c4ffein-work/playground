@@ -18,7 +18,7 @@
     <animate attributeName="opacity" values="0;0;1" dur="2s" fill="freeze"/>
   </text>
 
-  <g transform="translate(20, 48)">
+  <g transform="translate(13, 48)">
     <g>
       <text font-size="30">👋</text>
       <animateTransform attributeName="transform" type="rotate" values="0 15 15;20 15 15;-10 15 15;15 15 15;0 15 15" dur="1.5s" repeatCount="indefinite"/>
