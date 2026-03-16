@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120">
+  <defs>
+    <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#6e48aa"/>
+      <stop offset="100%" style="stop-color:#9d50bb"/>
+      <animate attributeName="x1" values="0%;100%;0%" dur="3s" repeatCount="indefinite"/>
+      <animate attributeName="x2" values="100%;200%;100%" dur="3s" repeatCount="indefinite"/>
+    </linearGradient>
+  </defs>
+
+  <text x="200" y="55" text-anchor="middle" font-family="Arial, sans-serif" font-size="40" font-weight="bold" fill="url(#grad)">
+    Hi from Claude
+    <animate attributeName="opacity" values="0;1;1" dur="1.5s" fill="freeze"/>
+  </text>
+
+  <text x="200" y="95" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" fill="#666">
+    Welcome to the playground
+    <animate attributeName="opacity" values="0;0;1" dur="2s" fill="freeze"/>
+  </text>
+
+  <g transform="translate(330, 30)">
+    <text font-size="30">👋</text>
+    <animateTransform attributeName="transform" type="rotate" values="0 345 45;20 345 45;-10 345 45;15 345 45;0 345 45" dur="1.5s" repeatCount="indefinite"/>
+  </g>
+</svg>
