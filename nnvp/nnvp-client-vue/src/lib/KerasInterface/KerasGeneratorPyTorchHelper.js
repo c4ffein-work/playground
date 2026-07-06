@@ -10,6 +10,7 @@
 /* eslint class-methods-use-this: ["error", { "exceptMethods": ["generateTuple",
                                                                 "renderValue",
                                                                 "activationModule",
+                                                                "recurrentModule",
                                                                 "isMerge"] }] */
 
 export default class KerasGeneratorPyTorchHelper {
@@ -74,6 +75,19 @@ export default class KerasGeneratorPyTorchHelper {
     }
   }
 
+  // Map a Keras recurrent layer name to its torch.nn module class, or null when the
+  // layer is not a (supported) recurrent layer. These modules are special-cased in
+  // forward() because they return a (output, hidden) tuple rather than a plain tensor.
+  recurrentModule(name) {
+    switch (name) {
+      case 'LSTM': return 'nn.LSTM';
+      case 'GRU': return 'nn.GRU';
+      case 'SimpleRNN':
+      case 'RNN': return 'nn.RNN';
+      default: return null;
+    }
+  }
+
   // Merge layers have no learnable module: they are wired directly in forward().
   isMerge(name) {
     return name === 'Concatenate' || name === 'Add';
@@ -117,6 +131,23 @@ export default class KerasGeneratorPyTorchHelper {
       case 'BatchNormalization':
         // Lazy variant infers num_features; 1d is the dimension-agnostic default.
         return 'nn.LazyBatchNorm1d()';
+      case 'Embedding': {
+        const args = [];
+        if (p.input_dim !== undefined) args.push(this.renderValue(p.input_dim));
+        if (p.output_dim !== undefined) args.push(this.renderValue(p.output_dim));
+        return `nn.Embedding(${args.join(', ')})`;
+      }
+      case 'LSTM':
+      case 'GRU':
+      case 'SimpleRNN':
+      case 'RNN': {
+        // torch has no Lazy recurrent module, so input_size is required. Keras `units`
+        // maps to hidden_size; the input feature size is unknown at design time, so we
+        // default input_size to the same value. batch_first=True matches Keras'
+        // (batch, timesteps, features) layout. The tuple return is unpacked in forward().
+        const units = p.units !== undefined ? this.renderValue(p.units) : '1';
+        return `${this.recurrentModule(name)}(${units}, ${units}, batch_first=True)`;
+      }
       case 'Activation':
         return this.activationModule(p.activation);
       case 'ReLU':
@@ -138,6 +169,18 @@ export default class KerasGeneratorPyTorchHelper {
     const { name } = this.graph[node].keras_data;
     if (name === 'Input' || name === 'Output' || this.isMerge(name)) return false;
     return this.moduleConstructor(node) !== null;
+  }
+
+  // True when a node is a recurrent module (LSTM/GRU/RNN). Such nodes are real module
+  // nodes but need special forward() handling for their (output, hidden) tuple return.
+  isRecurrentNode(node) {
+    return this.recurrentModule(this.graph[node].keras_data.name) !== null;
+  }
+
+  // Keras recurrent layers return only the last timestep unless return_sequences is set.
+  returnSequences(node) {
+    const { parameterValues: params } = this.graph[node].keras_data;
+    return !!(params && params.return_sequences);
   }
 
   // True when a node maps to nothing we know how to emit -> TODO placeholder.
@@ -168,7 +211,13 @@ export default class KerasGeneratorPyTorchHelper {
     this.list.forEach((node) => {
       const { name } = this.graph[node].keras_data;
       if (name === 'Input' || name === 'Output') return;
-      if (this.isModuleNode(node)) {
+      if (this.isRecurrentNode(node)) {
+        // Recurrent modules return (output, hidden); keep only the output tensor.
+        rs += `    x, _ = self.${this.nodeName(node)}(x)\n`;
+        if (!this.returnSequences(node)) {
+          rs += '    x = x[:, -1, :]\n';
+        }
+      } else if (this.isModuleNode(node)) {
         rs += `    x = self.${this.nodeName(node)}(x)\n`;
       } else if (this.isUnsupportedNode(node)) {
         rs += `    x = x  # TODO: unsupported layer ${name}\n`;
@@ -207,7 +256,17 @@ export default class KerasGeneratorPyTorchHelper {
     this.list.forEach((node) => {
       const { name } = this.graph[node].keras_data;
       if (name === 'Input' || name === 'Output') return;
-      rs += `    ${this.nodeName(node)} = ${this.forwardExpression(node)}\n`;
+      if (this.isRecurrentNode(node)) {
+        // Recurrent modules return (output, hidden); unpack and keep the output tensor.
+        const v = this.nodeName(node);
+        const sources = this.graph[node].sources.map(s => this.nodeName(s));
+        rs += `    ${v}, _ = self.${v}(${sources.join(', ')})\n`;
+        if (!this.returnSequences(node)) {
+          rs += `    ${v} = ${v}[:, -1, :]\n`;
+        }
+      } else {
+        rs += `    ${this.nodeName(node)} = ${this.forwardExpression(node)}\n`;
+      }
     });
     const returned = this.outputs.map(o => this.nodeName(this.graph[o].sources[0]));
     rs += `    return ${returned.length === 1 ? returned[0] : `(${returned.join(', ')})`}\n`;

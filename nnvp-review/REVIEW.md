@@ -56,6 +56,19 @@ original unknown-layer fallback. No behavior change (verified against `layer-hel
   `createTreatmentList` topological ordering (linear / branching / diamond / cycles), `isSequential`,
   and Python + JS generation asserting exact output strings.
 
+### 8. Ten improvements in parallel (0006) — nine subagents, merged with zero conflicts
+1. **Dark mode + theme v0.1** — semantic tokens, dark palette + persisted `[data-theme]` toggle, 8 components tokenized.
+2. **Code-split tfjs** — lazy `loadTf.js` + manualChunks; entry bundle **2,674 → 606 kB**, tfjs on-demand.
+3. **Chat hardening** — read-only-by-default guardrail, robust client errors, validation (+23 tests).
+4. **D3 unit tests** — 48 jsdom tests; fixed a real `debugGetBoardState` property bug.
+6. **PyTorch RNN/LSTM/GRU/Embedding** — correct tuple-return forward handling.
+7. **Removed dead `legacy-backend/`** + `docs/datasets.md`.
+8. **Dataset-load error UX** — visible error + Retry (e2e-verified via the blocked fetch).
+9. **tfjs-4 training smoke-test** — synthetic-data `model.fit`, proves v4 training works with no network.
+10. **Accessibility** — ARIA/keyboard/focus-trap pass across 13 components.
+Plus a `playwright.config` `testMatch` fix so the whole-dir e2e run stops colliding with the vitest files.
+Verified together: lint 0/0, **137 unit tests**, build ok, **60/60 non-network e2e**.
+
 ### 7. Four features in parallel (0005) — chat assistant · tutorial · PyTorch · tfjs 4
 Built by four independent subagents (each on the theme-v0.1 base), then merged with a combined
 verification pass (lint 0/0, 60 unit tests, build on tfjs 4, e2e 11/11 + 32/32 non-network core).

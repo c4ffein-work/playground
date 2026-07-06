@@ -10,5 +10,18 @@ export default defineConfig({
     alias: {
       '@': path.resolve(__dirname, './src')
     }
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        // Isolate the (large) TensorFlow.js library into its own chunk. It is
+        // reached only through a dynamic import() (see src/lib/tf/loadTf.js), so
+        // it stays out of the initial graph-editor bundle and is fetched lazily
+        // when the Training zone / dataset features are first used.
+        manualChunks(id) {
+          if (id.includes('node_modules/@tensorflow')) return 'tensorflow';
+        }
+      }
+    }
   }
 })

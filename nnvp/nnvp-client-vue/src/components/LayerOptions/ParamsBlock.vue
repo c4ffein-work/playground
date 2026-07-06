@@ -1,10 +1,25 @@
 <template>
   <div class="ParamsBlock">
-    <div class="ParamsBlock layer-title" @click="toggleLayer()">
+    <div
+      class="ParamsBlock layer-title"
+      role="button"
+      tabindex="0"
+      :aria-expanded="!isClosed"
+      :aria-label="'Toggle ' + title + ' parameters'"
+      @click="toggleLayer()"
+      @keydown.enter.prevent="toggleLayer()"
+      @keydown.space.prevent="toggleLayer()"
+    >
       {{title}}
       <div class="layer-title-actions">
-        <span v-if="layerType" class="help-icon" @click.stop="openModal" title="Learn about this layer">?</span>
-        <div class="arrow">▲</div>
+        <button
+          v-if="layerType"
+          type="button"
+          class="help-icon"
+          :aria-label="'Learn about the ' + layerType + ' layer'"
+          @click.stop="openModal"
+        >?</button>
+        <div class="arrow" aria-hidden="true">▲</div>
       </div>
     </div>
     <div class="ParamsBlock params-list" v-bind:class="{ closed: isClosed}">
@@ -14,8 +29,14 @@
     <!-- Help Modal -->
     <Teleport to="body">
       <div v-if="showModal" class="layer-help-modal-overlay" @click="closeModal">
-        <div class="layer-help-modal-container" @click.stop>
-          <button class="layer-help-modal-close" @click="closeModal">&times;</button>
+        <div
+          class="layer-help-modal-container"
+          role="dialog"
+          aria-modal="true"
+          :aria-label="layerType + ' layer help'"
+          @click.stop
+        >
+          <button class="layer-help-modal-close" aria-label="Close" @click="closeModal">&times;</button>
           <div class="layer-help-modal-body">
             <div v-html="getLayerHelp()"></div>
           </div>
@@ -50,6 +71,11 @@ export default {
     closeModal() {
       this.showModal = false;
     },
+    handleEscape(event) {
+      if (event.key === 'Escape' && this.showModal) {
+        this.closeModal();
+      }
+    },
     getLayerHelp() {
       return layerHelp[this.layerType] || `
         <h2>${this.layerType}</h2>
@@ -57,6 +83,12 @@ export default {
         <p>Check the <a href="https://keras.io/api/layers/" target="_blank">Keras documentation</a> for more details.</p>
       `;
     },
+  },
+  mounted() {
+    document.addEventListener('keydown', this.handleEscape);
+  },
+  beforeUnmount() {
+    document.removeEventListener('keydown', this.handleEscape);
   },
 };
 </script>
@@ -119,6 +151,8 @@ export default {
 .help-icon {
   width: 18px;
   height: 18px;
+  padding: 0;
+  border: none;
   border-radius: 50%;
   background: #000000;
   color: #ffffff;
@@ -135,6 +169,16 @@ export default {
 .help-icon:hover {
   background: #333333;
   transform: scale(1.1);
+}
+
+.help-icon:focus-visible {
+  outline: 2px solid #000000;
+  outline-offset: 2px;
+}
+
+.ParamsBlock.layer-title:focus-visible {
+  outline: 2px solid #000000;
+  outline-offset: -2px;
 }
 
 /* Modal styling - matching CompileOptions theme */

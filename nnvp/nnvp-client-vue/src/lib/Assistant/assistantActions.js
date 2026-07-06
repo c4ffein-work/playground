@@ -43,10 +43,14 @@ export default class AssistantActions {
   // the layer: take the catalog's KerasLayer, clone it, hand the clone to
   // $d3Interface.addLayer(...). Returns the created layer's id and type.
   addLayer(typeName) {
+    if (typeof typeName !== 'string' || typeName.trim() === '') {
+      throw new Error('addLayer requires a non-empty layer type name (a string).');
+    }
     const catalog = this.kerasInterface.getLayerList();
     const template = catalog[typeName];
     if (template === undefined) {
-      throw new Error(`Unknown layer type "${typeName}".`);
+      const available = Object.keys(catalog).join(', ');
+      throw new Error(`Unknown layer type "${typeName}". Available types: ${available}.`);
     }
     const model = this.requireModel();
     const beforeIds = new Set(model.d3Layers.map(layer => layer.id));
@@ -71,6 +75,15 @@ export default class AssistantActions {
 
   // Set a parameter value on a layer, found by its id.
   setParam(layerId, paramName, value) {
+    if (layerId === null || layerId === undefined || layerId === '') {
+      throw new Error('setParam requires a layer id (see list_layers for valid ids).');
+    }
+    if (typeof paramName !== 'string' || paramName.trim() === '') {
+      throw new Error('setParam requires a non-empty parameter name (a string).');
+    }
+    if (value === undefined) {
+      throw new Error('setParam requires a value to set.');
+    }
     const layer = this.d3Interface.findLayerById(layerId);
     if (layer === null || layer === undefined) {
       throw new Error(`No layer with id "${layerId}".`);

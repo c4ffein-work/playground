@@ -13,7 +13,7 @@
     ></div>
 
     <!-- Floating instruction card, bottom-center -->
-    <div class="tutorial-card" role="dialog" aria-label="Tutorial step">
+    <div ref="card" class="tutorial-card" role="dialog" aria-label="Tutorial step" tabindex="-1">
       <div class="tutorial-card-header">
         <span class="tutorial-progress">Step {{ currentStep + 1 }} / {{ totalSteps }}</span>
         <button class="tutorial-exit" type="button" @click="exit">Exit</button>
@@ -86,6 +86,9 @@ export default {
     // Bound handlers reused for subscribe/unsubscribe.
     this.stateChangeHandler = () => this.checkCompletion();
     this.reposition = () => this.updateHighlight();
+    this.handleKeydown = (event) => {
+      if (this.active && event.key === 'Escape') this.exit();
+    };
     if (this.active) this.startTutorial();
   },
   beforeUnmount() {
@@ -99,16 +102,21 @@ export default {
       this.$d3Interface.on('selection-changed', this.stateChangeHandler);
       window.addEventListener('resize', this.reposition);
       window.addEventListener('scroll', this.reposition, true);
+      document.addEventListener('keydown', this.handleKeydown);
       // Poll as a backup: some state changes (e.g. editing a parameter value)
       // do not necessarily emit graph-changed.
       this.pollTimer = setInterval(() => this.checkCompletion(), 500);
-      this.$nextTick(() => this.refreshState());
+      this.$nextTick(() => {
+        this.refreshState();
+        if (this.$refs.card) this.$refs.card.focus();
+      });
     },
     teardown() {
       this.$d3Interface.off('graph-changed', this.stateChangeHandler);
       this.$d3Interface.off('selection-changed', this.stateChangeHandler);
       window.removeEventListener('resize', this.reposition);
       window.removeEventListener('scroll', this.reposition, true);
+      document.removeEventListener('keydown', this.handleKeydown);
       if (this.pollTimer) {
         clearInterval(this.pollTimer);
         this.pollTimer = null;
@@ -184,7 +192,7 @@ export default {
 /* Coachmark ring around the current target element */
 .tutorial-highlight {
   position: fixed;
-  border: 2px solid #2563eb;
+  border: 2px solid var(--accent);
   border-radius: 10px;
   box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.25), 0 0 0 9999px rgba(0, 0, 0, 0.04);
   transition: all 0.2s ease;
@@ -204,7 +212,7 @@ export default {
   padding: 16px 18px;
   box-sizing: border-box;
   font-family: var(--font-regular);
-  color: #000000;
+  color: var(--text-primary);
   pointer-events: auto; /* the card itself is interactive */
 }
 
@@ -218,20 +226,20 @@ export default {
 .tutorial-progress {
   font-weight: var(--font-weight-semibold);
   font-size: 13px;
-  color: #2563eb;
+  color: var(--accent);
 }
 
 .tutorial-exit {
   background: transparent;
   border: none;
-  color: #6b7280;
+  color: var(--text-muted);
   font-size: 13px;
   cursor: pointer;
   padding: 2px 6px;
 }
 
 .tutorial-exit:hover {
-  color: #000000;
+  color: var(--text-primary);
 }
 
 .tutorial-title {
@@ -244,7 +252,7 @@ export default {
   margin: 0 0 14px 0;
   font-size: 14px;
   line-height: 1.45;
-  color: #374151;
+  color: var(--text-muted);
 }
 
 .tutorial-card-footer {
@@ -258,16 +266,17 @@ export default {
   margin-right: auto;
   font-size: 13px;
   font-weight: var(--font-weight-medium);
-  color: #16a34a;
+  color: var(--success);
 }
 
 .tutorial-btn {
   font-family: var(--font-regular);
   font-size: 14px;
   padding: 6px 14px;
-  border: 1px solid #cccccc;
+  border: 1px solid var(--input-border);
   border-radius: 8px;
-  background-color: #ffffff;
+  background-color: var(--bg-input);
+  color: var(--text-primary);
   cursor: pointer;
   transition: transform 0.15s ease;
 }
@@ -282,8 +291,8 @@ export default {
 }
 
 .tutorial-btn-primary {
-  background-color: #2563eb;
-  border-color: #2563eb;
-  color: #ffffff;
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
 }
 </style>

@@ -1,7 +1,7 @@
 From dd08eeb8b618a76fd6810bb393673a62dc6a94ad Mon Sep 17 00:00:00 2001
 From: c4ffein <c4ffein.work@gmail.com>
 Date: Mon, 6 Jul 2026 08:03:26 +0000
-Subject: [PATCH 2/5] Fix selection-changed notify guard and add
+Subject: [PATCH 2/6] Fix selection-changed notify guard and add
  deselect->empty-panel regression test
 
 - D3GraphEditor.notifySelectionChanged: guard on the callback's existence

@@ -2,7 +2,14 @@
   <div class="chat-assistant">
     <!-- Chat panel -->
     <Transition name="chat-panel">
-      <div v-if="open" class="chat-panel floating-panel">
+      <div
+        v-if="open"
+        id="chat-panel"
+        ref="panel"
+        class="chat-panel floating-panel"
+        role="dialog"
+        aria-label="Assistant"
+      >
         <div class="chat-header">
           <div class="chat-title">Assistant</div>
           <div class="chat-header-actions">
@@ -21,6 +28,7 @@
               placeholder="sk-ant-..."
               autocomplete="off"
             >
+            <span v-if="apiKeyWarning" class="chat-field-warning">{{ apiKeyWarning }}</span>
           </label>
           <label class="chat-field">
             <span>Model</span>
@@ -33,6 +41,36 @@
           <div class="chat-settings-actions">
             <button class="chat-btn" @click="saveSettings">Save</button>
           </div>
+        </div>
+
+        <!-- Guardrail: read-only vs allowed-to-edit mode. Read-only is the
+             default so the assistant cannot mutate the model without opt-in. -->
+        <div class="chat-mode-row">
+          <span class="chat-mode-label">Mode</span>
+          <div class="chat-mode-toggle" role="group" aria-label="Assistant mode">
+            <button
+              type="button"
+              :class="['chat-mode-btn', { active: !allowEdits }]"
+              :aria-pressed="!allowEdits"
+              @click="setMode(false)"
+            >
+              Read-only
+            </button>
+            <button
+              type="button"
+              :class="['chat-mode-btn', { active: allowEdits }]"
+              :aria-pressed="allowEdits"
+              @click="setMode(true)"
+            >
+              Allow edits
+            </button>
+          </div>
+        </div>
+        <div v-if="allowEdits" class="chat-mode-hint chat-mode-hint-warn">
+          The assistant can modify your model (add/delete layers, change parameters).
+        </div>
+        <div v-else class="chat-mode-hint">
+          Read-only: the assistant can inspect and generate code, but not change the model.
         </div>
 
         <div class="chat-messages" ref="messagesEl">
@@ -50,7 +88,9 @@
             <div v-if="message.role === 'tool'" class="chat-tool">
               <span class="chat-tool-name">{{ message.text }}</span>
             </div>
-            <div v-else class="chat-bubble-text">{{ message.text }}</div>
+            <div v-else :class="['chat-bubble-text', { 'chat-bubble-error': message.isError }]">
+              {{ message.text }}
+            </div>
           </div>
           <div v-if="sending" class="chat-message chat-assistant-msg">
             <div class="chat-bubble-text chat-typing">…</div>
@@ -59,8 +99,10 @@
 
         <form class="chat-input-row" @submit.prevent="send">
           <input
+            ref="draftInput"
             v-model="draft"
             class="chat-input"
+            aria-label="Message the assistant"
             placeholder="Message the assistant"
             :disabled="sending || !hasKey"
           >
@@ -76,9 +118,16 @@
     </Transition>
 
     <!-- Bubble toggle -->
-    <button class="chat-fab" aria-label="Toggle assistant" @click="open = !open">
-      <span v-if="!open">💬</span>
-      <span v-else>×</span>
+    <button
+      class="chat-fab"
+      aria-label="Toggle assistant"
+      aria-haspopup="dialog"
+      aria-controls="chat-panel"
+      :aria-expanded="open"
+      @click="toggleOpen"
+    >
+      <span v-if="!open" aria-hidden="true">💬</span>
+      <span v-else aria-hidden="true">×</span>
     </button>
   </div>
 </template>
@@ -89,8 +138,10 @@ import AnthropicClient, {
   STORAGE_KEY,
   STORAGE_BASE_URL,
   STORAGE_MODEL,
+  STORAGE_ALLOW_EDITS,
   DEFAULT_MODEL,
   DEFAULT_BASE_URL,
+  isPlausibleApiKey,
 } from '../../lib/Assistant/anthropicClient';
 
 export default {
@@ -109,7 +160,15 @@ export default {
       defaultModel: DEFAULT_MODEL,
       defaultBaseUrl: DEFAULT_BASE_URL,
       hasKey: false,
+      allowEdits: false,
     };
+  },
+  computed: {
+    // Warn (but do not block) when the pasted key does not look like a key.
+    apiKeyWarning() {
+      if (this.apiKey === '') return '';
+      return isPlausibleApiKey(this.apiKey) ? '' : 'This does not look like a valid API key.';
+    },
   },
   created() {
     if (typeof localStorage !== 'undefined') {
@@ -118,12 +177,39 @@ export default {
       this.baseUrl = localStorage.getItem(STORAGE_BASE_URL) || '';
     }
     this.hasKey = Boolean(this.apiKey);
+    if (typeof localStorage !== 'undefined') {
+      this.allowEdits = localStorage.getItem(STORAGE_ALLOW_EDITS) === 'true';
+    }
     this.actions = new AssistantActions(this.$d3Interface, this.$kerasInterface);
-    this.client = new AnthropicClient(this.actions);
+    this.client = new AnthropicClient(this.actions, { allowEdits: this.allowEdits });
   },
   methods: {
+    toggleOpen() {
+      this.open = !this.open;
+      if (this.open) {
+        // Move focus into the panel: the message field when it is enabled,
+        // otherwise the first available control (e.g. Settings).
+        this.$nextTick(() => {
+          const input = this.$refs.draftInput;
+          if (input && !input.disabled) {
+            input.focus();
+            return;
+          }
+          const panel = this.$refs.panel;
+          const focusable = panel && panel.querySelector('button, input:not([disabled]), [tabindex]');
+          if (focusable) focusable.focus();
+        });
+      }
+    },
     toggleSettings() {
       this.settingsOpen = !this.settingsOpen;
+    },
+    setMode(allowEdits) {
+      this.allowEdits = allowEdits;
+      if (this.client) this.client.setAllowEdits(allowEdits);
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(STORAGE_ALLOW_EDITS, allowEdits ? 'true' : 'false');
+      }
     },
     saveSettings() {
       if (typeof localStorage !== 'undefined') {
@@ -143,8 +229,8 @@ export default {
         if (el) el.scrollTop = el.scrollHeight;
       });
     },
-    pushMessage(role, text) {
-      this.messages.push({ role, text });
+    pushMessage(role, text, isError = false) {
+      this.messages.push({ role, text, isError });
       this.scrollToBottom();
     },
     async send() {
@@ -163,7 +249,7 @@ export default {
         const reply = await this.client.send(this.history, onActivity);
         if (reply) this.pushMessage('assistant', reply);
       } catch (error) {
-        this.pushMessage('assistant', `Error: ${error.message || error}`);
+        this.pushMessage('assistant', `Error: ${(error && error.message) || error}`, true);
       } finally {
         this.sending = false;
         this.scrollToBottom();
@@ -204,6 +290,12 @@ export default {
 
 .chat-fab:hover {
   transform: translateY(-1px);
+}
+
+.chat-fab:focus-visible,
+.chat-icon-btn:focus-visible {
+  outline: 2px solid #000000;
+  outline-offset: 2px;
 }
 
 .chat-panel {
@@ -247,7 +339,7 @@ export default {
 }
 
 .chat-icon-btn:hover {
-  background-color: #f0f0f0;
+  background-color: var(--bg-hover);
 }
 
 .chat-settings {
@@ -256,7 +348,7 @@ export default {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  background-color: #fafafa;
+  background-color: var(--bg-elevated);
 }
 
 .chat-field {
@@ -270,9 +362,61 @@ export default {
   font-size: 13px;
 }
 
+.chat-field-warning {
+  color: #b91c1c;
+  font-size: 11px;
+}
+
 .chat-settings-actions {
   display: flex;
   justify-content: flex-end;
+}
+
+.chat-mode-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.chat-mode-label {
+  font-size: 12px;
+  color: #666666;
+  font-weight: var(--font-weight-medium);
+}
+
+.chat-mode-toggle {
+  display: inline-flex;
+  border: 1px solid #cccccc;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.chat-mode-btn {
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+  border-radius: 0;
+}
+
+.chat-mode-btn.active {
+  background-color: #000000;
+  color: #ffffff;
+}
+
+.chat-mode-hint {
+  padding: 6px 14px;
+  font-size: 11px;
+  color: #666666;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.chat-mode-hint-warn {
+  color: #92400e;
+  background-color: #fef3c7;
 }
 
 .chat-btn {
@@ -289,7 +433,7 @@ export default {
 }
 
 .chat-empty {
-  color: #666666;
+  color: var(--text-muted);
   font-size: 13px;
   text-align: center;
   margin: auto 0;
@@ -313,19 +457,25 @@ export default {
 }
 
 .chat-user .chat-bubble-text {
-  background-color: #000000;
-  color: #ffffff;
+  background-color: var(--fill-strong);
+  color: var(--fill-strong-text);
 }
 
 .chat-assistant .chat-bubble-text,
 .chat-assistant-msg .chat-bubble-text {
-  background-color: #f0f0f0;
-  color: #000000;
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.chat-bubble-error {
+  background-color: #fee2e2 !important;
+  color: #b91c1c !important;
+  border: 1px solid #fca5a5;
 }
 
 .chat-tool {
   font-size: 11px;
-  color: #666666;
+  color: var(--text-muted);
 }
 
 .chat-tool-name {

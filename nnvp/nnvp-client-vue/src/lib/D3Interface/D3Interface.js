@@ -213,10 +213,10 @@ export default class {
       };
     }
     return {
-      layers: this.activeGraph.model.layers.map(l => ({ id: l.id, type: l.type })),
+      layers: this.activeGraph.model.d3Layers.map(l => ({ id: l.id, type: l.type })),
       inputs: this.activeGraph.model.modelInputs,
       outputs: this.activeGraph.model.modelOutputs,
-      edges: this.activeGraph.model.edges.length,
+      edges: this.activeGraph.model.d3Edges.length,
       undoStack: this.undoStackContainer.e.length,
       redoStack: this.redoStackContainer.e.length,
     };

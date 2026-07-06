@@ -56,15 +56,46 @@ function functionalJson() {
 }
 
 // A layer NNVP does not know how to map to torch.nn -> TODO placeholder.
-// Input(1) -> LSTM(2) -> Output(3) (still a linear chain -> sequential path).
+// Input(1) -> GaussianNoise(2) -> Output(3) (still a linear chain -> sequential path).
 function unsupportedJson() {
   return {
     inputs: ['1'],
     outputs: ['3'],
     layers: [
       leaf('1', 'Input', { params: { shape: [10] }, outputLayers: ['2'] }),
+      leaf('2', 'GaussianNoise', { params: { stddev: 0.1 }, inputLayers: ['1'], outputLayers: ['3'] }),
+      leaf('3', 'Output', { inputLayers: ['2'] }),
+    ],
+  };
+}
+
+// Sequential recurrent chain: Input(1) -> LSTM(2, units 8) -> Output(3).
+// return_sequences defaults to false, so forward() slices the last timestep.
+function lstmJson() {
+  return {
+    inputs: ['1'],
+    outputs: ['3'],
+    layers: [
+      leaf('1', 'Input', { params: { shape: [10, 8] }, outputLayers: ['2'] }),
       leaf('2', 'LSTM', { params: { units: 8 }, inputLayers: ['1'], outputLayers: ['3'] }),
       leaf('3', 'Output', { inputLayers: ['2'] }),
+    ],
+  };
+}
+
+// Sequential embedding + recurrent stack, mixing supported layer families:
+// Input(1) -> Embedding(2) -> LSTM(3, return_sequences) -> SimpleRNN(4) -> Dense(5) -> Output(6).
+function mixedJson() {
+  return {
+    inputs: ['1'],
+    outputs: ['6'],
+    layers: [
+      leaf('1', 'Input', { params: { shape: [20] }, outputLayers: ['2'] }),
+      leaf('2', 'Embedding', { params: { input_dim: 5000, output_dim: 32 }, inputLayers: ['1'], outputLayers: ['3'] }),
+      leaf('3', 'LSTM', { params: { units: 64, return_sequences: true }, inputLayers: ['2'], outputLayers: ['4'] }),
+      leaf('4', 'SimpleRNN', { params: { units: 32 }, inputLayers: ['3'], outputLayers: ['5'] }),
+      leaf('5', 'Dense', { params: { units: 10 }, inputLayers: ['4'], outputLayers: ['6'] }),
+      leaf('6', 'Output', { inputLayers: ['5'] }),
     ],
   };
 }
@@ -126,14 +157,58 @@ describe('PyTorch: full generation', () => {
       + 'class Model(nn.Module):\n'
       + '  def __init__(self):\n'
       + '    super().__init__()\n'
-      + '    # TODO: unsupported layer LSTM\n'
+      + '    # TODO: unsupported layer GaussianNoise\n'
       + '\n'
       + '  def forward(self, x):\n'
-      + '    x = x  # TODO: unsupported layer LSTM\n'
+      + '    x = x  # TODO: unsupported layer GaussianNoise\n'
       + '    return x\n',
     );
     // The placeholder must not silently emit wrong torch code.
-    expect(code).not.toContain('nn.LSTM');
+    expect(code).not.toContain('nn.GaussianNoise');
+  });
+
+  it('maps a sequential LSTM, unpacking the (output, hidden) tuple in forward()', () => {
+    const code = new KerasGenerator(lstmJson()).generatePyTorchFromGraph();
+    expect(code).toBe(
+      'import torch\n'
+      + 'import torch.nn as nn\n'
+      + '\n'
+      + '\n'
+      + 'class Model(nn.Module):\n'
+      + '  def __init__(self):\n'
+      + '    super().__init__()\n'
+      + '    self.layer_2 = nn.LSTM(8, 8, batch_first=True)\n'
+      + '\n'
+      + '  def forward(self, x):\n'
+      + '    x, _ = self.layer_2(x)\n'
+      + '    x = x[:, -1, :]\n'
+      + '    return x\n',
+    );
+  });
+
+  it('stacks Embedding + recurrent + dense layers in one sequential model', () => {
+    const code = new KerasGenerator(mixedJson()).generatePyTorchFromGraph();
+    expect(code).toBe(
+      'import torch\n'
+      + 'import torch.nn as nn\n'
+      + '\n'
+      + '\n'
+      + 'class Model(nn.Module):\n'
+      + '  def __init__(self):\n'
+      + '    super().__init__()\n'
+      + '    self.layer_2 = nn.Embedding(5000, 32)\n'
+      + '    self.layer_3 = nn.LSTM(64, 64, batch_first=True)\n'
+      + '    self.layer_4 = nn.RNN(32, 32, batch_first=True)\n'
+      + '    self.layer_5 = nn.LazyLinear(10)\n'
+      + '\n'
+      + '  def forward(self, x):\n'
+      + '    x = self.layer_2(x)\n'
+      + '    x, _ = self.layer_3(x)\n'
+      + '    x, _ = self.layer_4(x)\n'
+      + '    x = x[:, -1, :]\n'
+      + '    x = self.layer_5(x)\n'
+      + '    return x\n',
+    );
   });
 });
 
@@ -160,8 +235,16 @@ describe('PyTorch: layer -> torch.nn mapping', () => {
     expect(ctor('Sigmoid')).toBe('nn.Sigmoid()');
   });
 
+  it('maps embedding and recurrent layers to their torch modules', () => {
+    expect(ctor('Embedding', { input_dim: 1000, output_dim: 64 })).toBe('nn.Embedding(1000, 64)');
+    expect(ctor('LSTM', { units: 8 })).toBe('nn.LSTM(8, 8, batch_first=True)');
+    expect(ctor('GRU', { units: 16 })).toBe('nn.GRU(16, 16, batch_first=True)');
+    expect(ctor('SimpleRNN', { units: 32 })).toBe('nn.RNN(32, 32, batch_first=True)');
+    expect(ctor('RNN', { units: 4 })).toBe('nn.RNN(4, 4, batch_first=True)');
+  });
+
   it('returns null (-> TODO) for an unmapped layer or unknown activation', () => {
-    expect(ctor('LSTM', { units: 8 })).toBeNull();
+    expect(ctor('GaussianNoise', { stddev: 0.1 })).toBeNull();
     expect(ctor('Activation', { activation: 'mish' })).toBeNull();
   });
 });

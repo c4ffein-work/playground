@@ -66,6 +66,16 @@ export default {
       tutorialActive: false,
     };
   },
+  created() {
+    // Re-apply a previously chosen theme. When nothing is stored we leave
+    // data-theme unset so the prefers-color-scheme media query decides.
+    try {
+      const saved = localStorage.getItem('nnvp-theme');
+      if (saved === 'dark' || saved === 'light') {
+        document.documentElement.dataset.theme = saved;
+      }
+    } catch { /* localStorage unavailable (private mode / SSR) */ }
+  },
   mounted() {
     if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
       // eslint-disable-next-line no-alert
@@ -114,6 +124,112 @@ export default {
      pure-black hairline, for a lighter, more modern feel. */
   --panel-border: #e5e7eb;
   --panel-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+
+  /* Semantic tokens (v0.1) - themeable surfaces, text, inputs and accents.
+     Components reference these instead of hardcoded #000/#fff/#ccc so the
+     whole UI can be re-skinned for dark mode from one place. */
+  --bg-elevated: #f9f9f9;                /* dropdowns, settings popovers */
+  --bg-input: #ffffff;                   /* text fields, selects */
+  --bg-hover: rgba(0, 0, 0, 0.06);       /* subtle hover wash */
+
+  --text-primary: #111827;               /* body copy, headings */
+  --text-muted: #6b7280;                 /* secondary / helper text */
+  --text-on-fill: #ffffff;               /* text over a solid fill */
+
+  --input-border: #cccccc;               /* form control hairline */
+
+  --accent: #2563eb;                     /* primary / focus color */
+  --accent-hover: #1d4ed8;
+  --accent-text: #ffffff;                /* text over --accent */
+  --success: #16a34a;
+
+  /* Solid "inverted" fill (dark button on light, light button on dark). */
+  --fill-strong: #111827;
+  --fill-strong-text: #ffffff;
+}
+
+/* Dark palette - applied automatically when the OS prefers dark, unless the
+   user has made an explicit choice via [data-theme] (handled below). */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg-canvas: #0f1115;
+    --bg-panel: #1a1d24;
+    --border-color: #3a3f4b;
+    --panel-border: #2a2f3a;
+    --panel-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+
+    --bg-elevated: #22262f;
+    --bg-input: #12151b;
+    --bg-hover: rgba(255, 255, 255, 0.08);
+
+    --text-primary: #e5e7eb;
+    --text-muted: #9ca3af;
+    --text-on-fill: #ffffff;
+
+    --input-border: #3a3f4b;
+
+    --accent: #3b82f6;
+    --accent-hover: #60a5fa;
+    --accent-text: #0b1120;
+    --success: #22c55e;
+
+    --fill-strong: #e5e7eb;
+    --fill-strong-text: #0f1115;
+  }
+}
+
+/* Explicit user override. Higher specificity than the bare :root above, and
+   declared after the media query, so a forced theme always wins. */
+:root[data-theme="light"] {
+  --bg-canvas: #f0f0f0;
+  --bg-panel: #ffffff;
+  --border-color: #000000;
+  --panel-border: #e5e7eb;
+  --panel-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+
+  --bg-elevated: #f9f9f9;
+  --bg-input: #ffffff;
+  --bg-hover: rgba(0, 0, 0, 0.06);
+
+  --text-primary: #111827;
+  --text-muted: #6b7280;
+  --text-on-fill: #ffffff;
+
+  --input-border: #cccccc;
+
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-text: #ffffff;
+  --success: #16a34a;
+
+  --fill-strong: #111827;
+  --fill-strong-text: #ffffff;
+}
+
+:root[data-theme="dark"] {
+  --bg-canvas: #0f1115;
+  --bg-panel: #1a1d24;
+  --border-color: #3a3f4b;
+  --panel-border: #2a2f3a;
+  --panel-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+
+  --bg-elevated: #22262f;
+  --bg-input: #12151b;
+  --bg-hover: rgba(255, 255, 255, 0.08);
+
+  --text-primary: #e5e7eb;
+  --text-muted: #9ca3af;
+  --text-on-fill: #ffffff;
+
+  --input-border: #3a3f4b;
+
+  --accent: #3b82f6;
+  --accent-hover: #60a5fa;
+  --accent-text: #0b1120;
+  --success: #22c55e;
+
+  --fill-strong: #e5e7eb;
+  --fill-strong-text: #0f1115;
 }
 
 body,html {
@@ -200,19 +316,19 @@ body,html {
 
 /* Adjust spacing for buttons/inputs */
 button, input[type="button"], input[type="submit"], input, select {
-  color: #000000;
+  color: var(--text-primary);
   font-family: var(--font-regular);
   font-weight: var(--font-weight-regular);
-  background-color: #FFFFFF;
-  border: 1px solid #cccccc;
+  background-color: var(--bg-input);
+  border: 1px solid var(--input-border);
   border-radius: 4px;
   padding: 4px 8px;
 }
 
 input.arrows {
-  color: #000000;
-  background-color: #FFFFFF;
-  border: 1px solid #cccccc;
+  color: var(--text-primary);
+  background-color: var(--bg-input);
+  border: 1px solid var(--input-border);
 }
 
 select {
@@ -222,16 +338,16 @@ select {
 }
 
 select:focus {
-  outline: 2px solid #000000;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 select:-moz-focusring {
   color: transparent;
-  text-shadow: 0 0 0 #000000;
+  text-shadow: 0 0 0 var(--text-primary);
 }
 
 option:not(:checked) {
-  color: black;
+  color: var(--text-primary);
 }
 </style>

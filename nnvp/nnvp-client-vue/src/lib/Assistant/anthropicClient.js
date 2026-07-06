@@ -9,14 +9,42 @@
 export const STORAGE_KEY = 'nnvp_anthropic_key';
 export const STORAGE_BASE_URL = 'nnvp_anthropic_base_url';
 export const STORAGE_MODEL = 'nnvp_anthropic_model';
+export const STORAGE_ALLOW_EDITS = 'nnvp_anthropic_allow_edits';
 
 export const DEFAULT_MODEL = 'claude-sonnet-5';
 export const DEFAULT_BASE_URL = 'https://api.anthropic.com';
 export const ANTHROPIC_VERSION = '2023-06-01';
 
+// Tools that mutate the model graph. In read-only mode (the default) these are
+// blocked by runTool and never touch the model; read-only tools (inspection /
+// code generation) always run. Kept as a single source of truth so the UI, the
+// tool descriptions and the runtime guard can never drift apart.
+export const MUTATING_TOOLS = new Set([
+  'add_layer',
+  'set_param',
+  'delete_selected',
+  'undo',
+  'redo',
+]);
+
+export function isMutatingTool(name) {
+  return MUTATING_TOOLS.has(name);
+}
+
+// A minimal sanity check for an Anthropic API key. We deliberately keep this
+// permissive (custom proxies may issue their own keys) but catch obvious
+// mistakes like empty strings or a pasted placeholder.
+export function isPlausibleApiKey(key) {
+  return typeof key === 'string' && key.trim().length >= 8;
+}
+
 export const SYSTEM_PROMPT = [
   'You are the NNVP assistant, embedded in a visual editor that builds Keras models.',
   'You can inspect and modify the model graph through the provided tools.',
+  'Tools marked "[Modifies the model]" change the graph; the others are read-only.',
+  'The user may run you in read-only mode, in which the modifying tools are',
+  'disabled and will return an error — if that happens, do not keep retrying them:',
+  'explain what you would change and suggest the user enable "Allow edits".',
   'Prefer calling a tool over guessing. When you add layers or change parameters,',
   'briefly confirm what you did. Keep answers concise.',
 ].join(' ');
@@ -33,7 +61,7 @@ export function buildTools() {
     },
     {
       name: 'add_layer',
-      description: 'Add a new layer of the given type to the model graph.',
+      description: '[Modifies the model] Add a new layer of the given type to the model graph.',
       input_schema: {
         type: 'object',
         properties: {
@@ -49,7 +77,7 @@ export function buildTools() {
     },
     {
       name: 'set_param',
-      description: 'Set a parameter value on a layer, identified by its id.',
+      description: '[Modifies the model] Set a parameter value on a layer, identified by its id.',
       input_schema: {
         type: 'object',
         properties: {
@@ -78,17 +106,17 @@ export function buildTools() {
     },
     {
       name: 'delete_selected',
-      description: 'Delete the currently selected layers/edges from the graph.',
+      description: '[Modifies the model] Delete the currently selected layers/edges from the graph.',
       input_schema: { type: 'object', properties: {} },
     },
     {
       name: 'undo',
-      description: 'Undo the last graph change.',
+      description: '[Modifies the model] Undo the last graph change.',
       input_schema: { type: 'object', properties: {} },
     },
     {
       name: 'redo',
-      description: 'Redo the last undone graph change.',
+      description: '[Modifies the model] Redo the last undone graph change.',
       input_schema: { type: 'object', properties: {} },
     },
   ];
@@ -130,6 +158,16 @@ export default class AnthropicClient {
     // Allow tests to inject a fetch implementation.
     this.fetchImpl = options.fetch || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : null);
     this.maxTurns = options.maxTurns || 12;
+    // Guardrail: mutating tools only run when edits are explicitly allowed.
+    // Defaults to read-only so the assistant can never modify the model until
+    // the user opts in through the UI.
+    this.allowEdits = Boolean(options.allowEdits);
+  }
+
+  // Toggle the read-only vs allowed-to-edit guardrail at runtime (the UI calls
+  // this when the user flips the mode control).
+  setAllowEdits(value) {
+    this.allowEdits = Boolean(value);
   }
 
   config() {
@@ -152,6 +190,14 @@ export default class AnthropicClient {
     if (handler === undefined) {
       return { content: `Unknown tool "${name}".`, isError: true };
     }
+    if (isMutatingTool(name) && !this.allowEdits) {
+      return {
+        content: `Read-only mode is on, so "${name}" (which modifies the model) is disabled. `
+          + 'Do not retry it. Ask the user to turn on "Allow edits", or use the read-only '
+          + 'tools instead (list_layers, list_layer_types, get_model_summary, generate_code).',
+        isError: true,
+      };
+    }
     try {
       const result = handler(this.actions, input || {});
       const content = typeof result === 'string' ? result : JSON.stringify(result);
@@ -161,38 +207,79 @@ export default class AnthropicClient {
     }
   }
 
+  // Turn a non-2xx HTTP response into a friendly, actionable message. Tries to
+  // pull `error.message` out of the JSON body, falling back to the raw text.
+  static async describeHttpError(response) {
+    let detail = '';
+    try {
+      const body = await response.text();
+      try {
+        const parsed = JSON.parse(body);
+        detail = (parsed && parsed.error && parsed.error.message) ? parsed.error.message : body;
+      } catch {
+        detail = body;
+      }
+    } catch { /* ignore unreadable bodies */ }
+    const known = {
+      400: 'The request was rejected (400 Bad Request).',
+      401: 'Invalid API key (401). Check the key in the assistant settings (⚙).',
+      403: 'Access forbidden (403). This key may not be allowed to use the API.',
+      404: 'Endpoint not found (404). Check the base URL in the assistant settings.',
+      413: 'The conversation is too large to send (413). Start a new chat.',
+      429: 'Rate limited (429). Please wait a moment and try again.',
+      500: 'The Anthropic API had an internal error (500). Try again shortly.',
+      503: 'The Anthropic API is unavailable (503). Try again shortly.',
+      529: 'The Anthropic API is overloaded (529). Try again shortly.',
+    };
+    const base = known[response.status] || `Anthropic API error (status ${response.status}).`;
+    return detail ? `${base} ${detail}` : base;
+  }
+
   async postMessages(messages) {
     const { apiKey, baseUrl, model } = this.config();
     if (!apiKey) {
-      throw new Error('No Anthropic API key set. Add one in the assistant settings.');
+      throw new Error('No Anthropic API key set. Add one in the assistant settings (⚙).');
+    }
+    if (!isPlausibleApiKey(apiKey)) {
+      throw new Error('The Anthropic API key looks malformed. Check it in the settings (⚙).');
     }
     if (!this.fetchImpl) {
-      throw new Error('No fetch implementation available.');
+      throw new Error('No network client is available in this environment.');
     }
-    const response = await this.fetchImpl(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers: {
-        'x-api-key': apiKey,
-        'anthropic-version': ANTHROPIC_VERSION,
-        'anthropic-dangerous-direct-browser-access': 'true',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: this.options.maxTokens || 2048,
-        system: SYSTEM_PROMPT,
-        messages,
-        tools: this.tools(),
-      }),
-    });
+    let response;
+    try {
+      response = await this.fetchImpl(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers: {
+          'x-api-key': apiKey,
+          'anthropic-version': ANTHROPIC_VERSION,
+          'anthropic-dangerous-direct-browser-access': 'true',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: this.options.maxTokens || 2048,
+          system: SYSTEM_PROMPT,
+          messages,
+          tools: this.tools(),
+        }),
+      });
+    } catch (error) {
+      throw new Error(
+        'Network error: could not reach the Anthropic API '
+        + `(${(error && error.message) || error}). Check your connection or the base URL.`,
+      );
+    }
     if (!response.ok) {
-      let detail = '';
-      try {
-        detail = await response.text();
-      } catch { /* ignore */ }
-      throw new Error(`Anthropic API error ${response.status}: ${detail}`);
+      throw new Error(await AnthropicClient.describeHttpError(response));
     }
-    return response.json();
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      throw new Error('The Anthropic API returned a malformed (non-JSON) response.');
+    }
+    return data;
   }
 
   // Run the tool-use loop for one user turn. `history` is the running list of
@@ -203,6 +290,9 @@ export default class AnthropicClient {
     const notify = onActivity || (() => {});
     for (let turn = 0; turn < this.maxTurns; turn += 1) {
       const reply = await this.postMessages(history);
+      if (!reply || !Array.isArray(reply.content)) {
+        throw new Error('The Anthropic API returned an unexpected response shape (no content).');
+      }
       history.push({ role: 'assistant', content: reply.content });
 
       const toolUses = reply.content.filter(block => block.type === 'tool_use');
@@ -229,6 +319,9 @@ export default class AnthropicClient {
       });
       history.push({ role: 'user', content: toolResults });
     }
-    throw new Error('Assistant stopped after too many tool-use turns.');
+    throw new Error(
+      `The assistant used tools ${this.maxTurns} times without finishing. `
+      + 'Stopping to avoid a loop — try rephrasing your request.',
+    );
   }
 }

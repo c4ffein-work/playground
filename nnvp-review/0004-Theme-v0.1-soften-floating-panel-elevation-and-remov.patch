@@ -1,7 +1,7 @@
 From 091360a7f40a46252b50d99a938a79befc64b9d2 Mon Sep 17 00:00:00 2001
 From: c4ffein <c4ffein.work@gmail.com>
 Date: Mon, 6 Jul 2026 10:53:23 +0000
-Subject: [PATCH 4/5] Theme v0.1: soften floating-panel elevation and remove
+Subject: [PATCH 4/6] Theme v0.1: soften floating-panel elevation and remove
  dead Vite scaffold CSS
 
 - App.vue: replace the hard pure-black 1px panel hairline with a subtle border
