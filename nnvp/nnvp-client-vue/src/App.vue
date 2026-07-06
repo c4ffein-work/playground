@@ -96,6 +96,11 @@ export default {
   --border-width: 1px;
   --border-radius: 15px;
   --panel-margin: 12px;
+
+  /* Panel elevation (v0.1): a subtle border + soft shadow instead of a hard
+     pure-black hairline, for a lighter, more modern feel. */
+  --panel-border: #e5e7eb;
+  --panel-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
 }
 
 body,html {
@@ -136,8 +141,9 @@ body,html {
 .floating-panel {
   position: absolute;
   background-color: var(--bg-panel);
-  border: var(--border-width) solid var(--border-color);
+  border: var(--border-width) solid var(--panel-border);
   border-radius: var(--border-radius);
+  box-shadow: var(--panel-shadow);
   overflow: hidden;
   z-index: 10;
   pointer-events: auto;  /* Allow the panel background to receive clicks */

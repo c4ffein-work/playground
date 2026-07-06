@@ -56,6 +56,13 @@ original unknown-layer fallback. No behavior change (verified against `layer-hel
   `createTreatmentList` topological ordering (linear / branching / diamond / cycles), `isSequential`,
   and Python + JS generation asserting exact output strings.
 
+### 6. Theme v0.1 — softer panel elevation + dead-scaffold removal
+- Replaced the hard pure-black `1px` floating-panel hairline with a subtle border (`#e5e7eb`) + a
+  soft drop shadow (new `--panel-border` / `--panel-shadow` tokens) for a lighter, modern look.
+- Deleted `src/style.css` (default Vite scaffold — `#646cff` links, centered 1280px card, dark
+  boilerplate button) and its `main.js` import; it conflicted with the real design system and shipped
+  unused. Verified via layout e2e (5/5) + a screenshot.
+
 ### 5. Fix double-slash dataset URLs (FashionMNIST/CIFAR10) + datasets-sources tests
 - `datasets-sources.js` built FashionMNIST/CIFAR10 paths as `cdnDir+"/fashion_mnist/…"` while the
   default `cdnDir` ends in a slash — producing `datasets//fashion_mnist/…` (MNIST correctly used no
