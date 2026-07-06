@@ -9,6 +9,7 @@
 
 import KerasGeneratorPythonHelper from './KerasGeneratorPythonHelper';
 import KerasGeneratorJavascriptHelper from './KerasGeneratorJavascriptHelper';
+import KerasGeneratorPyTorchHelper from './KerasGeneratorPyTorchHelper';
 
 
 export default class KerasGenerator {
@@ -141,6 +142,12 @@ export default class KerasGenerator {
 
   generateJavascriptFromGraph() {
     return new KerasGeneratorJavascriptHelper(
+      this.graph, this.inputs, this.outputs, this.list, this.sequential,
+    ).generate();
+  }
+
+  generatePyTorchFromGraph() {
+    return new KerasGeneratorPyTorchHelper(
       this.graph, this.inputs, this.outputs, this.list, this.sequential,
     ).generate();
   }

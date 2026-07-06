@@ -58,6 +58,9 @@ export default {
           Generate_Javascript() {
             this.$d3Interface.generateJavascriptInBrowser(this.$kerasInterface);
           },
+          Generate_PyTorch() {
+            this.$d3Interface.generatePyTorchInBrowser(this.$kerasInterface);
+          },
         },
         Edit: {
           Undo: [() => this.$d3Interface.undo(), () => (this.$d3Interface.getUndoStackContainer().e.length === 0)],
@@ -65,6 +68,7 @@ export default {
           Group() { this.$d3Interface.createGroup(); },
         },
         Training: () => { this.$emit('open-trainer'); },
+        Tutorial: () => { this.$emit('open-tutorial'); },
         About: () => { this.$emit('open-about'); },
       },
       activatedState: false,

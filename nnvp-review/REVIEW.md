@@ -56,6 +56,16 @@ original unknown-layer fallback. No behavior change (verified against `layer-hel
   `createTreatmentList` topological ordering (linear / branching / diamond / cycles), `isSequential`,
   and Python + JS generation asserting exact output strings.
 
+### 7. Four features in parallel (0005) — chat assistant · tutorial · PyTorch · tfjs 4
+Built by four independent subagents (each on the theme-v0.1 base), then merged with a combined
+verification pass (lint 0/0, 60 unit tests, build on tfjs 4, e2e 11/11 + 32/32 non-network core).
+- **AI chat-assistant bubble** — actions API over `D3Interface`/`KerasInterface` exposed to Claude via
+  an Anthropic tool-use client (bring-your-own-key). *Live chat needs an API key — not exercised here.*
+- **MNIST tutorial mode** — 8-step guided build, coachmark overlay, auto-advances on editor state.
+- **PyTorch codegen** — `torch.nn.Module` output (LazyLinear/LazyConv2d), unsupported→`# TODO`.
+- **tfjs 3.3→4.22** — builds against v4, no code changes needed. *In-browser training needs a real
+  browser+network — not exercised here.*
+
 ### 6. Theme v0.1 — softer panel elevation + dead-scaffold removal
 - Replaced the hard pure-black `1px` floating-panel hairline with a subtle border (`#e5e7eb`) + a
   soft drop shadow (new `--panel-border` / `--panel-shadow` tokens) for a lighter, modern look.

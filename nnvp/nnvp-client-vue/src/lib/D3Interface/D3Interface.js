@@ -160,6 +160,12 @@ export default class {
     }
   }
 
+  generatePyTorchInBrowser(kerasInterface) {
+    if (this.activeGraph !== null) {
+      this.activeGraph.generatePyTorchInBrowser(kerasInterface);
+    }
+  }
+
   generateJavascriptNoSave(kerasInterface) {
     if (this.activeGraph !== null) {
       return this.activeGraph.generateJavascriptNoSave(kerasInterface);

@@ -2,13 +2,15 @@
   <div id="canvas-background" class="canvas-background">
     <WhiteBoard :isTraining="isTraining"/>
   </div>
-  <div id="generalMenu" class="floating-panel general-menu"><GeneralMenu @open-trainer="openTrainer" @open-about="openAboutModal"/></div>
+  <div id="generalMenu" class="floating-panel general-menu"><GeneralMenu @open-trainer="openTrainer" @open-about="openAboutModal" @open-tutorial="startTutorial"/></div>
   <div id="layerCatalog" class="floating-panel layer-catalog"><LayerCatalog/></div>
   <div id="layerOptions" class="floating-panel layer-options"><LayerOptions msg="NNVP"/></div>
   <div id="trainingZone" class="floating-panel training-zone" v-if="trainerHeight > 0" v-bind:style="{height: trainerHeight+'vh'}">
     <TrainingZone @close-trainer="closeTrainer" :trainingZoneSize="trainerHeight" @training-started="isTraining = true" @training-stopped="isTraining = false"/>
   </div>
   <AboutModal :show="showAboutModal" @close="closeAboutModal"/>
+  <ChatBubble/>
+  <TutorialOverlay :active="tutorialActive" @exit="stopTutorial"/>
 </template>
 
 
@@ -19,6 +21,8 @@ import LayerOptions from './components/LayerOptions/LayerOptions.vue';
 import WhiteBoard from './components/WhiteBoard.vue';
 import TrainingZone from './components/TrainingZone/TrainingZone.vue';
 import AboutModal from './components/AboutModal.vue';
+import ChatBubble from './components/Assistant/ChatBubble.vue';
+import TutorialOverlay from './components/Tutorial/TutorialOverlay.vue';
 
 export default {
   name: 'app',
@@ -29,8 +33,16 @@ export default {
     WhiteBoard,
     TrainingZone,
     AboutModal,
+    ChatBubble,
+    TutorialOverlay,
   },
   methods: {
+    startTutorial() {
+      this.tutorialActive = true;
+    },
+    stopTutorial() {
+      this.tutorialActive = false;
+    },
     openTrainer() {
       this.trainerOpenHeight = this.trainerOpenHeight > 25 ? this.trainerOpenHeight : 25;
       this.trainerHeight = this.trainerOpenHeight;
@@ -51,6 +63,7 @@ export default {
       trainerOpenHeight: 50,
       showAboutModal: false,
       isTraining: false,
+      tutorialActive: false,
     };
   },
   mounted() {

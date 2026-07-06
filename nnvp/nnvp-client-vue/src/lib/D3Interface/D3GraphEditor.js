@@ -601,6 +601,11 @@ D3GraphEditor.prototype.generateJavascriptInBrowser = function (kerasInterface) 
   saveAs(new Blob([generatedJavascript]), "myModel.js");
 }
 
+D3GraphEditor.prototype.generatePyTorchInBrowser = function (kerasInterface) {
+  const generatedPyTorch = kerasInterface.generatePyTorch(this.toJSON());
+  saveAs(new Blob([generatedPyTorch]), "myModel.py");
+}
+
 D3GraphEditor.prototype.generateJavascriptNoSave = function (kerasInterface) {
   return kerasInterface.generateJavascript(this.toJSON());
 }
