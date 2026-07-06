@@ -83,6 +83,37 @@ function lstmJson() {
   };
 }
 
+// Embedding -> LSTM inference chain: Input(1) -> Embedding(2, 1000/64) -> LSTM(3, 32) -> Output(4).
+// The LSTM input_size must be the Embedding's output_dim (64), not its own units.
+function embeddingLstmJson() {
+  return {
+    inputs: ['1'],
+    outputs: ['4'],
+    layers: [
+      leaf('1', 'Input', { params: { shape: [20] }, outputLayers: ['2'] }),
+      leaf('2', 'Embedding', { params: { input_dim: 1000, output_dim: 64 }, inputLayers: ['1'], outputLayers: ['3'] }),
+      leaf('3', 'LSTM', { params: { units: 32 }, inputLayers: ['2'], outputLayers: ['4'] }),
+      leaf('4', 'Output', { inputLayers: ['3'] }),
+    ],
+  };
+}
+
+// Uninferable recurrent input_size: the LSTM sits behind an unsupported layer, so its
+// predecessor feature dim is unknown -> fallback to units with a loud TODO comment.
+// Input(1) -> GaussianNoise(2) -> LSTM(3, units 8) -> Output(4).
+function uninferableLstmJson() {
+  return {
+    inputs: ['1'],
+    outputs: ['4'],
+    layers: [
+      leaf('1', 'Input', { params: { shape: [10] }, outputLayers: ['2'] }),
+      leaf('2', 'GaussianNoise', { params: { stddev: 0.1 }, inputLayers: ['1'], outputLayers: ['3'] }),
+      leaf('3', 'LSTM', { params: { units: 8 }, inputLayers: ['2'], outputLayers: ['4'] }),
+      leaf('4', 'Output', { inputLayers: ['3'] }),
+    ],
+  };
+}
+
 // Sequential embedding + recurrent stack, mixing supported layer families:
 // Input(1) -> Embedding(2) -> LSTM(3, return_sequences) -> SimpleRNN(4) -> Dense(5) -> Output(6).
 function mixedJson() {
@@ -197,8 +228,8 @@ describe('PyTorch: full generation', () => {
       + '  def __init__(self):\n'
       + '    super().__init__()\n'
       + '    self.layer_2 = nn.Embedding(5000, 32)\n'
-      + '    self.layer_3 = nn.LSTM(64, 64, batch_first=True)\n'
-      + '    self.layer_4 = nn.RNN(32, 32, batch_first=True)\n'
+      + '    self.layer_3 = nn.LSTM(32, 64, batch_first=True)\n'
+      + '    self.layer_4 = nn.RNN(64, 32, batch_first=True)\n'
       + '    self.layer_5 = nn.LazyLinear(10)\n'
       + '\n'
       + '  def forward(self, x):\n'
@@ -208,6 +239,37 @@ describe('PyTorch: full generation', () => {
       + '    x = x[:, -1, :]\n'
       + '    x = self.layer_5(x)\n'
       + '    return x\n',
+    );
+  });
+
+  it('infers the LSTM input_size from the upstream Embedding output_dim', () => {
+    const code = new KerasGenerator(embeddingLstmJson()).generatePyTorchFromGraph();
+    expect(code).toBe(
+      'import torch\n'
+      + 'import torch.nn as nn\n'
+      + '\n'
+      + '\n'
+      + 'class Model(nn.Module):\n'
+      + '  def __init__(self):\n'
+      + '    super().__init__()\n'
+      + '    self.layer_2 = nn.Embedding(1000, 64)\n'
+      + '    self.layer_3 = nn.LSTM(64, 32, batch_first=True)\n'
+      + '\n'
+      + '  def forward(self, x):\n'
+      + '    x = self.layer_2(x)\n'
+      + '    x, _ = self.layer_3(x)\n'
+      + '    x = x[:, -1, :]\n'
+      + '    return x\n',
+    );
+    // Correct inference must not leave a TODO marker behind.
+    expect(code).not.toContain('TODO: set input_size');
+  });
+
+  it('falls back to units with a loud TODO when input_size cannot be inferred', () => {
+    const code = new KerasGenerator(uninferableLstmJson()).generatePyTorchFromGraph();
+    expect(code).toContain(
+      '    self.layer_3 = nn.LSTM(8, 8, batch_first=True)'
+      + '  # TODO: set input_size (could not infer from graph)\n',
     );
   });
 });
@@ -236,11 +298,13 @@ describe('PyTorch: layer -> torch.nn mapping', () => {
   });
 
   it('maps embedding and recurrent layers to their torch modules', () => {
+    // Bare nodes (no graph context) have no inferable input_size -> loud TODO fallback.
+    const todo = '  # TODO: set input_size (could not infer from graph)';
     expect(ctor('Embedding', { input_dim: 1000, output_dim: 64 })).toBe('nn.Embedding(1000, 64)');
-    expect(ctor('LSTM', { units: 8 })).toBe('nn.LSTM(8, 8, batch_first=True)');
-    expect(ctor('GRU', { units: 16 })).toBe('nn.GRU(16, 16, batch_first=True)');
-    expect(ctor('SimpleRNN', { units: 32 })).toBe('nn.RNN(32, 32, batch_first=True)');
-    expect(ctor('RNN', { units: 4 })).toBe('nn.RNN(4, 4, batch_first=True)');
+    expect(ctor('LSTM', { units: 8 })).toBe(`nn.LSTM(8, 8, batch_first=True)${todo}`);
+    expect(ctor('GRU', { units: 16 })).toBe(`nn.GRU(16, 16, batch_first=True)${todo}`);
+    expect(ctor('SimpleRNN', { units: 32 })).toBe(`nn.RNN(32, 32, batch_first=True)${todo}`);
+    expect(ctor('RNN', { units: 4 })).toBe(`nn.RNN(4, 4, batch_first=True)${todo}`);
   });
 
   it('returns null (-> TODO) for an unmapped layer or unknown activation', () => {

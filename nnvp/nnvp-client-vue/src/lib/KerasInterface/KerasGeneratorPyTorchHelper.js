@@ -4,7 +4,9 @@
 //
 // Keras layers are lazily-shaped (input size is often unknown at design time), so we
 // prefer PyTorch's lazy modules (LazyLinear, LazyConv2d, LazyBatchNorm*, ...) whose
-// input dimension is inferred on the first forward pass.
+// input dimension is inferred on the first forward pass. torch has no lazy recurrent
+// module, so the recurrent input_size is inferred from the graph instead (see
+// KerasGeneratorDimInference); when that fails, the fallback is a loud TODO comment.
 
 /* eslint-disable no-param-reassign */
 /* eslint class-methods-use-this: ["error", { "exceptMethods": ["generateTuple",
@@ -13,6 +15,8 @@
                                                                 "recurrentModule",
                                                                 "isMerge"] }] */
 
+import inferFeatureDims from './KerasGeneratorDimInference';
+
 export default class KerasGeneratorPyTorchHelper {
   constructor(graph, inputs, outputs, list, sequential) {
     this.graph = graph;
@@ -20,6 +24,15 @@ export default class KerasGeneratorPyTorchHelper {
     this.outputs = outputs;
     this.list = list;
     this.sequential = sequential || false;
+    this.dims = inferFeatureDims(graph, list);
+  }
+
+  // Feature dim (last-axis size / channel count) of the node's first predecessor,
+  // as inferred from the graph, or null when it could not be derived.
+  inferredInputFeatures(node) {
+    const sources = this.graph[node].sources || [];
+    const source = this.dims[sources[0]];
+    return source && source.features !== null ? source.features : null;
   }
 
   // Returns the name given to the node in the generated PyTorch code.
@@ -142,11 +155,15 @@ export default class KerasGeneratorPyTorchHelper {
       case 'SimpleRNN':
       case 'RNN': {
         // torch has no Lazy recurrent module, so input_size is required. Keras `units`
-        // maps to hidden_size; the input feature size is unknown at design time, so we
-        // default input_size to the same value. batch_first=True matches Keras'
-        // (batch, timesteps, features) layout. The tuple return is unpacked in forward().
+        // maps to hidden_size; input_size is inferred from the predecessor's feature
+        // dim, falling back to `units` with a loud TODO when the graph does not make
+        // it derivable. batch_first=True matches Keras' (batch, timesteps, features)
+        // layout. The tuple return is unpacked in forward().
         const units = p.units !== undefined ? this.renderValue(p.units) : '1';
-        return `${this.recurrentModule(name)}(${units}, ${units}, batch_first=True)`;
+        const inferred = this.inferredInputFeatures(node);
+        const inputSize = inferred !== null ? this.renderValue(inferred) : units;
+        const todo = inferred !== null ? '' : '  # TODO: set input_size (could not infer from graph)';
+        return `${this.recurrentModule(name)}(${inputSize}, ${units}, batch_first=True)${todo}`;
       }
       case 'Activation':
         return this.activationModule(p.activation);

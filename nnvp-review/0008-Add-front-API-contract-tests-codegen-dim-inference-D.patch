@@ -1,0 +1,1387 @@
+From e9e6dcb6643339ad1422de13abb10c3779ee4aa6 Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Mon, 6 Jul 2026 17:23:11 +0000
+Subject: [PATCH 8/8] Add front/API contract tests, codegen dim inference, D3
+ bug fixes, and backend-proxy chat mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Integrated from three subagent branches plus one integration follow-up.
+
+- Contract round-trip suite (tests/contract/, vitest.contract.config.js, scripts/test-contract.sh,
+  npm run test:contract): the real apiClient against the real Django backend, no mocks — auth shapes
+  and exact error codes, projects CRUD with graph deep-equality round-trip, list-omits-graph,
+  ownership isolation. 16 tests; kept out of the unit suite so test:unit needs no backend.
+- Dimension inference for generated code (KerasGeneratorDimInference.js): PyTorch recurrent
+  input_size and Tinygrad Linear/Conv2d/BatchNorm2d in-dims are now derived by walking the graph
+  (units/filters/output_dim chains, Input shape, Flatten products when fully known); uninferable
+  cases keep a loud "# TODO: could not infer from graph" on the line instead of a plausible guess.
+- D3 bug fixes, each with a failing-then-passing test: selectOnNode is now an idempotent add with an
+  explicit toggleNodeSelection for the shift-click call site; removeObserver no longer deletes the
+  last observer on a miss (splice(-1)); D3LayerComponent.clone returns its result and uses the
+  editor's getNodeId; D3GraphValidation.isKerasError no longer throws ReferenceError. Known-broken
+  composite/group feature documented but deliberately untouched.
+- Chat backend-proxy mode: when the assistant base URL equals the configured NNVP backend URL, the
+  client posts to /api/assistant/messages with the signed-in JWT (no Anthropic key in the browser),
+  matching the hardened backend's auth; other custom base URLs keep transparent /v1/messages
+  semantics. ChatBubble treats a signed-in backend proxy as ready-to-chat.
+
+Verified: lint 0/0, 173 unit tests, build ok, contract 16/16 against the HARDENED backend,
+e2e app/a11y/cloud/interactions 22/22.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JNQtU2ePmhzdTwymZCbh7J
+---
+ nnvp-client-vue/package.json                  |   1 +
+ nnvp-client-vue/scripts/test-contract.sh      |  82 +++++
+ .../src/components/Assistant/ChatBubble.vue   |  13 +-
+ .../src/lib/Assistant/anthropicClient.js      |  59 +++-
+ .../src/lib/D3Interface/D3GraphEditor.js      |  31 +-
+ .../src/lib/D3Interface/D3GraphValidation.js  |   2 +-
+ .../src/lib/D3Interface/D3Layer.js            |   7 +-
+ .../src/lib/D3Interface/D3LayerComponent.js   |   4 +-
+ .../KerasGeneratorDimInference.js             | 121 +++++++
+ .../KerasGeneratorPyTorchHelper.js            |  27 +-
+ .../KerasGeneratorTinygradHelper.js           |  50 ++-
+ .../tests/contract/apiContract.test.js        | 303 ++++++++++++++++++
+ .../tests/unit/D3GraphEditor.test.js          |  66 +++-
+ .../tests/unit/KerasGeneratorPyTorch.test.js  |  76 ++++-
+ .../tests/unit/KerasGeneratorTinygrad.test.js |  67 +++-
+ .../tests/unit/assistantActions.test.js       |  43 +++
+ nnvp-client-vue/vitest.contract.config.js     |  17 +
+ 17 files changed, 900 insertions(+), 69 deletions(-)
+ create mode 100755 nnvp-client-vue/scripts/test-contract.sh
+ create mode 100644 nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorDimInference.js
+ create mode 100644 nnvp-client-vue/tests/contract/apiContract.test.js
+ create mode 100644 nnvp-client-vue/vitest.contract.config.js
+
+diff --git a/nnvp-client-vue/package.json b/nnvp-client-vue/package.json
+index 4317ccd..e7bed3c 100644
+--- a/nnvp-client-vue/package.json
++++ b/nnvp-client-vue/package.json
+@@ -14,6 +14,7 @@
+     "test:e2e:xvfb": "xvfb-run --auto-servernum --server-args='-screen 0 1280x720x24' playwright test",
+     "test:e2e:ui": "playwright test --ui",
+     "test:unit": "vitest run",
++    "test:contract": "vitest run --config vitest.contract.config.js",
+     "lint": "oxlint src tests",
+     "lint:fix": "oxlint src tests --fix"
+   },
+diff --git a/nnvp-client-vue/scripts/test-contract.sh b/nnvp-client-vue/scripts/test-contract.sh
+new file mode 100755
+index 0000000..b1a54f5
+--- /dev/null
++++ b/nnvp-client-vue/scripts/test-contract.sh
+@@ -0,0 +1,82 @@
++#!/usr/bin/env bash
++#
++# One-command contract run:
++#   1. throwaway sqlite DB in a temp dir for the Django backend
++#   2. migrate + runserver on a dedicated port (background)
++#   3. wait for readiness (poll /api/docs)
++#   4. run the vitest contract suite (real ApiClient -> real backend)
++#   5. kill the server, delete the temp DB
++#
++# Overrides:
++#   NNVP_BACKEND_DIR   path to the Django backend checkout (default: ../../nnvp-backend-i1)
++#   NNVP_BACKEND_PORT  port to serve on (default: 8123)
++set -euo pipefail
++
++SPA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++BACKEND_DIR="${NNVP_BACKEND_DIR:-$(cd "$SPA_DIR/../.." && pwd)/nnvp-backend-i1}"
++PORT="${NNVP_BACKEND_PORT:-8123}"
++BASE_URL="http://127.0.0.1:${PORT}"
++
++if [ ! -f "$BACKEND_DIR/manage.py" ]; then
++  echo "error: backend not found at $BACKEND_DIR (set NNVP_BACKEND_DIR)" >&2
++  exit 1
++fi
++
++# --- backend python: use the venv; recreate it if it's broken (moved venv) ---
++PYTHON="$BACKEND_DIR/.venv/bin/python"
++# Note: `import ninja` needs DJANGO_SETTINGS_MODULE, so only check it's findable.
++if ! "$PYTHON" -c 'import sys, importlib.util as u, django, jwt; sys.exit(0 if u.find_spec("ninja") else 1)' >/dev/null 2>&1; then
++  echo "backend venv unusable; recreating from requirements.txt ..."
++  rm -rf "$BACKEND_DIR/.venv"
++  python3 -m venv "$BACKEND_DIR/.venv"
++  "$BACKEND_DIR/.venv/bin/pip" install -q -r "$BACKEND_DIR/requirements.txt"
++fi
++
++# --- throwaway database in a fresh temp dir ---
++TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nnvp-contract.XXXXXX")"
++export DJANGO_DB_PATH="$TMP_DIR/db.sqlite3"
++
++SERVER_PID=""
++cleanup() {
++  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
++    kill "$SERVER_PID" 2>/dev/null || true
++    wait "$SERVER_PID" 2>/dev/null || true
++  fi
++  rm -rf "$TMP_DIR"
++}
++trap cleanup EXIT INT TERM
++
++echo "==> migrating throwaway sqlite DB ($DJANGO_DB_PATH)"
++(cd "$BACKEND_DIR" && "$PYTHON" manage.py migrate --noinput) >"$TMP_DIR/migrate.log" 2>&1 \
++  || { cat "$TMP_DIR/migrate.log" >&2; exit 1; }
++
++echo "==> starting backend on $BASE_URL"
++(cd "$BACKEND_DIR" && exec "$PYTHON" manage.py runserver "127.0.0.1:${PORT}" --noreload) \
++  >"$TMP_DIR/server.log" 2>&1 &
++SERVER_PID=$!
++
++echo "==> waiting for readiness (GET /api/docs)"
++ready=0
++for _ in $(seq 1 60); do
++  if curl --noproxy '*' -fsS -o /dev/null "$BASE_URL/api/docs" 2>/dev/null; then
++    ready=1
++    break
++  fi
++  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
++    echo "error: backend exited during startup:" >&2
++    cat "$TMP_DIR/server.log" >&2
++    exit 1
++  fi
++  sleep 0.5
++done
++if [ "$ready" -ne 1 ]; then
++  echo "error: backend never became ready on $BASE_URL" >&2
++  cat "$TMP_DIR/server.log" >&2
++  exit 1
++fi
++
++echo "==> running contract suite"
++status=0
++(cd "$SPA_DIR" && NNVP_BACKEND_URL="$BASE_URL" npm run test:contract) || status=$?
++
++exit "$status"
+diff --git a/nnvp-client-vue/src/components/Assistant/ChatBubble.vue b/nnvp-client-vue/src/components/Assistant/ChatBubble.vue
+index 44c467b..0389e3e 100644
+--- a/nnvp-client-vue/src/components/Assistant/ChatBubble.vue
++++ b/nnvp-client-vue/src/components/Assistant/ChatBubble.vue
+@@ -142,6 +142,8 @@ import AnthropicClient, {
+   DEFAULT_MODEL,
+   DEFAULT_BASE_URL,
+   isPlausibleApiKey,
++  readStoredConfig,
++  usesBackendProxy,
+ } from '../../lib/Assistant/anthropicClient';
+ 
+ export default {
+@@ -176,7 +178,7 @@ export default {
+       this.model = localStorage.getItem(STORAGE_MODEL) || '';
+       this.baseUrl = localStorage.getItem(STORAGE_BASE_URL) || '';
+     }
+-    this.hasKey = Boolean(this.apiKey);
++    this.refreshHasKey();
+     if (typeof localStorage !== 'undefined') {
+       this.allowEdits = localStorage.getItem(STORAGE_ALLOW_EDITS) === 'true';
+     }
+@@ -220,9 +222,16 @@ export default {
+         if (this.baseUrl) localStorage.setItem(STORAGE_BASE_URL, this.baseUrl);
+         else localStorage.removeItem(STORAGE_BASE_URL);
+       }
+-      this.hasKey = Boolean(this.apiKey);
++      this.refreshHasKey();
+       this.settingsOpen = false;
+     },
++    // "Ready to chat" means either a user-provided Anthropic key, or the base
++    // URL pointing at the NNVP backend proxy while signed in (JWT present).
++    refreshHasKey() {
++      const config = readStoredConfig();
++      this.hasKey = Boolean(this.apiKey)
++        || (usesBackendProxy(config) && Boolean(config.backendToken));
++    },
+     scrollToBottom() {
+       this.$nextTick(() => {
+         const el = this.$refs.messagesEl;
+diff --git a/nnvp-client-vue/src/lib/Assistant/anthropicClient.js b/nnvp-client-vue/src/lib/Assistant/anthropicClient.js
+index 8f8fb66..067a609 100644
+--- a/nnvp-client-vue/src/lib/Assistant/anthropicClient.js
++++ b/nnvp-client-vue/src/lib/Assistant/anthropicClient.js
+@@ -142,15 +142,31 @@ export function readStoredConfig(overrides = {}) {
+       apiKey: localStorage.getItem(STORAGE_KEY) || '',
+       baseUrl: localStorage.getItem(STORAGE_BASE_URL) || '',
+       model: localStorage.getItem(STORAGE_MODEL) || '',
++      backendUrl: localStorage.getItem('nnvp_backend_url') || '',
++      backendToken: localStorage.getItem('nnvp_backend_token') || '',
+     };
+   }
+   return {
+     apiKey: overrides.apiKey || stored.apiKey || '',
+     baseUrl: overrides.baseUrl || stored.baseUrl || DEFAULT_BASE_URL,
+     model: overrides.model || stored.model || DEFAULT_MODEL,
++    backendUrl: overrides.backendUrl || stored.backendUrl || '',
++    backendToken: overrides.backendToken || stored.backendToken || '',
+   };
+ }
+ 
++const trimSlash = (url) => (url || '').replace(/\/+$/, '');
++
++// The NNVP backend exposes the assistant proxy at /api/assistant/messages with
++// JWT Bearer auth and a server-side Anthropic key — a different path and auth
++// scheme from api.anthropic.com. When the chat's base URL is the configured
++// NNVP backend, switch to that contract; any other custom base URL is treated
++// as a transparent Anthropic-compatible proxy (same /v1/messages + x-api-key).
++export function usesBackendProxy(config) {
++  return Boolean(config.backendUrl)
++    && trimSlash(config.baseUrl) === trimSlash(config.backendUrl);
++}
++
+ export default class AnthropicClient {
+   constructor(actions, options = {}) {
+     this.actions = actions;
+@@ -236,26 +252,43 @@ export default class AnthropicClient {
+   }
+ 
+   async postMessages(messages) {
+-    const { apiKey, baseUrl, model } = this.config();
+-    if (!apiKey) {
+-      throw new Error('No Anthropic API key set. Add one in the assistant settings (⚙).');
+-    }
+-    if (!isPlausibleApiKey(apiKey)) {
+-      throw new Error('The Anthropic API key looks malformed. Check it in the settings (⚙).');
++    const config = this.config();
++    const { apiKey, baseUrl, model } = config;
++    const viaBackend = usesBackendProxy(config);
++    if (viaBackend) {
++      if (!config.backendToken) {
++        throw new Error('Sign in to your NNVP account to use the backend assistant proxy (Account menu).');
++      }
++    } else {
++      if (!apiKey) {
++        throw new Error('No Anthropic API key set. Add one in the assistant settings (⚙).');
++      }
++      if (!isPlausibleApiKey(apiKey)) {
++        throw new Error('The Anthropic API key looks malformed. Check it in the settings (⚙).');
++      }
+     }
+     if (!this.fetchImpl) {
+       throw new Error('No network client is available in this environment.');
+     }
++    const endpoint = viaBackend
++      ? `${trimSlash(baseUrl)}/api/assistant/messages`
++      : `${baseUrl}/v1/messages`;
++    const headers = viaBackend
++      ? {
++        authorization: `Bearer ${config.backendToken}`,
++        'content-type': 'application/json',
++      }
++      : {
++        'x-api-key': apiKey,
++        'anthropic-version': ANTHROPIC_VERSION,
++        'anthropic-dangerous-direct-browser-access': 'true',
++        'content-type': 'application/json',
++      };
+     let response;
+     try {
+-      response = await this.fetchImpl(`${baseUrl}/v1/messages`, {
++      response = await this.fetchImpl(endpoint, {
+         method: 'POST',
+-        headers: {
+-          'x-api-key': apiKey,
+-          'anthropic-version': ANTHROPIC_VERSION,
+-          'anthropic-dangerous-direct-browser-access': 'true',
+-          'content-type': 'application/json',
+-        },
++        headers,
+         body: JSON.stringify({
+           model,
+           max_tokens: this.options.maxTokens || 2048,
+diff --git a/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js b/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
+index 03416d8..ac238bb 100644
+--- a/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
++++ b/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
+@@ -227,21 +227,18 @@ D3GraphEditor.prototype.singleSelection = function (node) {
+ };
+ 
+ /**
+- * Add or remove if already selected, node to selectedNodes
+- * @param node which node to select or to remove selection
++ * Add node to selectedNodes, idempotently: an already-selected node
++ * stays selected, without duplicate entry or reordering
++ * @param node which node to select
+  */
+ D3GraphEditor.prototype.selectOnNode = function (node) {
+   if(this.selectedEdge) {
+     d3.select("#" + this.selectedEdge.id).classed("selected", false);
+     this.selectedEdge = null;
+   }
+-  this.selectedNodes.forEach(selectedNode => {
+-    if (selectedNode == node) {
+-      // Remove the html class selected
+-      d3.select("#" + node.htmlID).classed("selected", false);
+-      this.selectedNodes.splice(this.selectedNodes.indexOf(selectedNode), 1);
+-    }
+-  });
++  if (this.selectedNodes.indexOf(node) >= 0) {
++    return;
++  }
+   // Add the html class selected when selectedEdge
+   // Like this CSS can identified selected node
+   d3.select("#" + node.htmlID).classed("selected", true);
+@@ -249,6 +246,22 @@ D3GraphEditor.prototype.selectOnNode = function (node) {
+   this.notifySelectionChanged();
+ };
+ 
++/**
++ * Toggle node's membership in selectedNodes: select it if unselected,
++ * deselect it if already selected (used by shift-click on a layer)
++ * @param node which node to toggle
++ */
++D3GraphEditor.prototype.toggleNodeSelection = function (node) {
++  if (this.selectedNodes.indexOf(node) >= 0) {
++    // Remove the html class selected
++    d3.select("#" + node.htmlID).classed("selected", false);
++    this.selectedNodes.splice(this.selectedNodes.indexOf(node), 1);
++    this.notifySelectionChanged();
++    return;
++  }
++  this.selectOnNode(node);
++};
++
+ /**
+  * Call when we need to undo the selection
+  */
+diff --git a/nnvp-client-vue/src/lib/D3Interface/D3GraphValidation.js b/nnvp-client-vue/src/lib/D3Interface/D3GraphValidation.js
+index 40d8648..12037d6 100644
+--- a/nnvp-client-vue/src/lib/D3Interface/D3GraphValidation.js
++++ b/nnvp-client-vue/src/lib/D3Interface/D3GraphValidation.js
+@@ -90,7 +90,7 @@ D3GraphValidation.kerasError = function (graph, edge) {
+ D3GraphValidation.isKerasError = function (graph, edge) {
+   if (d3.select("#" + edge.htmlID).node()) {
+     d3.select("#" + edge.htmlID).select('path')
+-      .classed('linkError', D3GraphValidation.kerasError(graph, thisEdge));
++      .classed('linkError', D3GraphValidation.kerasError(graph, edge));
+   }
+ };
+ 
+diff --git a/nnvp-client-vue/src/lib/D3Interface/D3Layer.js b/nnvp-client-vue/src/lib/D3Interface/D3Layer.js
+index e467aaf..0d7c400 100644
+--- a/nnvp-client-vue/src/lib/D3Interface/D3Layer.js
++++ b/nnvp-client-vue/src/lib/D3Interface/D3Layer.js
+@@ -139,7 +139,10 @@ D3Layer.prototype.addObserver = function (o) {
+  * @param o which observer to remove
+  */
+ D3Layer.prototype.removeObserver = function (o) {
+-  this.observers.splice(this.observers.indexOf(o), 1);
++  // Guard against splice(-1, 1) removing the last observer when o is absent
++  if (this.observers.indexOf(o) !== -1) {
++    this.observers.splice(this.observers.indexOf(o), 1);
++  }
+ };
+ 
+ /**
+@@ -294,7 +297,7 @@ D3Layer.prototype.drawLayer = function (graph) {
+   gElement
+     .on("click", event => {
+       if (event.shiftKey) {
+-        graph.selectOnNode.call(graph, thisLayer);
++        graph.toggleNodeSelection.call(graph, thisLayer);
+       }
+       else {
+         graph.singleSelection.call(graph, thisLayer);
+diff --git a/nnvp-client-vue/src/lib/D3Interface/D3LayerComponent.js b/nnvp-client-vue/src/lib/D3Interface/D3LayerComponent.js
+index 4301f67..88a33c3 100644
+--- a/nnvp-client-vue/src/lib/D3Interface/D3LayerComponent.js
++++ b/nnvp-client-vue/src/lib/D3Interface/D3LayerComponent.js
+@@ -19,9 +19,11 @@ export default function D3LayerComponent(id, parent, kerasLayer, x, y, name, htm
+  * Clones a Layer
+  */
+ D3LayerComponent.prototype.clone = function () {
+-  let res = new D3Layer(this.getModel().getNodeId(), this.parent, this.kerasLayer.clone(), this.x, this.y, this.name);
++  // getNodeId lives on the editor, not the model
++  let res = new D3Layer(this.getEditor().getNodeId(), this.parent, this.kerasLayer.clone(), this.x, this.y, this.name);
+   this.inputLayers.forEach(inputLayer => res.inputLayers.push(inputLayer));
+   this.outputLayers.forEach(outputLayer => res.outputLayers.push(outputLayer));
++  return res;
+ };
+ 
+ /**
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorDimInference.js b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorDimInference.js
+new file mode 100644
+index 0000000..a12f8ae
+--- /dev/null
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorDimInference.js
+@@ -0,0 +1,121 @@
++// Feature-dimension inference shared by the PyTorch and tinygrad helpers.
++//
++// Walks the treatment list (already in topological order, so every node's sources
++// are resolved before the node itself) and derives, where the graph makes it
++// possible, each node's output dimensions in the Keras (channels-last) convention:
++//   - `features`: the last-axis size (Dense in_features, recurrent input_size) which
++//     is also the channel count consumed by Conv / BatchNorm on the next node;
++//   - `shape`: the FULL output shape (without batch), kept only while every axis is
++//     still known - it is what makes Flatten's in-features computable.
++// Conv and pooling layers keep their channel count but drop the full shape: spatial
++// arithmetic (stride / padding / dilation) is deliberately NOT attempted, so a
++// Flatten downstream of a Conv is treated as unknown rather than guessed.
++//
++// Anything not derivable is null; the generators fall back to their documented
++// defaults with a loud TODO comment so the user cannot miss the guess.
++
++export default function inferFeatureDims(graph, list) {
++  const dims = {};
++  // Dim record of an already-treated node, with nulls for anything unknown.
++  const dimsOf = node => dims[node] || { shape: null, features: null };
++  list.forEach((node) => {
++    const { name, parameterValues } = graph[node].keras_data;
++    const p = parameterValues || {};
++    const sources = graph[node].sources || [];
++    const source = dimsOf(sources[0]);
++    let shape = null;
++    let features = null;
++    switch (name) {
++      case 'Input':
++        // The user-declared shape is the one fully-known starting point.
++        if (Array.isArray(p.shape) && p.shape.length > 0
++            && p.shape.every(d => typeof d === 'number')) {
++          shape = p.shape.slice();
++          features = shape[shape.length - 1];
++        }
++        break;
++      case 'Dense':
++        // Dense maps the last axis to `units`, leaving the other axes untouched.
++        if (p.units !== undefined) {
++          features = p.units;
++          if (source.shape) shape = [...source.shape.slice(0, -1), p.units];
++        }
++        break;
++      case 'LSTM':
++      case 'GRU':
++      case 'SimpleRNN':
++      case 'RNN':
++        // Recurrent output features = units (with or without return_sequences);
++        // the timestep axis is not tracked, so only `features` survives.
++        if (p.units !== undefined) features = p.units;
++        break;
++      case 'Embedding':
++        // Embedding appends an `output_dim`-sized axis to its (integer) input.
++        if (p.output_dim !== undefined) {
++          features = p.output_dim;
++          if (source.shape) shape = [...source.shape, p.output_dim];
++        }
++        break;
++      case 'Conv1D':
++      case 'Conv2D':
++      case 'Conv3D':
++        // Channels become `filters`; spatial axes change in ways we do not compute.
++        if (p.filters !== undefined) features = p.filters;
++        break;
++      case 'MaxPooling1D':
++      case 'MaxPooling2D':
++      case 'MaxPooling3D':
++      case 'AveragePooling1D':
++      case 'AveragePooling2D':
++      case 'AveragePooling3D':
++        // Pooling keeps the channel count but shrinks spatial axes we do not compute.
++        features = source.features;
++        break;
++      case 'BatchNormalization':
++      case 'Dropout':
++      case 'Activation':
++      case 'ReLU':
++      case 'LeakyReLU':
++      case 'Sigmoid':
++      case 'Tanh':
++      case 'Softmax':
++      case 'ELU':
++      case 'SELU':
++      case 'GELU':
++      case 'Output':
++        // Shape-preserving: everything passes through unchanged.
++        shape = source.shape ? source.shape.slice() : null;
++        features = source.features;
++        break;
++      case 'Flatten':
++        // Only computable when the full predecessor shape is known.
++        if (source.shape) {
++          features = source.shape.reduce((acc, d) => acc * d, 1);
++          shape = [features];
++        }
++        break;
++      case 'Concatenate': {
++        // Keras Concatenate defaults to axis=-1: features add up when all are known.
++        const sourceDims = sources.map(dimsOf);
++        if (sourceDims.length > 0 && sourceDims.every(d => d.features !== null)) {
++          features = sourceDims.reduce((acc, d) => acc + d.features, 0);
++        }
++        break;
++      }
++      case 'Add': {
++        // Element-wise merge: features pass through when every source agrees.
++        const sourceDims = sources.map(dimsOf);
++        if (sourceDims.length > 0 && sourceDims.every(d => d.features !== null
++            && d.features === sourceDims[0].features)) {
++          features = sourceDims[0].features;
++        }
++        break;
++      }
++      default:
++        // Unknown/unsupported layer: its output dims cannot be trusted.
++        break;
++    }
++    dims[node] = { shape, features };
++  });
++  return dims;
++}
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js
+index ba2cff3..54c4e76 100644
+--- a/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js
+@@ -4,7 +4,9 @@
+ //
+ // Keras layers are lazily-shaped (input size is often unknown at design time), so we
+ // prefer PyTorch's lazy modules (LazyLinear, LazyConv2d, LazyBatchNorm*, ...) whose
+-// input dimension is inferred on the first forward pass.
++// input dimension is inferred on the first forward pass. torch has no lazy recurrent
++// module, so the recurrent input_size is inferred from the graph instead (see
++// KerasGeneratorDimInference); when that fails, the fallback is a loud TODO comment.
+ 
+ /* eslint-disable no-param-reassign */
+ /* eslint class-methods-use-this: ["error", { "exceptMethods": ["generateTuple",
+@@ -13,6 +15,8 @@
+                                                                 "recurrentModule",
+                                                                 "isMerge"] }] */
+ 
++import inferFeatureDims from './KerasGeneratorDimInference';
++
+ export default class KerasGeneratorPyTorchHelper {
+   constructor(graph, inputs, outputs, list, sequential) {
+     this.graph = graph;
+@@ -20,6 +24,15 @@ export default class KerasGeneratorPyTorchHelper {
+     this.outputs = outputs;
+     this.list = list;
+     this.sequential = sequential || false;
++    this.dims = inferFeatureDims(graph, list);
++  }
++
++  // Feature dim (last-axis size / channel count) of the node's first predecessor,
++  // as inferred from the graph, or null when it could not be derived.
++  inferredInputFeatures(node) {
++    const sources = this.graph[node].sources || [];
++    const source = this.dims[sources[0]];
++    return source && source.features !== null ? source.features : null;
+   }
+ 
+   // Returns the name given to the node in the generated PyTorch code.
+@@ -142,11 +155,15 @@ export default class KerasGeneratorPyTorchHelper {
+       case 'SimpleRNN':
+       case 'RNN': {
+         // torch has no Lazy recurrent module, so input_size is required. Keras `units`
+-        // maps to hidden_size; the input feature size is unknown at design time, so we
+-        // default input_size to the same value. batch_first=True matches Keras'
+-        // (batch, timesteps, features) layout. The tuple return is unpacked in forward().
++        // maps to hidden_size; input_size is inferred from the predecessor's feature
++        // dim, falling back to `units` with a loud TODO when the graph does not make
++        // it derivable. batch_first=True matches Keras' (batch, timesteps, features)
++        // layout. The tuple return is unpacked in forward().
+         const units = p.units !== undefined ? this.renderValue(p.units) : '1';
+-        return `${this.recurrentModule(name)}(${units}, ${units}, batch_first=True)`;
++        const inferred = this.inferredInputFeatures(node);
++        const inputSize = inferred !== null ? this.renderValue(inferred) : units;
++        const todo = inferred !== null ? '' : '  # TODO: set input_size (could not infer from graph)';
++        return `${this.recurrentModule(name)}(${inputSize}, ${units}, batch_first=True)${todo}`;
+       }
+       case 'Activation':
+         return this.activationModule(p.activation);
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorTinygradHelper.js b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorTinygradHelper.js
+index ac1f5c1..79fddb8 100644
+--- a/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorTinygradHelper.js
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorTinygradHelper.js
+@@ -4,11 +4,11 @@
+ //
+ // Unlike PyTorch, tinygrad has NO lazy layers: nn.Linear / nn.Conv2d / nn.BatchNorm2d
+ // all need their input dimension (in_features / in_channels / num_features) up front.
+-// That size is unknown from the graph at design time, so - mirroring how the PyTorch
+-// helper documented its recurrent input_size choice - we default the in-dim to the
+-// SAME value as the out-dim (units / filters), and fall back to a clearly-commented
+-// placeholder for BatchNorm (which has no out-dim to reuse). The emitted code is valid
+-// and importable; the placeholder dimensions are the documented assumption to adjust.
++// That dimension is inferred from the graph (see KerasGeneratorDimInference): each
++// predecessor's feature dim / channel count is walked down from the Input shape. When
++// the graph does not make it derivable, we fall back to the out-dim (units / filters,
++// or 1 for BatchNorm which has no out-dim to reuse) with a loud TODO comment on the
++// line, so the emitted code stays valid and importable and the guess cannot be missed.
+ //
+ // tinygrad activations are Tensor METHODS (x.relu(), x.sigmoid(), ...), not modules,
+ // and Flatten is a method too (x.flatten(1)), so those nodes emit no __init__ line.
+@@ -18,6 +18,8 @@
+                                                                 "renderValue",
+                                                                 "activationMethod"] }] */
+ 
++import inferFeatureDims from './KerasGeneratorDimInference';
++
+ export default class KerasGeneratorTinygradHelper {
+   constructor(graph, inputs, outputs, list, sequential) {
+     this.graph = graph;
+@@ -25,6 +27,15 @@ export default class KerasGeneratorTinygradHelper {
+     this.outputs = outputs;
+     this.list = list;
+     this.sequential = sequential || false;
++    this.dims = inferFeatureDims(graph, list);
++  }
++
++  // Feature dim (last-axis size / channel count) of the node's first predecessor,
++  // as inferred from the graph, or null when it could not be derived.
++  inferredInputFeatures(node) {
++    const sources = this.graph[node].sources || [];
++    const source = this.dims[sources[0]];
++    return source && source.features !== null ? source.features : null;
+   }
+ 
+   // Returns the name given to the node in the generated tinygrad code.
+@@ -87,21 +98,32 @@ export default class KerasGeneratorTinygradHelper {
+     const p = params || {};
+     switch (name) {
+       case 'Dense': {
+-        // No lazy Linear in tinygrad: in_features defaults to the same value as
+-        // out_features (units) since the real input size is unknown here.
++        // No lazy Linear in tinygrad: in_features is inferred from the predecessor's
++        // feature dim, falling back to units with a loud TODO when not derivable.
+         const units = p.units !== undefined ? this.renderValue(p.units) : '1';
+-        return `nn.Linear(${units}, ${units})`;
++        const inferred = this.inferredInputFeatures(node);
++        const inFeatures = inferred !== null ? this.renderValue(inferred) : units;
++        const todo = inferred !== null ? '' : '  # TODO: set in_features (could not infer from graph)';
++        return `nn.Linear(${inFeatures}, ${units})${todo}`;
+       }
+       case 'Conv2D': {
+-        // in_channels defaults to out_channels (filters); kernel_size passed through.
++        // in_channels is inferred from the predecessor's channel count, falling back
++        // to filters with a loud TODO when not derivable; kernel_size passed through.
+         const filters = p.filters !== undefined ? this.renderValue(p.filters) : '1';
+         const kernel = p.kernel_size !== undefined ? this.renderValue(p.kernel_size) : '3';
+-        return `nn.Conv2d(${filters}, ${filters}, ${kernel})`;
++        const inferred = this.inferredInputFeatures(node);
++        const inChannels = inferred !== null ? this.renderValue(inferred) : filters;
++        const todo = inferred !== null ? '' : '  # TODO: set in_channels (could not infer from graph)';
++        return `nn.Conv2d(${inChannels}, ${filters}, ${kernel})${todo}`;
++      }
++      case 'BatchNormalization': {
++        // BatchNorm2d needs num_features = the input channel count, inferred from the
++        // predecessor; the fallback placeholder (1) keeps the code importable and the
++        // loud TODO makes the guess impossible to miss.
++        const inferred = this.inferredInputFeatures(node);
++        if (inferred !== null) return `nn.BatchNorm2d(${this.renderValue(inferred)})`;
++        return 'nn.BatchNorm2d(1)  # TODO: set num_features (could not infer from graph)';
+       }
+-      case 'BatchNormalization':
+-        // BatchNorm2d needs num_features and has no out-dim to reuse; emit a clearly
+-        // labelled placeholder (1) to keep the code importable - adjust to the channels.
+-        return 'nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count';
+       default:
+         return null;
+     }
+diff --git a/nnvp-client-vue/tests/contract/apiContract.test.js b/nnvp-client-vue/tests/contract/apiContract.test.js
+new file mode 100644
+index 0000000..670f9a8
+--- /dev/null
++++ b/nnvp-client-vue/tests/contract/apiContract.test.js
+@@ -0,0 +1,303 @@
++/**
++ * apiContract.test.js
++ *
++ * REAL round-trip contract tests: the SPA's actual ApiClient
++ * (src/lib/Backend/apiClient.js) talking to the actual Django Ninja backend
++ * over real HTTP (Node's global fetch). No mocks anywhere.
++ *
++ * Requires a running backend, e.g. via `bash scripts/test-contract.sh`, or:
++ *   NNVP_BACKEND_URL=http://127.0.0.1:8123 npm run test:contract
++ *
++ * These tests are intentionally excluded from `npm run test:unit`
++ * (see vitest.config.js vs vitest.contract.config.js).
++ */
++import { readFileSync } from 'node:fs';
++import { fileURLToPath } from 'node:url';
++import { beforeAll, describe, expect, it } from 'vitest';
++import ApiClient, { ApiError, ERROR_CODES } from '../../src/lib/Backend/apiClient.js';
++
++const BACKEND_URL = process.env.NNVP_BACKEND_URL || 'http://127.0.0.1:8123';
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++/** Minimal in-memory Storage stub (the client supports injectable storage). */
++class MemoryStorage {
++  constructor() { this.map = new Map(); }
++  getItem(key) { return this.map.has(key) ? this.map.get(key) : null; }
++  setItem(key, value) { this.map.set(key, String(value)); }
++  removeItem(key) { this.map.delete(key); }
++}
++
++function makeClient() {
++  const client = new ApiClient({ storage: new MemoryStorage() });
++  client.setBaseUrl(BACKEND_URL);
++  return client;
++}
++
++// Unique emails per run so re-runs against a reused DB never collide.
++const RUN_ID = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`;
++let emailCounter = 0;
++function uniqueEmail() {
++  emailCounter += 1;
++  return `contract-${RUN_ID}-${emailCounter}@example.test`;
++}
++
++/** Await a rejection and assert it is a structured ApiError. */
++async function expectApiError(promise, { code, status } = {}) {
++  const err = await promise.then(
++    (value) => {
++      throw new Error(`expected ApiError but the call resolved with: ${JSON.stringify(value)}`);
++    },
++    (e) => e,
++  );
++  expect(err).toBeInstanceOf(ApiError);
++  expect(err.name).toBe('ApiError');
++  if (code !== undefined) expect(err.code).toBe(code);
++  if (status !== undefined) expect(err.status).toBe(status);
++  return err;
++}
++
++/**
++ * A REALISTIC graph payload in the exact `{layers, edges, inputs, outputs}`
++ * shape the app saves (see D3Model.generateJson / AccountPanel cloud save).
++ * Lifted from the repo's real MNIST CNN example; the file stores only
++ * `{layers, edges}`, so `inputs`/`outputs` are derived from the Input/Output
++ * layers, matching what D3Model serializes for a loaded model.
++ */
++function realisticGraph() {
++  const file = fileURLToPath(
++    new URL('../../../ourKerasExemples/Mnist_Cnn_Param.json', import.meta.url),
++  );
++  const { layers, edges } = JSON.parse(readFileSync(file, 'utf8'));
++  return {
++    layers,
++    edges,
++    inputs: layers.filter((l) => l.kerasLayer.name === 'Input').map((l) => l.id),
++    outputs: layers.filter((l) => l.kerasLayer.name === 'Output').map((l) => l.id),
++  };
++}
++
++/** A small hand-built graph in the same shape, used for update round-trips. */
++function smallGraph() {
++  return {
++    layers: [
++      { class: 'D3Layer', x: 10, y: 10, width: 80, height: 40, id: 0, htmlID: 'Layer_0', name: 'Input', inputLayers: [], outputLayers: [1], kerasLayer: { name: 'Input' } },
++      { class: 'D3Layer', x: 10, y: 90, width: 80, height: 40, id: 1, htmlID: 'Layer_1', name: 'Dense', inputLayers: [0], outputLayers: [2], kerasLayer: { name: 'Dense', parameterValues: { units: 4, activation: 'relu' } } },
++      { class: 'D3Layer', x: 10, y: 170, width: 80, height: 40, id: 2, htmlID: 'Layer_2', name: 'Output', inputLayers: [1], outputLayers: [], kerasLayer: { name: 'Output' } },
++    ],
++    edges: [
++      { id: 's0_t1', source: 0, target: 1 },
++      { id: 's1_t2', source: 1, target: 2 },
++    ],
++    inputs: [0],
++    outputs: [2],
++  };
++}
++
++// ---------------------------------------------------------------------------
++// Suite (single file, sequential: later blocks reuse state from earlier ones)
++// ---------------------------------------------------------------------------
++
++describe(`API contract against real backend at ${BACKEND_URL}`, () => {
++  beforeAll(async () => {
++    let response;
++    try {
++      response = await fetch(`${BACKEND_URL}/api/docs`);
++    } catch (cause) {
++      throw new Error(
++        `No backend reachable at ${BACKEND_URL} (${cause}). `
++        + 'Start one with `bash scripts/test-contract.sh` or set NNVP_BACKEND_URL.',
++      );
++    }
++    expect(response.ok).toBe(true);
++  });
++
++  // Shared state across the ordered tests below.
++  const alice = { client: makeClient(), email: uniqueEmail(), password: `pw-${RUN_ID}-alice` };
++  const bob = { client: makeClient(), email: uniqueEmail(), password: `pw-${RUN_ID}-bob` };
++  const graph = realisticGraph();
++  let aliceProjectId = null;
++
++  describe('auth', () => {
++    it('register returns 201 with a token and the user shape, and stores the token', async () => {
++      const data = await alice.client.register({ email: alice.email, password: alice.password });
++
++      expect(typeof data.token).toBe('string');
++      expect(data.token.length).toBeGreaterThan(0);
++      expect(typeof data.user.id).toBe('number');
++      expect(data.user.email).toBe(alice.email);
++      alice.id = data.user.id;
++
++      // The client auto-stores the token in its (injected) storage.
++      expect(alice.client.getToken()).toBe(data.token);
++      expect(alice.client.isLoggedIn()).toBe(true);
++    });
++
++    it('registering the same email again is rejected with HTTP 409', async () => {
++      const err = await expectApiError(
++        makeClient().register({ email: alice.email, password: alice.password }),
++        { code: ERROR_CODES.http, status: 409 },
++      );
++      expect(err.body).toEqual({ detail: 'A user with that email already exists.' });
++    });
++
++    it('login returns a fresh token for an existing user', async () => {
++      const client = makeClient();
++      const data = await client.login({ email: alice.email, password: alice.password });
++
++      expect(typeof data.token).toBe('string');
++      expect(data.token.length).toBeGreaterThan(0);
++      expect(data.user).toEqual({ id: alice.id, email: alice.email });
++      expect(client.getToken()).toBe(data.token);
++
++      // Keep alice on a login-issued token for the rest of the suite.
++      alice.client = client;
++    });
++
++    it('me returns the id/email of the token owner', async () => {
++      const me = await alice.client.me();
++      expect(me).toEqual({ id: alice.id, email: alice.email });
++    });
++
++    it('login with bad credentials fails with a structured 401 ApiError', async () => {
++      const err = await expectApiError(
++        makeClient().login({ email: alice.email, password: 'definitely-wrong' }),
++        { code: ERROR_CODES.http, status: 401 },
++      );
++      expect(err.body).toEqual({ detail: 'Invalid email or password.' });
++      expect(err.message).toBe('Invalid email or password.');
++    });
++
++    it('me with no token short-circuits client-side with a not-logged-in ApiError', async () => {
++      const client = makeClient(); // configured URL, no token
++      const err = await expectApiError(client.me(), { code: ERROR_CODES.notLoggedIn });
++      expect(err.status).toBeNull(); // never hit the network
++    });
++
++    it('me with an invalid token is rejected by the backend with 401', async () => {
++      const client = makeClient();
++      client.setToken('not-a-real-jwt');
++      const err = await expectApiError(client.me(), { code: ERROR_CODES.http, status: 401 });
++      expect(err.body).toEqual({ detail: 'Unauthorized' });
++    });
++
++    it('project routes also require auth (401 with an invalid token)', async () => {
++      const client = makeClient();
++      client.setToken('not-a-real-jwt');
++      await expectApiError(client.listProjects(), { code: ERROR_CODES.http, status: 401 });
++    });
++  });
++
++  describe('projects CRUD round-trip', () => {
++    it('create returns the full project including the graph exactly as sent', async () => {
++      const created = await alice.client.createProject({ name: 'Mnist CNN', graph });
++
++      expect(typeof created.id).toBe('number');
++      expect(created.name).toBe('Mnist CNN');
++      expect(typeof created.updated_at).toBe('string');
++      expect(Number.isNaN(Date.parse(created.updated_at))).toBe(false);
++      // The true round-trip: the stored graph deep-equals what the app sent.
++      expect(created.graph).toEqual(graph);
++
++      aliceProjectId = created.id;
++    });
++
++    it('list includes the project WITHOUT the graph blob', async () => {
++      const projects = await alice.client.listProjects();
++      expect(Array.isArray(projects)).toBe(true);
++
++      const entry = projects.find((p) => p.id === aliceProjectId);
++      expect(entry).toBeDefined();
++      expect(entry.name).toBe('Mnist CNN');
++      expect(typeof entry.updated_at).toBe('string');
++      // Contract: the list payload omits the graph entirely.
++      expect('graph' in entry).toBe(false);
++      expect(Object.keys(entry).sort()).toEqual(['id', 'name', 'updated_at']);
++    });
++
++    it('get returns the graph, deep-equal to what was sent', async () => {
++      const project = await alice.client.getProject(aliceProjectId);
++      expect(project.id).toBe(aliceProjectId);
++      expect(project.name).toBe('Mnist CNN');
++      expect(project.graph).toEqual(graph);
++    });
++
++    it('update with name only renames without touching the stored graph', async () => {
++      const updated = await alice.client.updateProject(aliceProjectId, { name: 'Mnist CNN v2' });
++      expect(updated.id).toBe(aliceProjectId);
++      expect(updated.name).toBe('Mnist CNN v2');
++      expect(updated.graph).toEqual(graph);
++
++      const refetched = await alice.client.getProject(aliceProjectId);
++      expect(refetched.name).toBe('Mnist CNN v2');
++      expect(refetched.graph).toEqual(graph);
++    });
++
++    it('update with a new graph round-trips the new graph', async () => {
++      const nextGraph = smallGraph();
++      const updated = await alice.client.updateProject(aliceProjectId, {
++        name: 'Small Dense',
++        graph: nextGraph,
++      });
++      expect(updated.name).toBe('Small Dense');
++      expect(updated.graph).toEqual(nextGraph);
++
++      const refetched = await alice.client.getProject(aliceProjectId);
++      expect(refetched.graph).toEqual(nextGraph);
++      expect(refetched.graph).not.toEqual(graph);
++    });
++
++    it('get of a nonexistent project id is a structured 404', async () => {
++      await expectApiError(
++        alice.client.getProject(99999999),
++        { code: ERROR_CODES.http, status: 404 },
++      );
++    });
++  });
++
++  describe('ownership isolation', () => {
++    it('a second user cannot read, modify, or see the first user\'s project', async () => {
++      const data = await bob.client.register({ email: bob.email, password: bob.password });
++      expect(typeof data.token).toBe('string');
++
++      // Read is a 404 (not a 403): existence is not leaked across owners.
++      await expectApiError(
++        bob.client.getProject(aliceProjectId),
++        { code: ERROR_CODES.http, status: 404 },
++      );
++      await expectApiError(
++        bob.client.updateProject(aliceProjectId, { name: 'hijacked' }),
++        { code: ERROR_CODES.http, status: 404 },
++      );
++      await expectApiError(
++        bob.client.deleteProject(aliceProjectId),
++        { code: ERROR_CODES.http, status: 404 },
++      );
++
++      // Bob's list does not contain Alice's project.
++      const bobProjects = await bob.client.listProjects();
++      expect(bobProjects.some((p) => p.id === aliceProjectId)).toBe(false);
++
++      // And Alice's project is untouched by the failed cross-user writes.
++      const project = await alice.client.getProject(aliceProjectId);
++      expect(project.name).toBe('Small Dense');
++    });
++  });
++
++  describe('delete', () => {
++    it('delete returns 204 (client resolves null) and a subsequent get is 404', async () => {
++      const result = await alice.client.deleteProject(aliceProjectId);
++      expect(result).toBeNull(); // 204 No Content
++
++      await expectApiError(
++        alice.client.getProject(aliceProjectId),
++        { code: ERROR_CODES.http, status: 404 },
++      );
++
++      const projects = await alice.client.listProjects();
++      expect(projects.some((p) => p.id === aliceProjectId)).toBe(false);
++    });
++  });
++});
+diff --git a/nnvp-client-vue/tests/unit/D3GraphEditor.test.js b/nnvp-client-vue/tests/unit/D3GraphEditor.test.js
+index 9c7699b..4ed4c21 100644
+--- a/nnvp-client-vue/tests/unit/D3GraphEditor.test.js
++++ b/nnvp-client-vue/tests/unit/D3GraphEditor.test.js
+@@ -2,6 +2,7 @@
+ import { describe, it, expect, beforeEach } from 'vitest';
+ import * as d3 from 'd3';
+ import D3GraphEditor from '../../src/lib/D3Interface/D3GraphEditor';
++import D3GraphValidation from '../../src/lib/D3Interface/D3GraphValidation';
+ import KerasLayer from '../../src/lib/KerasInterface/KerasLayer';
+ 
+ // d3-zoom reads the SVG's intrinsic width/height (via width.baseVal.value) when
+@@ -152,6 +153,20 @@ describe('D3GraphEditor', () => {
+     expect(editor.model.d3Edges).toHaveLength(0);
+   });
+ 
++  it('isKerasError refreshes the linkError class of a drawn edge', () => {
++    editor.addLayer(new KerasLayer('Input', 'Core'), 0, 0);
++    editor.addLayer(new KerasLayer('Dense', 'Core'), 300, 0);
++    const [a, b] = editor.model.d3Layers;
++    editor.layerMouseDown(a);
++    editor.layerMouseUp(b);
++    const edge = editor.model.d3Edges[0];
++    // Used to throw "thisEdge is not defined".
++    expect(() => D3GraphValidation.isKerasError(editor, edge)).not.toThrow();
++    const path = document.querySelector(`#${edge.htmlID} path`);
++    expect(path.classList.contains('linkError'))
++      .toBe(!!D3GraphValidation.kerasError(editor, edge));
++  });
++
+   it('notifyGraphChanged / notifySelectionChanged fire the registered callbacks', () => {
+     let graphChanges = 0;
+     let selectionChanges = 0;
+@@ -190,15 +205,29 @@ describe('D3GraphEditor selection bookkeeping', () => {
+     expect(editor.selectedNodes).toEqual([a, b]);
+   });
+ 
+-  it('selectOnNode re-selecting a node keeps a single entry, moved to the end', () => {
+-    // selectOnNode removes an already-selected node but then unconditionally
+-    // re-pushes it, so re-selecting does not deselect: it keeps one entry and
+-    // reorders it to the end. Deselecting all is done via undoSelection.
++  it('selectOnNode is idempotent: re-selecting keeps one entry in place', () => {
++    // Re-selecting an already-selected node must neither duplicate it nor
++    // move it to the end of the selection.
+     const [a, b] = editor.model.d3Layers;
+     editor.selectOnNode(a);
+     editor.selectOnNode(b);
+     editor.selectOnNode(a);
+-    expect(editor.selectedNodes).toEqual([b, a]);
++    expect(editor.selectedNodes).toEqual([a, b]);
++  });
++
++  it('toggleNodeSelection adds an unselected node to the selection', () => {
++    const [a, b] = editor.model.d3Layers;
++    editor.toggleNodeSelection(a);
++    editor.toggleNodeSelection(b);
++    expect(editor.selectedNodes).toEqual([a, b]);
++  });
++
++  it('toggleNodeSelection deselects an already-selected node', () => {
++    const [a, b] = editor.model.d3Layers;
++    editor.selectOnNode(a);
++    editor.selectOnNode(b);
++    editor.toggleNodeSelection(a);
++    expect(editor.selectedNodes).toEqual([b]);
+   });
+ 
+   it('undoSelection clears the current selection', () => {
+@@ -209,6 +238,33 @@ describe('D3GraphEditor selection bookkeeping', () => {
+     expect(editor.selectedNodes).toHaveLength(0);
+   });
+ 
++  it('removeObserver ignores an object that is not an observer', () => {
++    // splice(indexOf(o), 1) with indexOf === -1 used to remove the LAST
++    // observer instead of doing nothing.
++    editor.layerMouseDown(editor.model.d3Layers[0]);
++    editor.layerMouseUp(editor.model.d3Layers[1]);
++    const [a] = editor.model.d3Layers;
++    const edge = editor.model.d3Edges[0];
++    expect(a.observers).toEqual([edge]);
++    a.removeObserver({ not: 'an observer' });
++    expect(a.observers).toEqual([edge]);
++    a.removeObserver(edge);
++    expect(a.observers).toEqual([]);
++  });
++
++  it('clone returns a fresh layer with copied wiring and a new id', () => {
++    editor.layerMouseDown(editor.model.d3Layers[0]);
++    editor.layerMouseUp(editor.model.d3Layers[1]);
++    const [a, b] = editor.model.d3Layers;
++    const copy = b.clone();
++    expect(copy).toBeDefined();
++    expect(copy).not.toBe(b);
++    expect(copy.kerasLayer.name).toBe(b.kerasLayer.name);
++    expect(copy.inputLayers).toEqual([a.id]);
++    expect(copy.id).not.toBe(a.id);
++    expect(copy.id).not.toBe(b.id);
++  });
++
+   it('selectEdge clears node selection and unselects a previously selected edge', () => {
+     editor.layerMouseDown(editor.model.d3Layers[0]);
+     editor.layerMouseUp(editor.model.d3Layers[1]);
+diff --git a/nnvp-client-vue/tests/unit/KerasGeneratorPyTorch.test.js b/nnvp-client-vue/tests/unit/KerasGeneratorPyTorch.test.js
+index 4b054f2..7b2a20e 100644
+--- a/nnvp-client-vue/tests/unit/KerasGeneratorPyTorch.test.js
++++ b/nnvp-client-vue/tests/unit/KerasGeneratorPyTorch.test.js
+@@ -83,6 +83,37 @@ function lstmJson() {
+   };
+ }
+ 
++// Embedding -> LSTM inference chain: Input(1) -> Embedding(2, 1000/64) -> LSTM(3, 32) -> Output(4).
++// The LSTM input_size must be the Embedding's output_dim (64), not its own units.
++function embeddingLstmJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['4'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [20] }, outputLayers: ['2'] }),
++      leaf('2', 'Embedding', { params: { input_dim: 1000, output_dim: 64 }, inputLayers: ['1'], outputLayers: ['3'] }),
++      leaf('3', 'LSTM', { params: { units: 32 }, inputLayers: ['2'], outputLayers: ['4'] }),
++      leaf('4', 'Output', { inputLayers: ['3'] }),
++    ],
++  };
++}
++
++// Uninferable recurrent input_size: the LSTM sits behind an unsupported layer, so its
++// predecessor feature dim is unknown -> fallback to units with a loud TODO comment.
++// Input(1) -> GaussianNoise(2) -> LSTM(3, units 8) -> Output(4).
++function uninferableLstmJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['4'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [10] }, outputLayers: ['2'] }),
++      leaf('2', 'GaussianNoise', { params: { stddev: 0.1 }, inputLayers: ['1'], outputLayers: ['3'] }),
++      leaf('3', 'LSTM', { params: { units: 8 }, inputLayers: ['2'], outputLayers: ['4'] }),
++      leaf('4', 'Output', { inputLayers: ['3'] }),
++    ],
++  };
++}
++
+ // Sequential embedding + recurrent stack, mixing supported layer families:
+ // Input(1) -> Embedding(2) -> LSTM(3, return_sequences) -> SimpleRNN(4) -> Dense(5) -> Output(6).
+ function mixedJson() {
+@@ -197,8 +228,8 @@ describe('PyTorch: full generation', () => {
+       + '  def __init__(self):\n'
+       + '    super().__init__()\n'
+       + '    self.layer_2 = nn.Embedding(5000, 32)\n'
+-      + '    self.layer_3 = nn.LSTM(64, 64, batch_first=True)\n'
+-      + '    self.layer_4 = nn.RNN(32, 32, batch_first=True)\n'
++      + '    self.layer_3 = nn.LSTM(32, 64, batch_first=True)\n'
++      + '    self.layer_4 = nn.RNN(64, 32, batch_first=True)\n'
+       + '    self.layer_5 = nn.LazyLinear(10)\n'
+       + '\n'
+       + '  def forward(self, x):\n'
+@@ -210,6 +241,37 @@ describe('PyTorch: full generation', () => {
+       + '    return x\n',
+     );
+   });
++
++  it('infers the LSTM input_size from the upstream Embedding output_dim', () => {
++    const code = new KerasGenerator(embeddingLstmJson()).generatePyTorchFromGraph();
++    expect(code).toBe(
++      'import torch\n'
++      + 'import torch.nn as nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model(nn.Module):\n'
++      + '  def __init__(self):\n'
++      + '    super().__init__()\n'
++      + '    self.layer_2 = nn.Embedding(1000, 64)\n'
++      + '    self.layer_3 = nn.LSTM(64, 32, batch_first=True)\n'
++      + '\n'
++      + '  def forward(self, x):\n'
++      + '    x = self.layer_2(x)\n'
++      + '    x, _ = self.layer_3(x)\n'
++      + '    x = x[:, -1, :]\n'
++      + '    return x\n',
++    );
++    // Correct inference must not leave a TODO marker behind.
++    expect(code).not.toContain('TODO: set input_size');
++  });
++
++  it('falls back to units with a loud TODO when input_size cannot be inferred', () => {
++    const code = new KerasGenerator(uninferableLstmJson()).generatePyTorchFromGraph();
++    expect(code).toContain(
++      '    self.layer_3 = nn.LSTM(8, 8, batch_first=True)'
++      + '  # TODO: set input_size (could not infer from graph)\n',
++    );
++  });
+ });
+ 
+ describe('PyTorch: layer -> torch.nn mapping', () => {
+@@ -236,11 +298,13 @@ describe('PyTorch: layer -> torch.nn mapping', () => {
+   });
+ 
+   it('maps embedding and recurrent layers to their torch modules', () => {
++    // Bare nodes (no graph context) have no inferable input_size -> loud TODO fallback.
++    const todo = '  # TODO: set input_size (could not infer from graph)';
+     expect(ctor('Embedding', { input_dim: 1000, output_dim: 64 })).toBe('nn.Embedding(1000, 64)');
+-    expect(ctor('LSTM', { units: 8 })).toBe('nn.LSTM(8, 8, batch_first=True)');
+-    expect(ctor('GRU', { units: 16 })).toBe('nn.GRU(16, 16, batch_first=True)');
+-    expect(ctor('SimpleRNN', { units: 32 })).toBe('nn.RNN(32, 32, batch_first=True)');
+-    expect(ctor('RNN', { units: 4 })).toBe('nn.RNN(4, 4, batch_first=True)');
++    expect(ctor('LSTM', { units: 8 })).toBe(`nn.LSTM(8, 8, batch_first=True)${todo}`);
++    expect(ctor('GRU', { units: 16 })).toBe(`nn.GRU(16, 16, batch_first=True)${todo}`);
++    expect(ctor('SimpleRNN', { units: 32 })).toBe(`nn.RNN(32, 32, batch_first=True)${todo}`);
++    expect(ctor('RNN', { units: 4 })).toBe(`nn.RNN(4, 4, batch_first=True)${todo}`);
+   });
+ 
+   it('returns null (-> TODO) for an unmapped layer or unknown activation', () => {
+diff --git a/nnvp-client-vue/tests/unit/KerasGeneratorTinygrad.test.js b/nnvp-client-vue/tests/unit/KerasGeneratorTinygrad.test.js
+index 859303a..37c9a38 100644
+--- a/nnvp-client-vue/tests/unit/KerasGeneratorTinygrad.test.js
++++ b/nnvp-client-vue/tests/unit/KerasGeneratorTinygrad.test.js
+@@ -75,6 +75,23 @@ function functionalJson() {
+   };
+ }
+ 
++// MNIST-style MLP with a 3D input: Input(1, [28,28,1]) -> Flatten(2) -> Dense(3,128)
++// -> Dense(4,10) -> Output(5). The full Input shape is known, so Flatten's product
++// (784) and the chained Dense in_features (128) must both be inferred.
++function mnistMlpJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['5'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [28, 28, 1] }, outputLayers: ['2'] }),
++      leaf('2', 'Flatten', { inputLayers: ['1'], outputLayers: ['3'] }),
++      leaf('3', 'Dense', { params: { units: 128 }, inputLayers: ['2'], outputLayers: ['4'] }),
++      leaf('4', 'Dense', { params: { units: 10 }, inputLayers: ['3'], outputLayers: ['5'] }),
++      leaf('5', 'Output', { inputLayers: ['4'] }),
++    ],
++  };
++}
++
+ // A layer NNVP does not know how to map to tinygrad -> TODO placeholder.
+ // Input(1) -> GaussianNoise(2) -> Output(3) (still a linear chain -> sequential path).
+ function unsupportedJson() {
+@@ -100,8 +117,8 @@ describe('Tinygrad: full generation', () => {
+       + '\n'
+       + 'class Model:\n'
+       + '  def __init__(self):\n'
+-      + '    self.layer_3 = nn.Linear(128, 128)\n'
+-      + '    self.layer_4 = nn.Linear(10, 10)\n'
++      + '    self.layer_3 = nn.Linear(784, 128)\n'
++      + '    self.layer_4 = nn.Linear(128, 10)\n'
+       + '\n'
+       + '  def __call__(self, x):\n'
+       + '    x = x.flatten(1)\n'
+@@ -119,9 +136,11 @@ describe('Tinygrad: full generation', () => {
+       + '\n'
+       + 'class Model:\n'
+       + '  def __init__(self):\n'
+-      + '    self.layer_2 = nn.Conv2d(16, 16, (3,3,))\n'
+-      + '    self.layer_3 = nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count\n'
+-      + '    self.layer_6 = nn.Linear(10, 10)\n'
++      + '    self.layer_2 = nn.Conv2d(1, 16, (3,3,))\n'
++      + '    self.layer_3 = nn.BatchNorm2d(16)\n'
++      // Flatten after a Conv2D: spatial arithmetic is not attempted, so the Dense
++      // in_features is not inferable -> out-dim fallback with a loud TODO.
++      + '    self.layer_6 = nn.Linear(10, 10)  # TODO: set in_features (could not infer from graph)\n'
+       + '\n'
+       + '  def __call__(self, x):\n'
+       + '    x = self.layer_2(x)\n'
+@@ -141,8 +160,8 @@ describe('Tinygrad: full generation', () => {
+       + '\n'
+       + 'class Model:\n'
+       + '  def __init__(self):\n'
+-      + '    self.layer_2 = nn.Linear(4, 4)\n'
+-      + '    self.layer_3 = nn.Linear(4, 4)\n'
++      + '    self.layer_2 = nn.Linear(10, 4)\n'
++      + '    self.layer_3 = nn.Linear(10, 4)\n'
+       + '    # TODO: unsupported layer Concatenate\n'
+       + '\n'
+       + '  def __call__(self, x):\n'
+@@ -172,6 +191,27 @@ describe('Tinygrad: full generation', () => {
+     // The placeholder must not silently emit wrong tinygrad code.
+     expect(code).not.toContain('nn.GaussianNoise');
+   });
++
++  it('infers Flatten product and chained Dense in_features from the Input shape', () => {
++    const code = new KerasGenerator(mnistMlpJson()).generateTinygradFromGraph();
++    expect(code).toBe(
++      'from tinygrad import Tensor, nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model:\n'
++      + '  def __init__(self):\n'
++      + '    self.layer_3 = nn.Linear(784, 128)\n'
++      + '    self.layer_4 = nn.Linear(128, 10)\n'
++      + '\n'
++      + '  def __call__(self, x):\n'
++      + '    x = x.flatten(1)\n'
++      + '    x = self.layer_3(x)\n'
++      + '    x = self.layer_4(x)\n'
++      + '    return x\n',
++    );
++    // Fully inferred dims must not leave any TODO marker behind.
++    expect(code).not.toContain('TODO');
++  });
+ });
+ 
+ describe('Tinygrad: layer -> tinygrad mapping', () => {
+@@ -185,11 +225,16 @@ describe('Tinygrad: layer -> tinygrad mapping', () => {
+     return new KerasGeneratorTinygradHelper(graph, [], [], [], false).methodCall('n');
+   };
+ 
+-  it('maps module layers, defaulting the in-dim to the out-dim', () => {
+-    expect(ctor('Dense', { units: 32 })).toBe('nn.Linear(32, 32)');
+-    expect(ctor('Conv2D', { filters: 16, kernel_size: [3, 3] })).toBe('nn.Conv2d(16, 16, (3,3,))');
++  it('maps module layers, falling back to the out-dim + loud TODO without a graph', () => {
++    // Bare nodes (no graph context) have no inferable in-dim -> loud TODO fallback.
++    expect(ctor('Dense', { units: 32 })).toBe(
++      'nn.Linear(32, 32)  # TODO: set in_features (could not infer from graph)',
++    );
++    expect(ctor('Conv2D', { filters: 16, kernel_size: [3, 3] })).toBe(
++      'nn.Conv2d(16, 16, (3,3,))  # TODO: set in_channels (could not infer from graph)',
++    );
+     expect(ctor('BatchNormalization')).toBe(
+-      'nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count',
++      'nn.BatchNorm2d(1)  # TODO: set num_features (could not infer from graph)',
+     );
+   });
+ 
+diff --git a/nnvp-client-vue/tests/unit/assistantActions.test.js b/nnvp-client-vue/tests/unit/assistantActions.test.js
+index dcc4bf1..3de9ff9 100644
+--- a/nnvp-client-vue/tests/unit/assistantActions.test.js
++++ b/nnvp-client-vue/tests/unit/assistantActions.test.js
+@@ -481,3 +481,46 @@ describe('AnthropicClient.send error handling', () => {
+     expect(fetchImpl.calls).toHaveLength(0);
+   });
+ });
++
++describe('AnthropicClient backend proxy mode', () => {
++  const makeActions = () => new AssistantActions(makeFakeD3Interface(), makeFakeKerasInterface());
++
++  it('posts to /api/assistant/messages with the backend JWT and no API key', async () => {
++    const fetchImpl = makeFakeFetch([textReply('ok')]);
++    const client = new AnthropicClient(makeActions(), {
++      fetch: fetchImpl,
++      baseUrl: 'http://localhost:8009/',
++      backendUrl: 'http://localhost:8009',
++      backendToken: 'backend-jwt',
++    });
++    const reply = await client.send([{ role: 'user', content: 'hi' }]);
++    expect(reply).toBe('ok');
++    expect(fetchImpl.calls[0].url).toBe('http://localhost:8009/api/assistant/messages');
++    expect(fetchImpl.calls[0].init.headers.authorization).toBe('Bearer backend-jwt');
++    expect(fetchImpl.calls[0].init.headers['x-api-key']).toBeUndefined();
++  });
++
++  it('asks the user to sign in when the backend proxy is selected without a token', async () => {
++    const client = new AnthropicClient(makeActions(), {
++      fetch: makeFakeFetch([]),
++      baseUrl: 'http://localhost:8009',
++      backendUrl: 'http://localhost:8009',
++    });
++    await expect(client.send([{ role: 'user', content: 'hi' }])).rejects.toThrow(/Sign in/);
++  });
++
++  it('treats a non-backend custom base URL as an Anthropic-compatible proxy', async () => {
++    const fetchImpl = makeFakeFetch([textReply('ok')]);
++    const client = new AnthropicClient(makeActions(), {
++      fetch: fetchImpl,
++      apiKey: 'sk-ant-testkey',
++      baseUrl: 'https://myproxy.example.com',
++      backendUrl: 'http://localhost:8009',
++      backendToken: 'backend-jwt',
++    });
++    await client.send([{ role: 'user', content: 'hi' }]);
++    expect(fetchImpl.calls[0].url).toBe('https://myproxy.example.com/v1/messages');
++    expect(fetchImpl.calls[0].init.headers['x-api-key']).toBe('sk-ant-testkey');
++    expect(fetchImpl.calls[0].init.headers.authorization).toBeUndefined();
++  });
++});
+diff --git a/nnvp-client-vue/vitest.contract.config.js b/nnvp-client-vue/vitest.contract.config.js
+new file mode 100644
+index 0000000..d2f2e40
+--- /dev/null
++++ b/nnvp-client-vue/vitest.contract.config.js
+@@ -0,0 +1,17 @@
++import { defineConfig } from 'vitest/config';
++
++// Contract tests: the real ApiClient against a real running Django backend.
++// Deliberately a separate config so `npm run test:unit` (vitest.config.js,
++// which includes only tests/unit/**) never picks these up.
++// Run via `npm run test:contract` or `bash scripts/test-contract.sh`.
++export default defineConfig({
++  test: {
++    environment: 'node',
++    include: ['tests/contract/**/*.{test,spec}.js'],
++    // Tests within the suite share backend state and must run in order,
++    // against a single backend instance.
++    fileParallelism: false,
++    testTimeout: 15000,
++    hookTimeout: 15000,
++  },
++});
+-- 
+2.43.0
+

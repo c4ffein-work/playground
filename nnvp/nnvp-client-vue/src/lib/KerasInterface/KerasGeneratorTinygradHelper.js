@@ -4,11 +4,11 @@
 //
 // Unlike PyTorch, tinygrad has NO lazy layers: nn.Linear / nn.Conv2d / nn.BatchNorm2d
 // all need their input dimension (in_features / in_channels / num_features) up front.
-// That size is unknown from the graph at design time, so - mirroring how the PyTorch
-// helper documented its recurrent input_size choice - we default the in-dim to the
-// SAME value as the out-dim (units / filters), and fall back to a clearly-commented
-// placeholder for BatchNorm (which has no out-dim to reuse). The emitted code is valid
-// and importable; the placeholder dimensions are the documented assumption to adjust.
+// That dimension is inferred from the graph (see KerasGeneratorDimInference): each
+// predecessor's feature dim / channel count is walked down from the Input shape. When
+// the graph does not make it derivable, we fall back to the out-dim (units / filters,
+// or 1 for BatchNorm which has no out-dim to reuse) with a loud TODO comment on the
+// line, so the emitted code stays valid and importable and the guess cannot be missed.
 //
 // tinygrad activations are Tensor METHODS (x.relu(), x.sigmoid(), ...), not modules,
 // and Flatten is a method too (x.flatten(1)), so those nodes emit no __init__ line.
@@ -18,6 +18,8 @@
                                                                 "renderValue",
                                                                 "activationMethod"] }] */
 
+import inferFeatureDims from './KerasGeneratorDimInference';
+
 export default class KerasGeneratorTinygradHelper {
   constructor(graph, inputs, outputs, list, sequential) {
     this.graph = graph;
@@ -25,6 +27,15 @@ export default class KerasGeneratorTinygradHelper {
     this.outputs = outputs;
     this.list = list;
     this.sequential = sequential || false;
+    this.dims = inferFeatureDims(graph, list);
+  }
+
+  // Feature dim (last-axis size / channel count) of the node's first predecessor,
+  // as inferred from the graph, or null when it could not be derived.
+  inferredInputFeatures(node) {
+    const sources = this.graph[node].sources || [];
+    const source = this.dims[sources[0]];
+    return source && source.features !== null ? source.features : null;
   }
 
   // Returns the name given to the node in the generated tinygrad code.
@@ -87,21 +98,32 @@ export default class KerasGeneratorTinygradHelper {
     const p = params || {};
     switch (name) {
       case 'Dense': {
-        // No lazy Linear in tinygrad: in_features defaults to the same value as
-        // out_features (units) since the real input size is unknown here.
+        // No lazy Linear in tinygrad: in_features is inferred from the predecessor's
+        // feature dim, falling back to units with a loud TODO when not derivable.
         const units = p.units !== undefined ? this.renderValue(p.units) : '1';
-        return `nn.Linear(${units}, ${units})`;
+        const inferred = this.inferredInputFeatures(node);
+        const inFeatures = inferred !== null ? this.renderValue(inferred) : units;
+        const todo = inferred !== null ? '' : '  # TODO: set in_features (could not infer from graph)';
+        return `nn.Linear(${inFeatures}, ${units})${todo}`;
       }
       case 'Conv2D': {
-        // in_channels defaults to out_channels (filters); kernel_size passed through.
+        // in_channels is inferred from the predecessor's channel count, falling back
+        // to filters with a loud TODO when not derivable; kernel_size passed through.
         const filters = p.filters !== undefined ? this.renderValue(p.filters) : '1';
         const kernel = p.kernel_size !== undefined ? this.renderValue(p.kernel_size) : '3';
-        return `nn.Conv2d(${filters}, ${filters}, ${kernel})`;
+        const inferred = this.inferredInputFeatures(node);
+        const inChannels = inferred !== null ? this.renderValue(inferred) : filters;
+        const todo = inferred !== null ? '' : '  # TODO: set in_channels (could not infer from graph)';
+        return `nn.Conv2d(${inChannels}, ${filters}, ${kernel})${todo}`;
       }
-      case 'BatchNormalization':
-        // BatchNorm2d needs num_features and has no out-dim to reuse; emit a clearly
-        // labelled placeholder (1) to keep the code importable - adjust to the channels.
-        return 'nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count';
+      case 'BatchNormalization': {
+        // BatchNorm2d needs num_features = the input channel count, inferred from the
+        // predecessor; the fallback placeholder (1) keeps the code importable and the
+        // loud TODO makes the guess impossible to miss.
+        const inferred = this.inferredInputFeatures(node);
+        if (inferred !== null) return `nn.BatchNorm2d(${this.renderValue(inferred)})`;
+        return 'nn.BatchNorm2d(1)  # TODO: set num_features (could not infer from graph)';
+      }
       default:
         return null;
     }

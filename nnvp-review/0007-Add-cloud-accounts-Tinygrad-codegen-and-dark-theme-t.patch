@@ -1,7 +1,7 @@
 From 6aeec8b08bdf48efbe317f6f0a1422e39ca75399 Mon Sep 17 00:00:00 2001
 From: c4ffein <c4ffein.work@gmail.com>
 Date: Mon, 6 Jul 2026 16:24:59 +0000
-Subject: [PATCH 7/7] Add cloud accounts, Tinygrad codegen, and dark-theme the
+Subject: [PATCH 7/8] Add cloud accounts, Tinygrad codegen, and dark-theme the
  D3 canvas
 
 Integrated from three subagent branches (merged clean) + one integration fix.

@@ -1,9 +1,15 @@
-"""Small permissive CORS middleware for the SPA.
+"""Env-driven CORS middleware for the SPA (dependency-free, no django-cors-headers).
 
-Public-for-now: allows any origin. Keeps external deps minimal (no
-django-cors-headers). Tighten `Access-Control-Allow-Origin` before locking down.
+Behavior is controlled by settings.CORS_ALLOWED_ORIGINS:
+- contains "*" (the default only when DEBUG=True): wildcard — any origin allowed.
+- non-empty list: the request's Origin header must exactly match an entry
+  (scheme://host[:port]); matches get the origin echoed back plus Vary: Origin.
+- empty list (the default when DEBUG=False): no CORS headers at all — browsers
+  block cross-origin reads until CORS_ALLOWED_ORIGINS is configured.
 """
+from django.conf import settings
 from django.http import HttpResponse
+from django.utils.cache import patch_vary_headers
 
 
 class CorsMiddleware:
@@ -16,10 +22,20 @@ class CorsMiddleware:
         else:
             response = self.get_response(request)
 
-        response["Access-Control-Allow-Origin"] = "*"
-        response["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-        response["Access-Control-Allow-Headers"] = (
-            "Authorization, Content-Type, X-Requested-With"
-        )
-        response["Access-Control-Max-Age"] = "86400"
+        allowed = settings.CORS_ALLOWED_ORIGINS
+        origin = request.META.get("HTTP_ORIGIN")
+        allow_origin = None
+        if "*" in allowed:
+            allow_origin = "*"
+        elif origin and origin in allowed:
+            allow_origin = origin
+            patch_vary_headers(response, ("Origin",))
+
+        if allow_origin:
+            response["Access-Control-Allow-Origin"] = allow_origin
+            response["Access-Control-Allow-Methods"] = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+            response["Access-Control-Allow-Headers"] = (
+                "Authorization, Content-Type, X-Requested-With"
+            )
+            response["Access-Control-Max-Age"] = "86400"
         return response

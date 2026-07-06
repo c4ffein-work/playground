@@ -1,7 +1,7 @@
 From ba5dd2a3beac5061ed64c10bab7eb26b5dec3c37 Mon Sep 17 00:00:00 2001
 From: c4ffein <c4ffein.work@gmail.com>
 Date: Mon, 6 Jul 2026 07:50:12 +0000
-Subject: [PATCH 1/7] Extract layer help into data module, add KerasGenerator
+Subject: [PATCH 1/8] Extract layer help into data module, add KerasGenerator
  unit tests, fix 3 codegen bugs
 
 Refactor:

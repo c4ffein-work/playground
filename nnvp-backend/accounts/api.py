@@ -1,4 +1,6 @@
 from django.contrib.auth import authenticate
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError
 from ninja import Router
 from ninja.errors import HttpError
@@ -16,6 +18,12 @@ def register(request, data: RegisterIn):
     email = data.email.strip().lower()
     if not email or not data.password:
         raise HttpError(422, "Email and password are required.")
+    # Django's standard validator stack (AUTH_PASSWORD_VALIDATORS): min length 8,
+    # common-password, all-numeric, similarity to the email. 422 + messages.
+    try:
+        validate_password(data.password, user=User(email=email))
+    except ValidationError as exc:
+        raise HttpError(422, " ".join(exc.messages))
     try:
         user = User.objects.create_user(email=email, password=data.password)
     except IntegrityError:

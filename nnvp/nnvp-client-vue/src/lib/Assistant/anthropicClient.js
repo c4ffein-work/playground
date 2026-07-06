@@ -142,13 +142,29 @@ export function readStoredConfig(overrides = {}) {
       apiKey: localStorage.getItem(STORAGE_KEY) || '',
       baseUrl: localStorage.getItem(STORAGE_BASE_URL) || '',
       model: localStorage.getItem(STORAGE_MODEL) || '',
+      backendUrl: localStorage.getItem('nnvp_backend_url') || '',
+      backendToken: localStorage.getItem('nnvp_backend_token') || '',
     };
   }
   return {
     apiKey: overrides.apiKey || stored.apiKey || '',
     baseUrl: overrides.baseUrl || stored.baseUrl || DEFAULT_BASE_URL,
     model: overrides.model || stored.model || DEFAULT_MODEL,
+    backendUrl: overrides.backendUrl || stored.backendUrl || '',
+    backendToken: overrides.backendToken || stored.backendToken || '',
   };
+}
+
+const trimSlash = (url) => (url || '').replace(/\/+$/, '');
+
+// The NNVP backend exposes the assistant proxy at /api/assistant/messages with
+// JWT Bearer auth and a server-side Anthropic key — a different path and auth
+// scheme from api.anthropic.com. When the chat's base URL is the configured
+// NNVP backend, switch to that contract; any other custom base URL is treated
+// as a transparent Anthropic-compatible proxy (same /v1/messages + x-api-key).
+export function usesBackendProxy(config) {
+  return Boolean(config.backendUrl)
+    && trimSlash(config.baseUrl) === trimSlash(config.backendUrl);
 }
 
 export default class AnthropicClient {
@@ -236,26 +252,43 @@ export default class AnthropicClient {
   }
 
   async postMessages(messages) {
-    const { apiKey, baseUrl, model } = this.config();
-    if (!apiKey) {
-      throw new Error('No Anthropic API key set. Add one in the assistant settings (⚙).');
-    }
-    if (!isPlausibleApiKey(apiKey)) {
-      throw new Error('The Anthropic API key looks malformed. Check it in the settings (⚙).');
+    const config = this.config();
+    const { apiKey, baseUrl, model } = config;
+    const viaBackend = usesBackendProxy(config);
+    if (viaBackend) {
+      if (!config.backendToken) {
+        throw new Error('Sign in to your NNVP account to use the backend assistant proxy (Account menu).');
+      }
+    } else {
+      if (!apiKey) {
+        throw new Error('No Anthropic API key set. Add one in the assistant settings (⚙).');
+      }
+      if (!isPlausibleApiKey(apiKey)) {
+        throw new Error('The Anthropic API key looks malformed. Check it in the settings (⚙).');
+      }
     }
     if (!this.fetchImpl) {
       throw new Error('No network client is available in this environment.');
     }
+    const endpoint = viaBackend
+      ? `${trimSlash(baseUrl)}/api/assistant/messages`
+      : `${baseUrl}/v1/messages`;
+    const headers = viaBackend
+      ? {
+        authorization: `Bearer ${config.backendToken}`,
+        'content-type': 'application/json',
+      }
+      : {
+        'x-api-key': apiKey,
+        'anthropic-version': ANTHROPIC_VERSION,
+        'anthropic-dangerous-direct-browser-access': 'true',
+        'content-type': 'application/json',
+      };
     let response;
     try {
-      response = await this.fetchImpl(`${baseUrl}/v1/messages`, {
+      response = await this.fetchImpl(endpoint, {
         method: 'POST',
-        headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': ANTHROPIC_VERSION,
-          'anthropic-dangerous-direct-browser-access': 'true',
-          'content-type': 'application/json',
-        },
+        headers,
         body: JSON.stringify({
           model,
           max_tokens: this.options.maxTokens || 2048,

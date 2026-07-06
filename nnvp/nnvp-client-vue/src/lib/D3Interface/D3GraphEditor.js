@@ -227,26 +227,39 @@ D3GraphEditor.prototype.singleSelection = function (node) {
 };
 
 /**
- * Add or remove if already selected, node to selectedNodes
- * @param node which node to select or to remove selection
+ * Add node to selectedNodes, idempotently: an already-selected node
+ * stays selected, without duplicate entry or reordering
+ * @param node which node to select
  */
 D3GraphEditor.prototype.selectOnNode = function (node) {
   if(this.selectedEdge) {
     d3.select("#" + this.selectedEdge.id).classed("selected", false);
     this.selectedEdge = null;
   }
-  this.selectedNodes.forEach(selectedNode => {
-    if (selectedNode == node) {
-      // Remove the html class selected
-      d3.select("#" + node.htmlID).classed("selected", false);
-      this.selectedNodes.splice(this.selectedNodes.indexOf(selectedNode), 1);
-    }
-  });
+  if (this.selectedNodes.indexOf(node) >= 0) {
+    return;
+  }
   // Add the html class selected when selectedEdge
   // Like this CSS can identified selected node
   d3.select("#" + node.htmlID).classed("selected", true);
   this.selectedNodes.push(node);
   this.notifySelectionChanged();
+};
+
+/**
+ * Toggle node's membership in selectedNodes: select it if unselected,
+ * deselect it if already selected (used by shift-click on a layer)
+ * @param node which node to toggle
+ */
+D3GraphEditor.prototype.toggleNodeSelection = function (node) {
+  if (this.selectedNodes.indexOf(node) >= 0) {
+    // Remove the html class selected
+    d3.select("#" + node.htmlID).classed("selected", false);
+    this.selectedNodes.splice(this.selectedNodes.indexOf(node), 1);
+    this.notifySelectionChanged();
+    return;
+  }
+  this.selectOnNode(node);
 };
 
 /**

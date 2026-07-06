@@ -1,7 +1,7 @@
 From bfaaba8dc9ccdb27590430adb45262d317e503e0 Mon Sep 17 00:00:00 2001
 From: c4ffein <c4ffein.work@gmail.com>
 Date: Mon, 6 Jul 2026 12:03:09 +0000
-Subject: [PATCH 5/7] Add 4 features in parallel: AI chat-assistant, MNIST
+Subject: [PATCH 5/8] Add 4 features in parallel: AI chat-assistant, MNIST
  tutorial, PyTorch codegen, tfjs 4 upgrade
 
 Integrated from four independent subagent branches (each built on the theme-v0.1 base),

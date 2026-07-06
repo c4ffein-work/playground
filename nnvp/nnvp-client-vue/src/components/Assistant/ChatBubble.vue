@@ -142,6 +142,8 @@ import AnthropicClient, {
   DEFAULT_MODEL,
   DEFAULT_BASE_URL,
   isPlausibleApiKey,
+  readStoredConfig,
+  usesBackendProxy,
 } from '../../lib/Assistant/anthropicClient';
 
 export default {
@@ -176,7 +178,7 @@ export default {
       this.model = localStorage.getItem(STORAGE_MODEL) || '';
       this.baseUrl = localStorage.getItem(STORAGE_BASE_URL) || '';
     }
-    this.hasKey = Boolean(this.apiKey);
+    this.refreshHasKey();
     if (typeof localStorage !== 'undefined') {
       this.allowEdits = localStorage.getItem(STORAGE_ALLOW_EDITS) === 'true';
     }
@@ -220,8 +222,15 @@ export default {
         if (this.baseUrl) localStorage.setItem(STORAGE_BASE_URL, this.baseUrl);
         else localStorage.removeItem(STORAGE_BASE_URL);
       }
-      this.hasKey = Boolean(this.apiKey);
+      this.refreshHasKey();
       this.settingsOpen = false;
+    },
+    // "Ready to chat" means either a user-provided Anthropic key, or the base
+    // URL pointing at the NNVP backend proxy while signed in (JWT present).
+    refreshHasKey() {
+      const config = readStoredConfig();
+      this.hasKey = Boolean(this.apiKey)
+        || (usesBackendProxy(config) && Boolean(config.backendToken));
     },
     scrollToBottom() {
       this.$nextTick(() => {

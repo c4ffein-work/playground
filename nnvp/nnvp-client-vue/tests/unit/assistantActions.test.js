@@ -481,3 +481,46 @@ describe('AnthropicClient.send error handling', () => {
     expect(fetchImpl.calls).toHaveLength(0);
   });
 });
+
+describe('AnthropicClient backend proxy mode', () => {
+  const makeActions = () => new AssistantActions(makeFakeD3Interface(), makeFakeKerasInterface());
+
+  it('posts to /api/assistant/messages with the backend JWT and no API key', async () => {
+    const fetchImpl = makeFakeFetch([textReply('ok')]);
+    const client = new AnthropicClient(makeActions(), {
+      fetch: fetchImpl,
+      baseUrl: 'http://localhost:8009/',
+      backendUrl: 'http://localhost:8009',
+      backendToken: 'backend-jwt',
+    });
+    const reply = await client.send([{ role: 'user', content: 'hi' }]);
+    expect(reply).toBe('ok');
+    expect(fetchImpl.calls[0].url).toBe('http://localhost:8009/api/assistant/messages');
+    expect(fetchImpl.calls[0].init.headers.authorization).toBe('Bearer backend-jwt');
+    expect(fetchImpl.calls[0].init.headers['x-api-key']).toBeUndefined();
+  });
+
+  it('asks the user to sign in when the backend proxy is selected without a token', async () => {
+    const client = new AnthropicClient(makeActions(), {
+      fetch: makeFakeFetch([]),
+      baseUrl: 'http://localhost:8009',
+      backendUrl: 'http://localhost:8009',
+    });
+    await expect(client.send([{ role: 'user', content: 'hi' }])).rejects.toThrow(/Sign in/);
+  });
+
+  it('treats a non-backend custom base URL as an Anthropic-compatible proxy', async () => {
+    const fetchImpl = makeFakeFetch([textReply('ok')]);
+    const client = new AnthropicClient(makeActions(), {
+      fetch: fetchImpl,
+      apiKey: 'sk-ant-testkey',
+      baseUrl: 'https://myproxy.example.com',
+      backendUrl: 'http://localhost:8009',
+      backendToken: 'backend-jwt',
+    });
+    await client.send([{ role: 'user', content: 'hi' }]);
+    expect(fetchImpl.calls[0].url).toBe('https://myproxy.example.com/v1/messages');
+    expect(fetchImpl.calls[0].init.headers['x-api-key']).toBe('sk-ant-testkey');
+    expect(fetchImpl.calls[0].init.headers.authorization).toBeUndefined();
+  });
+});

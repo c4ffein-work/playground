@@ -56,6 +56,21 @@ original unknown-layer fallback. No behavior change (verified against `layer-hel
   `createTreatmentList` topological ordering (linear / branching / diamond / cycles), `isSequential`,
   and Python + JS generation asserting exact output strings.
 
+### 10. Contract tests + dim inference + D3 fixes + hardened backend (0008)
+- **Front/API contract suite** — the real `apiClient` against the real Django backend, zero mocks
+  (`npm run test:contract`, 16 tests: auth shapes/status codes, CRUD with graph deep-equality,
+  ownership isolation). **No mismatch found**, re-verified against the hardened backend.
+- **Codegen dim inference** — PyTorch/Tinygrad in-dims now derived from the graph
+  (`Input([28,28,1])→Flatten→Dense(128)` → `nn.Linear(784, 128)`); uninferable → loud `# TODO`.
+- **Four D3 bugs fixed** (idempotent `selectOnNode` + shift-click toggle, `removeObserver`
+  `splice(-1)`, `clone` no-return/wrong-target, `isKerasError` ReferenceError), each with a
+  failing-then-passing test. Known-broken composite/"Group layers" feature documented, untouched.
+- **Backend hardened** (`../nnvp-backend/`, 25 tests): proxy requires JWT (+30/m throttle),
+  refuses prod start on dev SECRET_KEY, env-driven CORS/hosts, password validation, `SECURITY.md`
+  with an honest gaps list. **Chat backend-proxy mode** added to the SPA: base URL = backend →
+  `/api/assistant/messages` + Bearer JWT, no Anthropic key in the browser.
+Verified: lint 0/0, **173 unit** + **16 contract** + 22 e2e sanity; backend **25/25**.
+
 ### 9. Accounts + Tinygrad + dark canvas (0007) + Django backend (`../nnvp-backend/`)
 - **Optional cloud accounts** (`apiClient.js` + `AccountPanel.vue`) — sign in/register + "My Projects"
   save/load, progressive-enhancement (fully usable logged-out). Round-trips through the same

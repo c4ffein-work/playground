@@ -2,6 +2,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import * as d3 from 'd3';
 import D3GraphEditor from '../../src/lib/D3Interface/D3GraphEditor';
+import D3GraphValidation from '../../src/lib/D3Interface/D3GraphValidation';
 import KerasLayer from '../../src/lib/KerasInterface/KerasLayer';
 
 // d3-zoom reads the SVG's intrinsic width/height (via width.baseVal.value) when
@@ -152,6 +153,20 @@ describe('D3GraphEditor', () => {
     expect(editor.model.d3Edges).toHaveLength(0);
   });
 
+  it('isKerasError refreshes the linkError class of a drawn edge', () => {
+    editor.addLayer(new KerasLayer('Input', 'Core'), 0, 0);
+    editor.addLayer(new KerasLayer('Dense', 'Core'), 300, 0);
+    const [a, b] = editor.model.d3Layers;
+    editor.layerMouseDown(a);
+    editor.layerMouseUp(b);
+    const edge = editor.model.d3Edges[0];
+    // Used to throw "thisEdge is not defined".
+    expect(() => D3GraphValidation.isKerasError(editor, edge)).not.toThrow();
+    const path = document.querySelector(`#${edge.htmlID} path`);
+    expect(path.classList.contains('linkError'))
+      .toBe(!!D3GraphValidation.kerasError(editor, edge));
+  });
+
   it('notifyGraphChanged / notifySelectionChanged fire the registered callbacks', () => {
     let graphChanges = 0;
     let selectionChanges = 0;
@@ -190,15 +205,29 @@ describe('D3GraphEditor selection bookkeeping', () => {
     expect(editor.selectedNodes).toEqual([a, b]);
   });
 
-  it('selectOnNode re-selecting a node keeps a single entry, moved to the end', () => {
-    // selectOnNode removes an already-selected node but then unconditionally
-    // re-pushes it, so re-selecting does not deselect: it keeps one entry and
-    // reorders it to the end. Deselecting all is done via undoSelection.
+  it('selectOnNode is idempotent: re-selecting keeps one entry in place', () => {
+    // Re-selecting an already-selected node must neither duplicate it nor
+    // move it to the end of the selection.
     const [a, b] = editor.model.d3Layers;
     editor.selectOnNode(a);
     editor.selectOnNode(b);
     editor.selectOnNode(a);
-    expect(editor.selectedNodes).toEqual([b, a]);
+    expect(editor.selectedNodes).toEqual([a, b]);
+  });
+
+  it('toggleNodeSelection adds an unselected node to the selection', () => {
+    const [a, b] = editor.model.d3Layers;
+    editor.toggleNodeSelection(a);
+    editor.toggleNodeSelection(b);
+    expect(editor.selectedNodes).toEqual([a, b]);
+  });
+
+  it('toggleNodeSelection deselects an already-selected node', () => {
+    const [a, b] = editor.model.d3Layers;
+    editor.selectOnNode(a);
+    editor.selectOnNode(b);
+    editor.toggleNodeSelection(a);
+    expect(editor.selectedNodes).toEqual([b]);
   });
 
   it('undoSelection clears the current selection', () => {
@@ -207,6 +236,33 @@ describe('D3GraphEditor selection bookkeeping', () => {
     editor.selectOnNode(b);
     editor.undoSelection();
     expect(editor.selectedNodes).toHaveLength(0);
+  });
+
+  it('removeObserver ignores an object that is not an observer', () => {
+    // splice(indexOf(o), 1) with indexOf === -1 used to remove the LAST
+    // observer instead of doing nothing.
+    editor.layerMouseDown(editor.model.d3Layers[0]);
+    editor.layerMouseUp(editor.model.d3Layers[1]);
+    const [a] = editor.model.d3Layers;
+    const edge = editor.model.d3Edges[0];
+    expect(a.observers).toEqual([edge]);
+    a.removeObserver({ not: 'an observer' });
+    expect(a.observers).toEqual([edge]);
+    a.removeObserver(edge);
+    expect(a.observers).toEqual([]);
+  });
+
+  it('clone returns a fresh layer with copied wiring and a new id', () => {
+    editor.layerMouseDown(editor.model.d3Layers[0]);
+    editor.layerMouseUp(editor.model.d3Layers[1]);
+    const [a, b] = editor.model.d3Layers;
+    const copy = b.clone();
+    expect(copy).toBeDefined();
+    expect(copy).not.toBe(b);
+    expect(copy.kerasLayer.name).toBe(b.kerasLayer.name);
+    expect(copy.inputLayers).toEqual([a.id]);
+    expect(copy.id).not.toBe(a.id);
+    expect(copy.id).not.toBe(b.id);
   });
 
   it('selectEdge clears node selection and unselects a previously selected edge', () => {

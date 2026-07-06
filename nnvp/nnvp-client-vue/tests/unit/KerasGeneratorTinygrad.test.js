@@ -75,6 +75,23 @@ function functionalJson() {
   };
 }
 
+// MNIST-style MLP with a 3D input: Input(1, [28,28,1]) -> Flatten(2) -> Dense(3,128)
+// -> Dense(4,10) -> Output(5). The full Input shape is known, so Flatten's product
+// (784) and the chained Dense in_features (128) must both be inferred.
+function mnistMlpJson() {
+  return {
+    inputs: ['1'],
+    outputs: ['5'],
+    layers: [
+      leaf('1', 'Input', { params: { shape: [28, 28, 1] }, outputLayers: ['2'] }),
+      leaf('2', 'Flatten', { inputLayers: ['1'], outputLayers: ['3'] }),
+      leaf('3', 'Dense', { params: { units: 128 }, inputLayers: ['2'], outputLayers: ['4'] }),
+      leaf('4', 'Dense', { params: { units: 10 }, inputLayers: ['3'], outputLayers: ['5'] }),
+      leaf('5', 'Output', { inputLayers: ['4'] }),
+    ],
+  };
+}
+
 // A layer NNVP does not know how to map to tinygrad -> TODO placeholder.
 // Input(1) -> GaussianNoise(2) -> Output(3) (still a linear chain -> sequential path).
 function unsupportedJson() {
@@ -100,8 +117,8 @@ describe('Tinygrad: full generation', () => {
       + '\n'
       + 'class Model:\n'
       + '  def __init__(self):\n'
-      + '    self.layer_3 = nn.Linear(128, 128)\n'
-      + '    self.layer_4 = nn.Linear(10, 10)\n'
+      + '    self.layer_3 = nn.Linear(784, 128)\n'
+      + '    self.layer_4 = nn.Linear(128, 10)\n'
       + '\n'
       + '  def __call__(self, x):\n'
       + '    x = x.flatten(1)\n'
@@ -119,9 +136,11 @@ describe('Tinygrad: full generation', () => {
       + '\n'
       + 'class Model:\n'
       + '  def __init__(self):\n'
-      + '    self.layer_2 = nn.Conv2d(16, 16, (3,3,))\n'
-      + '    self.layer_3 = nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count\n'
-      + '    self.layer_6 = nn.Linear(10, 10)\n'
+      + '    self.layer_2 = nn.Conv2d(1, 16, (3,3,))\n'
+      + '    self.layer_3 = nn.BatchNorm2d(16)\n'
+      // Flatten after a Conv2D: spatial arithmetic is not attempted, so the Dense
+      // in_features is not inferable -> out-dim fallback with a loud TODO.
+      + '    self.layer_6 = nn.Linear(10, 10)  # TODO: set in_features (could not infer from graph)\n'
       + '\n'
       + '  def __call__(self, x):\n'
       + '    x = self.layer_2(x)\n'
@@ -141,8 +160,8 @@ describe('Tinygrad: full generation', () => {
       + '\n'
       + 'class Model:\n'
       + '  def __init__(self):\n'
-      + '    self.layer_2 = nn.Linear(4, 4)\n'
-      + '    self.layer_3 = nn.Linear(4, 4)\n'
+      + '    self.layer_2 = nn.Linear(10, 4)\n'
+      + '    self.layer_3 = nn.Linear(10, 4)\n'
       + '    # TODO: unsupported layer Concatenate\n'
       + '\n'
       + '  def __call__(self, x):\n'
@@ -172,6 +191,27 @@ describe('Tinygrad: full generation', () => {
     // The placeholder must not silently emit wrong tinygrad code.
     expect(code).not.toContain('nn.GaussianNoise');
   });
+
+  it('infers Flatten product and chained Dense in_features from the Input shape', () => {
+    const code = new KerasGenerator(mnistMlpJson()).generateTinygradFromGraph();
+    expect(code).toBe(
+      'from tinygrad import Tensor, nn\n'
+      + '\n'
+      + '\n'
+      + 'class Model:\n'
+      + '  def __init__(self):\n'
+      + '    self.layer_3 = nn.Linear(784, 128)\n'
+      + '    self.layer_4 = nn.Linear(128, 10)\n'
+      + '\n'
+      + '  def __call__(self, x):\n'
+      + '    x = x.flatten(1)\n'
+      + '    x = self.layer_3(x)\n'
+      + '    x = self.layer_4(x)\n'
+      + '    return x\n',
+    );
+    // Fully inferred dims must not leave any TODO marker behind.
+    expect(code).not.toContain('TODO');
+  });
 });
 
 describe('Tinygrad: layer -> tinygrad mapping', () => {
@@ -185,11 +225,16 @@ describe('Tinygrad: layer -> tinygrad mapping', () => {
     return new KerasGeneratorTinygradHelper(graph, [], [], [], false).methodCall('n');
   };
 
-  it('maps module layers, defaulting the in-dim to the out-dim', () => {
-    expect(ctor('Dense', { units: 32 })).toBe('nn.Linear(32, 32)');
-    expect(ctor('Conv2D', { filters: 16, kernel_size: [3, 3] })).toBe('nn.Conv2d(16, 16, (3,3,))');
+  it('maps module layers, falling back to the out-dim + loud TODO without a graph', () => {
+    // Bare nodes (no graph context) have no inferable in-dim -> loud TODO fallback.
+    expect(ctor('Dense', { units: 32 })).toBe(
+      'nn.Linear(32, 32)  # TODO: set in_features (could not infer from graph)',
+    );
+    expect(ctor('Conv2D', { filters: 16, kernel_size: [3, 3] })).toBe(
+      'nn.Conv2d(16, 16, (3,3,))  # TODO: set in_channels (could not infer from graph)',
+    );
     expect(ctor('BatchNormalization')).toBe(
-      'nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count',
+      'nn.BatchNorm2d(1)  # TODO: set num_features (could not infer from graph)',
     );
   });
 

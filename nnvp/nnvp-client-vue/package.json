@@ -14,6 +14,7 @@
     "test:e2e:xvfb": "xvfb-run --auto-servernum --server-args='-screen 0 1280x720x24' playwright test",
     "test:e2e:ui": "playwright test --ui",
     "test:unit": "vitest run",
+    "test:contract": "vitest run --config vitest.contract.config.js",
     "lint": "oxlint src tests",
     "lint:fix": "oxlint src tests --fix"
   },

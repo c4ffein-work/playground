@@ -57,6 +57,26 @@ class AuthTests(TestCase):
         r = self._get("/api/auth/me", token="not.a.valid.jwt")
         self.assertEqual(r.status_code, 401)
 
+    def test_register_rejects_weak_passwords(self):
+        weak = [
+            "short7!",       # < 8 chars
+            "password123",   # in Django's common-password list
+            "3141592653",    # entirely numeric
+        ]
+        for pwd in weak:
+            r = self._post("/api/auth/register", {"email": "weak@x.com", "password": pwd})
+            self.assertEqual(r.status_code, 422, (pwd, r.content))
+            self.assertTrue(r.json()["detail"])  # human-readable validator message
+        self.assertFalse(User.objects.filter(email="weak@x.com").exists())
+
+    def test_register_accepts_strong_password(self):
+        r = self._post(
+            "/api/auth/register",
+            {"email": "strong@x.com", "password": "correct-horse-battery"},
+        )
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertIn("token", r.json())
+
     def test_duplicate_registration_conflicts(self):
         self._post("/api/auth/register", {"email": "dup@x.com", "password": "supersecret"})
         r = self._post("/api/auth/register", {"email": "dup@x.com", "password": "supersecret"})
