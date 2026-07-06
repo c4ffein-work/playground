@@ -56,6 +56,18 @@ original unknown-layer fallback. No behavior change (verified against `layer-hel
   `createTreatmentList` topological ordering (linear / branching / diamond / cycles), `isSequential`,
   and Python + JS generation asserting exact output strings.
 
+### 9. Accounts + Tinygrad + dark canvas (0007) + Django backend (`../nnvp-backend/`)
+- **Optional cloud accounts** (`apiClient.js` + `AccountPanel.vue`) — sign in/register + "My Projects"
+  save/load, progressive-enhancement (fully usable logged-out). Round-trips through the same
+  `toJSON`/`loadJSON` as the File menu. 17 unit tests + a mocked-backend e2e.
+- **Tinygrad codegen** (`KerasGeneratorTinygradHelper.js`) — the 4th generation target
+  (Keras/TF.js/PyTorch/Tinygrad); modules + Tensor-method activations, unsupported → `# TODO`.
+- **Dark-themed D3 canvas** — canvas tokens; the board/nodes/edges now re-skin with the theme.
+- **`nnvp-backend/`** — a **separate Django Ninja project** (not part of the SPA): email/JWT auth,
+  per-user project storage, and a server-side Anthropic proxy (`/api/assistant/messages`). 12 tests,
+  `/api/docs` OpenAPI. Public/no-CORS-lock for now; hardening TODOs (rate-limit, CORS, secrets) in its README.
+  Verified together: lint 0/0, **162 unit tests**, build ok, **61/61 non-network e2e**.
+
 ### 8. Ten improvements in parallel (0006) — nine subagents, merged with zero conflicts
 1. **Dark mode + theme v0.1** — semantic tokens, dark palette + persisted `[data-theme]` toggle, 8 components tokenized.
 2. **Code-split tfjs** — lazy `loadTf.js` + manualChunks; entry bundle **2,674 → 606 kB**, tfjs on-demand.

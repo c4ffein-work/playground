@@ -2,13 +2,14 @@
   <div id="canvas-background" class="canvas-background">
     <WhiteBoard :isTraining="isTraining"/>
   </div>
-  <div id="generalMenu" class="floating-panel general-menu"><GeneralMenu @open-trainer="openTrainer" @open-about="openAboutModal" @open-tutorial="startTutorial"/></div>
+  <div id="generalMenu" class="floating-panel general-menu"><GeneralMenu @open-trainer="openTrainer" @open-about="openAboutModal" @open-tutorial="startTutorial" @open-account="openAccount"/></div>
   <div id="layerCatalog" class="floating-panel layer-catalog"><LayerCatalog/></div>
   <div id="layerOptions" class="floating-panel layer-options"><LayerOptions msg="NNVP"/></div>
   <div id="trainingZone" class="floating-panel training-zone" v-if="trainerHeight > 0" v-bind:style="{height: trainerHeight+'vh'}">
     <TrainingZone @close-trainer="closeTrainer" :trainingZoneSize="trainerHeight" @training-started="isTraining = true" @training-stopped="isTraining = false"/>
   </div>
   <AboutModal :show="showAboutModal" @close="closeAboutModal"/>
+  <AccountPanel :show="showAccount" :intent="accountIntent" @close="closeAccount"/>
   <ChatBubble/>
   <TutorialOverlay :active="tutorialActive" @exit="stopTutorial"/>
 </template>
@@ -21,6 +22,7 @@ import LayerOptions from './components/LayerOptions/LayerOptions.vue';
 import WhiteBoard from './components/WhiteBoard.vue';
 import TrainingZone from './components/TrainingZone/TrainingZone.vue';
 import AboutModal from './components/AboutModal.vue';
+import AccountPanel from './components/Account/AccountPanel.vue';
 import ChatBubble from './components/Assistant/ChatBubble.vue';
 import TutorialOverlay from './components/Tutorial/TutorialOverlay.vue';
 
@@ -33,10 +35,19 @@ export default {
     WhiteBoard,
     TrainingZone,
     AboutModal,
+    AccountPanel,
     ChatBubble,
     TutorialOverlay,
   },
   methods: {
+    openAccount(intent) {
+      this.accountIntent = typeof intent === 'string' ? intent : '';
+      this.showAccount = true;
+    },
+    closeAccount() {
+      this.showAccount = false;
+      this.accountIntent = '';
+    },
     startTutorial() {
       this.tutorialActive = true;
     },
@@ -62,6 +73,8 @@ export default {
       trainerHeight: 0,
       trainerOpenHeight: 50,
       showAboutModal: false,
+      showAccount: false,
+      accountIntent: '',
       isTraining: false,
       tutorialActive: false,
     };
@@ -146,6 +159,21 @@ export default {
   /* Solid "inverted" fill (dark button on light, light button on dark). */
   --fill-strong: #111827;
   --fill-strong-text: #ffffff;
+
+  /* D3 editing canvas (whiteboard) tokens. The SVG board, grid/borders,
+     nodes and edges reference these so the theme toggle re-skins the canvas
+     from one place. Light values reproduce the historical hardcoded look. */
+  --canvas-bg: #f0f0f0;                  /* area around the board + borders */
+  --canvas-board: #ffffff;               /* the whiteboard sheet itself */
+  --canvas-selection: lightgray;         /* rubber-band selection rect */
+  --node-fill: #ffffff;                  /* layer node background */
+  --node-stroke: #000000;                /* layer node / anchor outline */
+  --node-text: #000000;                  /* layer node label */
+  --node-selected-fill: rgb(250, 232, 255); /* selected layer background */
+  --node-isolated-stroke: red;           /* isolated / invalid layer outline */
+  --edge-color: #333333;                 /* connections + arrow heads */
+  --edge-selected: green;                /* selected connection */
+  --edge-error: red;                     /* error / cycle connection */
 }
 
 /* Dark palette - applied automatically when the OS prefers dark, unless the
@@ -175,6 +203,18 @@ export default {
 
     --fill-strong: #e5e7eb;
     --fill-strong-text: #0f1115;
+
+    --canvas-bg: #0f1115;
+    --canvas-board: #181b22;
+    --canvas-selection: rgba(148, 163, 184, 0.35);
+    --node-fill: #22262f;
+    --node-stroke: #9aa4b2;
+    --node-text: #e5e7eb;
+    --node-selected-fill: #3b2b4d;
+    --node-isolated-stroke: #f87171;
+    --edge-color: #cbd5e1;
+    --edge-selected: #4ade80;
+    --edge-error: #f87171;
   }
 }
 
@@ -204,6 +244,18 @@ export default {
 
   --fill-strong: #111827;
   --fill-strong-text: #ffffff;
+
+  --canvas-bg: #f0f0f0;
+  --canvas-board: #ffffff;
+  --canvas-selection: lightgray;
+  --node-fill: #ffffff;
+  --node-stroke: #000000;
+  --node-text: #000000;
+  --node-selected-fill: rgb(250, 232, 255);
+  --node-isolated-stroke: red;
+  --edge-color: #333333;
+  --edge-selected: green;
+  --edge-error: red;
 }
 
 :root[data-theme="dark"] {
@@ -230,6 +282,18 @@ export default {
 
   --fill-strong: #e5e7eb;
   --fill-strong-text: #0f1115;
+
+  --canvas-bg: #0f1115;
+  --canvas-board: #181b22;
+  --canvas-selection: rgba(148, 163, 184, 0.35);
+  --node-fill: #22262f;
+  --node-stroke: #9aa4b2;
+  --node-text: #e5e7eb;
+  --node-selected-fill: #3b2b4d;
+  --node-isolated-stroke: #f87171;
+  --edge-color: #cbd5e1;
+  --edge-selected: #4ade80;
+  --edge-error: #f87171;
 }
 
 body,html {

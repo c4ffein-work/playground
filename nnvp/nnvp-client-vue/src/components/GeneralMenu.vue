@@ -73,12 +73,17 @@ export default {
           Load() { this.$d3Interface.loadBoard(); },
           Templates: 'templatesMenu',
           Save() { this.$d3Interface.saveBoard(); },
+          Save_to_cloud() { this.$emit('open-account', 'save'); },
+          Open_from_cloud() { this.$emit('open-account'); },
           Generate() { this.$d3Interface.generatePythonInBrowser(this.$kerasInterface); },
           Generate_Javascript() {
             this.$d3Interface.generateJavascriptInBrowser(this.$kerasInterface);
           },
           Generate_PyTorch() {
             this.$d3Interface.generatePyTorchInBrowser(this.$kerasInterface);
+          },
+          Generate_Tinygrad() {
+            this.$d3Interface.generateTinygradInBrowser(this.$kerasInterface);
           },
         },
         Edit: {
@@ -88,6 +93,7 @@ export default {
         },
         Training: () => { this.$emit('open-trainer'); },
         Tutorial: () => { this.$emit('open-tutorial'); },
+        Account: () => { this.$emit('open-account'); },
         About: () => { this.$emit('open-about'); },
       },
       activatedState: false,

@@ -606,6 +606,11 @@ D3GraphEditor.prototype.generatePyTorchInBrowser = function (kerasInterface) {
   saveAs(new Blob([generatedPyTorch]), "myModel.py");
 }
 
+D3GraphEditor.prototype.generateTinygradInBrowser = function (kerasInterface) {
+  const generatedTinygrad = kerasInterface.generateTinygrad(this.toJSON());
+  saveAs(new Blob([generatedTinygrad]), "myModel.py");
+}
+
 D3GraphEditor.prototype.generateJavascriptNoSave = function (kerasInterface) {
   return kerasInterface.generateJavascript(this.toJSON());
 }
@@ -717,7 +722,7 @@ D3GraphEditor.prototype.addEventHandlerDragOnHtmlClass = function (layer, htmlEl
           .attr("height", 40)
           .attr("width", 90)
           .style("fill", "none")
-          .style("stroke", "black");
+          .style("stroke", "var(--node-stroke)");
       })
       .on("drag", event =>
         d3.select("#dragFromLeftbar").selectAll("rect")

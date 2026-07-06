@@ -24,7 +24,8 @@ test.describe('Accessibility', () => {
     await page.waitForTimeout(50);
     // The File submenu items should now be revealed and named.
     await expect(page.getByRole('menuitem', { name: 'New' })).toBeVisible();
-    await expect(page.getByRole('menuitem', { name: 'Save' })).toBeVisible();
+    // exact: the File menu now also has "Save to cloud", so match the plain Save item.
+    await expect(page.getByRole('menuitem', { name: 'Save', exact: true })).toBeVisible();
   });
 
   test('layer catalog exposes a labelled search box and named add buttons', async ({ page }) => {

@@ -10,6 +10,7 @@
 import KerasGeneratorPythonHelper from './KerasGeneratorPythonHelper';
 import KerasGeneratorJavascriptHelper from './KerasGeneratorJavascriptHelper';
 import KerasGeneratorPyTorchHelper from './KerasGeneratorPyTorchHelper';
+import KerasGeneratorTinygradHelper from './KerasGeneratorTinygradHelper';
 
 
 export default class KerasGenerator {
@@ -148,6 +149,12 @@ export default class KerasGenerator {
 
   generatePyTorchFromGraph() {
     return new KerasGeneratorPyTorchHelper(
+      this.graph, this.inputs, this.outputs, this.list, this.sequential,
+    ).generate();
+  }
+
+  generateTinygradFromGraph() {
+    return new KerasGeneratorTinygradHelper(
       this.graph, this.inputs, this.outputs, this.list, this.sequential,
     ).generate();
   }

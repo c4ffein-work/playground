@@ -1,0 +1,2074 @@
+From 6aeec8b08bdf48efbe317f6f0a1422e39ca75399 Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Mon, 6 Jul 2026 16:24:59 +0000
+Subject: [PATCH 7/7] Add cloud accounts, Tinygrad codegen, and dark-theme the
+ D3 canvas
+
+Integrated from three subagent branches (merged clean) + one integration fix.
+
+- Cloud save/accounts (progressive enhancement; works logged-out): src/lib/Backend/apiClient.js +
+  src/components/Account/AccountPanel.vue talk to the separate Django Ninja backend (auth + /api/projects).
+  Cloud save/load round-trips through the SAME toJSON/loadJSON the File menu uses, via new
+  D3Interface.getGraphJSON()/loadGraphFromJSON(). New File>Save to cloud / Open from cloud + Account menu.
+  17 apiClient unit tests + cloud.spec.js e2e (backend mocked).
+- Tinygrad code generation: src/lib/KerasInterface/KerasGeneratorTinygradHelper.js mirrors the PyTorch
+  helper (nn.Linear/Conv2d/BatchNorm2d modules, activations as Tensor methods x.relu()/x.flatten(1)),
+  unsupported layers -> explicit # TODO; Generate Tinygrad File-menu item. 8 exact-string unit tests.
+- Dark-theme the D3 canvas: canvas tokens in App.vue (light values unchanged), WhiteBoard CSS + arrow
+  markers + drag-preview now follow the theme so the board/nodes/edges re-skin on toggle.
+
+Integration fix: a11y.spec.js now matches the File menu "Save" item with exact:true, since h1 added a
+"Save to cloud" item that made the substring name ambiguous.
+
+Verified together: lint 0/0, 162 unit tests (12 files), build ok, non-network e2e 61/61
+(app/interactions/help/tutorial/a11y/dataset-error/cloud + 32 core-features). Cloud UI verified
+against a mocked backend; the real backend (nnvp-backend) has its own 12 passing tests.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JNQtU2ePmhzdTwymZCbh7J
+---
+ nnvp-client-vue/src/App.vue                   |  66 +-
+ .../src/components/Account/AccountPanel.vue   | 577 ++++++++++++++++++
+ .../src/components/GeneralMenu.vue            |   6 +
+ nnvp-client-vue/src/components/WhiteBoard.vue |  44 +-
+ nnvp-client-vue/src/lib/Backend/apiClient.js  | 222 +++++++
+ .../src/lib/D3Interface/D3GraphEditor.js      |   7 +-
+ .../src/lib/D3Interface/D3Interface.js        |  22 +
+ .../src/lib/KerasInterface/KerasGenerator.js  |   7 +
+ .../KerasGeneratorTinygradHelper.js           | 247 ++++++++
+ .../src/lib/KerasInterface/KerasInterface.js  |  10 +-
+ nnvp-client-vue/tests/a11y.spec.js            |   3 +-
+ nnvp-client-vue/tests/cloud.spec.js           | 113 ++++
+ .../tests/unit/KerasGeneratorTinygrad.test.js | 214 +++++++
+ nnvp-client-vue/tests/unit/apiClient.test.js  | 213 +++++++
+ 14 files changed, 1728 insertions(+), 23 deletions(-)
+ create mode 100644 nnvp-client-vue/src/components/Account/AccountPanel.vue
+ create mode 100644 nnvp-client-vue/src/lib/Backend/apiClient.js
+ create mode 100644 nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorTinygradHelper.js
+ create mode 100644 nnvp-client-vue/tests/cloud.spec.js
+ create mode 100644 nnvp-client-vue/tests/unit/KerasGeneratorTinygrad.test.js
+ create mode 100644 nnvp-client-vue/tests/unit/apiClient.test.js
+
+diff --git a/nnvp-client-vue/src/App.vue b/nnvp-client-vue/src/App.vue
+index 7615b2b..53be3a4 100644
+--- a/nnvp-client-vue/src/App.vue
++++ b/nnvp-client-vue/src/App.vue
+@@ -2,13 +2,14 @@
+   <div id="canvas-background" class="canvas-background">
+     <WhiteBoard :isTraining="isTraining"/>
+   </div>
+-  <div id="generalMenu" class="floating-panel general-menu"><GeneralMenu @open-trainer="openTrainer" @open-about="openAboutModal" @open-tutorial="startTutorial"/></div>
++  <div id="generalMenu" class="floating-panel general-menu"><GeneralMenu @open-trainer="openTrainer" @open-about="openAboutModal" @open-tutorial="startTutorial" @open-account="openAccount"/></div>
+   <div id="layerCatalog" class="floating-panel layer-catalog"><LayerCatalog/></div>
+   <div id="layerOptions" class="floating-panel layer-options"><LayerOptions msg="NNVP"/></div>
+   <div id="trainingZone" class="floating-panel training-zone" v-if="trainerHeight > 0" v-bind:style="{height: trainerHeight+'vh'}">
+     <TrainingZone @close-trainer="closeTrainer" :trainingZoneSize="trainerHeight" @training-started="isTraining = true" @training-stopped="isTraining = false"/>
+   </div>
+   <AboutModal :show="showAboutModal" @close="closeAboutModal"/>
++  <AccountPanel :show="showAccount" :intent="accountIntent" @close="closeAccount"/>
+   <ChatBubble/>
+   <TutorialOverlay :active="tutorialActive" @exit="stopTutorial"/>
+ </template>
+@@ -21,6 +22,7 @@ import LayerOptions from './components/LayerOptions/LayerOptions.vue';
+ import WhiteBoard from './components/WhiteBoard.vue';
+ import TrainingZone from './components/TrainingZone/TrainingZone.vue';
+ import AboutModal from './components/AboutModal.vue';
++import AccountPanel from './components/Account/AccountPanel.vue';
+ import ChatBubble from './components/Assistant/ChatBubble.vue';
+ import TutorialOverlay from './components/Tutorial/TutorialOverlay.vue';
+ 
+@@ -33,10 +35,19 @@ export default {
+     WhiteBoard,
+     TrainingZone,
+     AboutModal,
++    AccountPanel,
+     ChatBubble,
+     TutorialOverlay,
+   },
+   methods: {
++    openAccount(intent) {
++      this.accountIntent = typeof intent === 'string' ? intent : '';
++      this.showAccount = true;
++    },
++    closeAccount() {
++      this.showAccount = false;
++      this.accountIntent = '';
++    },
+     startTutorial() {
+       this.tutorialActive = true;
+     },
+@@ -62,6 +73,8 @@ export default {
+       trainerHeight: 0,
+       trainerOpenHeight: 50,
+       showAboutModal: false,
++      showAccount: false,
++      accountIntent: '',
+       isTraining: false,
+       tutorialActive: false,
+     };
+@@ -146,6 +159,21 @@ export default {
+   /* Solid "inverted" fill (dark button on light, light button on dark). */
+   --fill-strong: #111827;
+   --fill-strong-text: #ffffff;
++
++  /* D3 editing canvas (whiteboard) tokens. The SVG board, grid/borders,
++     nodes and edges reference these so the theme toggle re-skins the canvas
++     from one place. Light values reproduce the historical hardcoded look. */
++  --canvas-bg: #f0f0f0;                  /* area around the board + borders */
++  --canvas-board: #ffffff;               /* the whiteboard sheet itself */
++  --canvas-selection: lightgray;         /* rubber-band selection rect */
++  --node-fill: #ffffff;                  /* layer node background */
++  --node-stroke: #000000;                /* layer node / anchor outline */
++  --node-text: #000000;                  /* layer node label */
++  --node-selected-fill: rgb(250, 232, 255); /* selected layer background */
++  --node-isolated-stroke: red;           /* isolated / invalid layer outline */
++  --edge-color: #333333;                 /* connections + arrow heads */
++  --edge-selected: green;                /* selected connection */
++  --edge-error: red;                     /* error / cycle connection */
+ }
+ 
+ /* Dark palette - applied automatically when the OS prefers dark, unless the
+@@ -175,6 +203,18 @@ export default {
+ 
+     --fill-strong: #e5e7eb;
+     --fill-strong-text: #0f1115;
++
++    --canvas-bg: #0f1115;
++    --canvas-board: #181b22;
++    --canvas-selection: rgba(148, 163, 184, 0.35);
++    --node-fill: #22262f;
++    --node-stroke: #9aa4b2;
++    --node-text: #e5e7eb;
++    --node-selected-fill: #3b2b4d;
++    --node-isolated-stroke: #f87171;
++    --edge-color: #cbd5e1;
++    --edge-selected: #4ade80;
++    --edge-error: #f87171;
+   }
+ }
+ 
+@@ -204,6 +244,18 @@ export default {
+ 
+   --fill-strong: #111827;
+   --fill-strong-text: #ffffff;
++
++  --canvas-bg: #f0f0f0;
++  --canvas-board: #ffffff;
++  --canvas-selection: lightgray;
++  --node-fill: #ffffff;
++  --node-stroke: #000000;
++  --node-text: #000000;
++  --node-selected-fill: rgb(250, 232, 255);
++  --node-isolated-stroke: red;
++  --edge-color: #333333;
++  --edge-selected: green;
++  --edge-error: red;
+ }
+ 
+ :root[data-theme="dark"] {
+@@ -230,6 +282,18 @@ export default {
+ 
+   --fill-strong: #e5e7eb;
+   --fill-strong-text: #0f1115;
++
++  --canvas-bg: #0f1115;
++  --canvas-board: #181b22;
++  --canvas-selection: rgba(148, 163, 184, 0.35);
++  --node-fill: #22262f;
++  --node-stroke: #9aa4b2;
++  --node-text: #e5e7eb;
++  --node-selected-fill: #3b2b4d;
++  --node-isolated-stroke: #f87171;
++  --edge-color: #cbd5e1;
++  --edge-selected: #4ade80;
++  --edge-error: #f87171;
+ }
+ 
+ body,html {
+diff --git a/nnvp-client-vue/src/components/Account/AccountPanel.vue b/nnvp-client-vue/src/components/Account/AccountPanel.vue
+new file mode 100644
+index 0000000..290590a
+--- /dev/null
++++ b/nnvp-client-vue/src/components/Account/AccountPanel.vue
+@@ -0,0 +1,577 @@
++<template>
++  <Transition name="modal">
++    <div v-if="show" class="modal-overlay" @click="closeModal">
++      <div
++        ref="container"
++        class="account-container"
++        role="dialog"
++        aria-modal="true"
++        aria-labelledby="account-modal-title"
++        tabindex="-1"
++        @click.stop
++      >
++        <button class="modal-close" @click="closeModal" aria-label="Close">&times;</button>
++
++        <div class="account-content">
++          <h1 id="account-modal-title">Cloud</h1>
++          <p class="subtitle">Optional accounts &amp; saved projects</p>
++
++          <p v-if="error" class="msg msg-error" role="alert">{{ error }}</p>
++          <p v-else-if="status" class="msg msg-ok" role="status">{{ status }}</p>
++
++          <!-- Backend URL setting: always available so users can point at their own server -->
++          <section class="section">
++            <h2>Backend</h2>
++            <label class="field">
++              <span>Server URL</span>
++              <input
++                v-model="backendUrlDraft"
++                type="url"
++                placeholder="http://localhost:8009"
++                autocomplete="off"
++                @keydown.enter="saveBackendUrl"
++              />
++            </label>
++            <div class="row">
++              <button class="btn" @click="saveBackendUrl">Save URL</button>
++              <span v-if="!isConfigured" class="hint">
++                Leave empty to keep working fully offline.
++              </span>
++            </div>
++          </section>
++
++          <!-- Auth: only meaningful once a backend URL is set -->
++          <section v-if="isConfigured && !user" class="section">
++            <h2>{{ tab === 'register' ? 'Create account' : 'Sign in' }}</h2>
++            <div class="tabs">
++              <button
++                class="tab" :class="{ active: tab === 'login' }"
++                @click="tab = 'login'"
++              >Sign in</button>
++              <button
++                class="tab" :class="{ active: tab === 'register' }"
++                @click="tab = 'register'"
++              >Register</button>
++            </div>
++            <label class="field">
++              <span>Email</span>
++              <input v-model="email" type="email" autocomplete="username" />
++            </label>
++            <label class="field">
++              <span>Password</span>
++              <input
++                v-model="password" type="password"
++                autocomplete="current-password"
++                @keydown.enter="submitAuth"
++              />
++            </label>
++            <div class="row">
++              <button class="btn btn-primary" :disabled="busy" @click="submitAuth">
++                {{ tab === 'register' ? 'Create account' : 'Sign in' }}
++              </button>
++            </div>
++          </section>
++
++          <!-- Signed-in: current user + projects -->
++          <template v-if="isConfigured && user">
++            <section class="section">
++              <h2>Account</h2>
++              <div class="row account-row">
++                <span class="user-email">{{ user.email }}</span>
++                <button class="btn" @click="signOut">Sign out</button>
++              </div>
++            </section>
++
++            <section class="section">
++              <div class="section-head">
++                <h2>My Projects</h2>
++                <button class="btn btn-primary" :disabled="busy" @click="saveToCloud">
++                  Save current
++                </button>
++              </div>
++
++              <p v-if="projects.length === 0" class="hint">
++                No saved projects yet. Use “Save current” to store the board.
++              </p>
++              <ul v-else class="project-list">
++                <li v-for="p in projects" :key="p.id" class="project-item">
++                  <button class="project-open" :disabled="busy" @click="openProject(p)">
++                    <span class="project-name">{{ p.name }}</span>
++                    <span class="project-date">{{ formatDate(p.updated_at) }}</span>
++                  </button>
++                  <button
++                    class="btn btn-danger" :disabled="busy"
++                    :aria-label="`Delete ${p.name}`"
++                    @click="deleteProject(p)"
++                  >Delete</button>
++                </li>
++              </ul>
++            </section>
++          </template>
++        </div>
++      </div>
++    </div>
++  </Transition>
++</template>
++
++<script>
++import ApiClient, { ERROR_CODES } from '../../lib/Backend/apiClient';
++
++export default {
++  name: 'AccountPanel',
++  props: {
++    show: {
++      type: Boolean,
++      required: true,
++    },
++    // Optional intent when opened, e.g. 'save' to immediately save the board.
++    intent: {
++      type: String,
++      default: '',
++    },
++  },
++  data() {
++    return {
++      backendUrlDraft: '',
++      isConfigured: false,
++      user: null,
++      projects: [],
++      tab: 'login',
++      email: '',
++      password: '',
++      busy: false,
++      error: '',
++      status: '',
++    };
++  },
++  created() {
++    // Non-reactive client; reads url/token from localStorage on every call.
++    this.api = new ApiClient();
++  },
++  watch: {
++    show(isOpen) {
++      if (isOpen) this.onOpen();
++      else this.restoreFocus();
++    },
++  },
++  methods: {
++    async onOpen() {
++      this.error = '';
++      this.status = '';
++      this.backendUrlDraft = this.api.getBaseUrl();
++      this.isConfigured = this.api.isConfigured();
++      this.previouslyFocused = document.activeElement;
++      this.$nextTick(() => {
++        const container = this.$refs.container;
++        if (container) {
++          const focusable = container.querySelector('input, button');
++          (focusable || container).focus();
++        }
++      });
++      if (this.api.isLoggedIn()) {
++        await this.loadSession();
++        if (this.intent === 'save' && this.user) await this.saveToCloud();
++      } else {
++        this.user = null;
++        this.projects = [];
++      }
++    },
++    async loadSession() {
++      this.busy = true;
++      try {
++        this.user = await this.api.me();
++        await this.refreshProjects();
++      } catch (e) {
++        this.handleError(e);
++        // A rejected/expired token: drop back to the signed-out state.
++        if (e && e.code === ERROR_CODES.http && e.status === 401) {
++          this.api.clearToken();
++          this.user = null;
++          this.projects = [];
++        }
++      } finally {
++        this.busy = false;
++      }
++    },
++    async refreshProjects() {
++      this.projects = (await this.api.listProjects()) || [];
++    },
++    saveBackendUrl() {
++      this.api.setBaseUrl(this.backendUrlDraft);
++      this.isConfigured = this.api.isConfigured();
++      this.error = '';
++      this.status = this.isConfigured ? 'Backend URL saved.' : 'Backend URL cleared.';
++      if (this.api.isLoggedIn()) this.loadSession();
++      else { this.user = null; this.projects = []; }
++    },
++    async submitAuth() {
++      if (this.busy) return;
++      this.busy = true;
++      this.error = '';
++      this.status = '';
++      try {
++        const creds = { email: this.email, password: this.password };
++        const data = this.tab === 'register'
++          ? await this.api.register(creds)
++          : await this.api.login(creds);
++        this.user = (data && data.user) || (await this.api.me());
++        this.password = '';
++        this.status = `Signed in as ${this.user.email}.`;
++        await this.refreshProjects();
++      } catch (e) {
++        this.handleError(e);
++      } finally {
++        this.busy = false;
++      }
++    },
++    signOut() {
++      this.api.logout();
++      this.user = null;
++      this.projects = [];
++      this.status = 'Signed out.';
++      this.error = '';
++    },
++    async saveToCloud() {
++      if (this.busy) return;
++      const graphString = this.$d3Interface ? this.$d3Interface.getGraphJSON() : null;
++      if (graphString === null || graphString === undefined) {
++        this.error = 'No board to save.';
++        return;
++      }
++      // eslint-disable-next-line no-alert
++      const name = window.prompt('Project name', this.defaultProjectName());
++      if (name === null) return; // cancelled
++      const trimmed = name.trim();
++      if (!trimmed) { this.error = 'Please provide a project name.'; return; }
++      this.busy = true;
++      this.error = '';
++      this.status = '';
++      try {
++        const graph = JSON.parse(graphString);
++        await this.api.createProject({ name: trimmed, graph });
++        await this.refreshProjects();
++        this.status = `Saved “${trimmed}” to the cloud.`;
++      } catch (e) {
++        this.handleError(e);
++      } finally {
++        this.busy = false;
++      }
++    },
++    async openProject(project) {
++      if (this.busy) return;
++      this.busy = true;
++      this.error = '';
++      this.status = '';
++      try {
++        // Fetch the full project so we always load the latest stored graph.
++        const full = await this.api.getProject(project.id);
++        const graph = full && full.graph !== undefined ? full.graph : project.graph;
++        const graphString = typeof graph === 'string' ? graph : JSON.stringify(graph);
++        if (this.$d3Interface) this.$d3Interface.loadGraphFromJSON(graphString);
++        this.status = `Opened “${full ? full.name : project.name}”.`;
++        this.closeModal();
++      } catch (e) {
++        this.handleError(e);
++      } finally {
++        this.busy = false;
++      }
++    },
++    async deleteProject(project) {
++      // eslint-disable-next-line no-alert
++      if (!window.confirm(`Delete “${project.name}”? This cannot be undone.`)) return;
++      this.busy = true;
++      this.error = '';
++      this.status = '';
++      try {
++        await this.api.deleteProject(project.id);
++        await this.refreshProjects();
++        this.status = `Deleted “${project.name}”.`;
++      } catch (e) {
++        this.handleError(e);
++      } finally {
++        this.busy = false;
++      }
++    },
++    defaultProjectName() {
++      const stamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
++      return `Model ${stamp}`;
++    },
++    formatDate(value) {
++      if (!value) return '';
++      const d = new Date(value);
++      return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
++    },
++    handleError(e) {
++      const code = e && e.code;
++      if (code === ERROR_CODES.noBackend) {
++        this.error = 'Set a backend URL first.';
++      } else if (code === ERROR_CODES.notLoggedIn) {
++        this.error = 'Please sign in first.';
++      } else if (code === ERROR_CODES.network) {
++        this.error = 'Could not reach the backend. Is it running?';
++      } else if (code === ERROR_CODES.malformed) {
++        this.error = 'The backend returned an unexpected response.';
++      } else if (e && e.message) {
++        this.error = e.message;
++      } else {
++        this.error = 'Something went wrong.';
++      }
++    },
++    closeModal() {
++      this.$emit('close');
++    },
++    restoreFocus() {
++      if (this.previouslyFocused && typeof this.previouslyFocused.focus === 'function') {
++        this.previouslyFocused.focus();
++      }
++      this.previouslyFocused = null;
++    },
++    handleKeydown(event) {
++      if (!this.show) return;
++      if (event.key === 'Escape') this.closeModal();
++    },
++  },
++  mounted() {
++    document.addEventListener('keydown', this.handleKeydown);
++    if (this.show) this.onOpen();
++  },
++  beforeUnmount() {
++    document.removeEventListener('keydown', this.handleKeydown);
++  },
++};
++</script>
++
++<style scoped>
++.modal-overlay {
++  position: fixed;
++  top: 0;
++  left: 0;
++  width: 100%;
++  height: 100%;
++  background-color: rgba(0, 0, 0, 0.25);
++  display: flex;
++  align-items: flex-start;
++  justify-content: center;
++  z-index: 9999;
++  padding-top: 40px;
++}
++
++.account-container {
++  background-color: var(--bg-panel);
++  border-radius: var(--border-radius);
++  border: 1px solid var(--panel-border);
++  box-shadow: var(--panel-shadow);
++  max-width: 460px;
++  width: 90%;
++  max-height: 85vh;
++  overflow-y: auto;
++  position: relative;
++  padding: 28px 32px 32px;
++  font-family: var(--font-regular);
++  font-weight: var(--font-weight-regular);
++  color: var(--text-primary);
++  text-align: left;
++}
++
++.modal-close {
++  position: absolute;
++  top: 14px;
++  right: 16px;
++  background: none;
++  border: none;
++  font-size: 30px;
++  line-height: 1;
++  color: var(--text-primary);
++  cursor: pointer;
++  padding: 0;
++  width: 30px;
++  height: 30px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  transition: opacity 0.2s;
++}
++.modal-close:hover { opacity: 0.6; }
++.modal-close:focus-visible {
++  outline: 2px solid var(--accent);
++  outline-offset: 2px;
++  border-radius: 4px;
++}
++
++.account-content h1 {
++  font-family: var(--font-medium);
++  font-weight: var(--font-weight-semibold);
++  font-size: 1.7em;
++  margin: 0 0 4px 0;
++}
++.subtitle {
++  color: var(--text-muted);
++  margin: 0 0 18px 0;
++  font-size: 0.9em;
++}
++
++.section {
++  margin-top: 20px;
++  padding-top: 16px;
++  border-top: 1px solid var(--panel-border);
++}
++.section:first-of-type { border-top: none; padding-top: 0; margin-top: 8px; }
++.section h2 {
++  font-family: var(--font-medium);
++  font-weight: var(--font-weight-medium);
++  font-size: 1.05em;
++  margin: 0 0 12px 0;
++}
++.section-head {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 12px;
++  margin-bottom: 12px;
++}
++.section-head h2 { margin: 0; }
++
++.field {
++  display: block;
++  margin-bottom: 10px;
++}
++.field > span {
++  display: block;
++  font-size: 0.8em;
++  color: var(--text-muted);
++  margin-bottom: 4px;
++}
++.field input {
++  width: 100%;
++  box-sizing: border-box;
++  background-color: var(--bg-input);
++  border: 1px solid var(--input-border);
++  border-radius: 6px;
++  padding: 8px 10px;
++  color: var(--text-primary);
++  font-family: var(--font-regular);
++}
++.field input:focus {
++  outline: 2px solid var(--accent);
++  outline-offset: 1px;
++}
++
++.row {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  flex-wrap: wrap;
++}
++.account-row { justify-content: space-between; }
++.user-email {
++  font-weight: var(--font-weight-medium);
++  overflow-wrap: anywhere;
++}
++
++.hint {
++  color: var(--text-muted);
++  font-size: 0.82em;
++  margin: 6px 0 0 0;
++}
++
++.btn {
++  background-color: var(--bg-input);
++  color: var(--text-primary);
++  border: 1px solid var(--input-border);
++  border-radius: 6px;
++  padding: 7px 14px;
++  font-family: var(--font-regular);
++  font-weight: var(--font-weight-medium);
++  cursor: pointer;
++  transition: transform 0.15s ease, background-color 0.15s ease;
++}
++.btn:hover:not(:disabled) { transform: translate(1px, -1px); }
++.btn:disabled { opacity: 0.5; cursor: default; }
++.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
++.btn-primary {
++  background-color: var(--accent);
++  border-color: var(--accent);
++  color: var(--accent-text);
++}
++.btn-primary:hover:not(:disabled) { background-color: var(--accent-hover); }
++.btn-danger { color: #dc2626; border-color: var(--input-border); }
++.btn-danger:hover:not(:disabled) { background-color: rgba(220, 38, 38, 0.1); }
++
++.tabs {
++  display: flex;
++  gap: 6px;
++  margin-bottom: 14px;
++}
++.tab {
++  background: none;
++  border: none;
++  border-bottom: 2px solid transparent;
++  color: var(--text-muted);
++  padding: 4px 6px;
++  cursor: pointer;
++  font-family: var(--font-regular);
++  font-weight: var(--font-weight-medium);
++}
++.tab.active {
++  color: var(--text-primary);
++  border-bottom-color: var(--accent);
++}
++.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
++
++.project-list {
++  list-style: none;
++  padding: 0;
++  margin: 0;
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++}
++.project-item {
++  display: flex;
++  align-items: stretch;
++  gap: 8px;
++}
++.project-open {
++  flex: 1;
++  display: flex;
++  flex-direction: column;
++  align-items: flex-start;
++  gap: 2px;
++  background-color: var(--bg-elevated);
++  border: 1px solid var(--panel-border);
++  border-radius: 8px;
++  padding: 8px 12px;
++  cursor: pointer;
++  text-align: left;
++  transition: transform 0.15s ease;
++  color: var(--text-primary);
++}
++.project-open:hover:not(:disabled) { transform: translate(1px, -1px); }
++.project-open:disabled { opacity: 0.5; cursor: default; }
++.project-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
++.project-name { font-weight: var(--font-weight-medium); }
++.project-date { font-size: 0.78em; color: var(--text-muted); }
++
++.msg {
++  border-radius: 6px;
++  padding: 8px 12px;
++  font-size: 0.85em;
++  margin: 0 0 14px 0;
++}
++.msg-error {
++  color: #b91c1c;
++  background-color: rgba(220, 38, 38, 0.12);
++}
++.msg-ok {
++  color: var(--success);
++  background-color: rgba(22, 163, 74, 0.12);
++}
++
++/* Transition animations (match AboutModal) */
++.modal-enter-active,
++.modal-leave-active { transition: all 0.3s ease-out; }
++.modal-enter-active .account-container,
++.modal-leave-active .account-container { transition: transform 0.3s ease-out; }
++.modal-enter-from .account-container,
++.modal-leave-to .account-container { transform: translateY(-100vh); }
++</style>
+diff --git a/nnvp-client-vue/src/components/GeneralMenu.vue b/nnvp-client-vue/src/components/GeneralMenu.vue
+index 7a805d6..2e913bc 100644
+--- a/nnvp-client-vue/src/components/GeneralMenu.vue
++++ b/nnvp-client-vue/src/components/GeneralMenu.vue
+@@ -73,6 +73,8 @@ export default {
+           Load() { this.$d3Interface.loadBoard(); },
+           Templates: 'templatesMenu',
+           Save() { this.$d3Interface.saveBoard(); },
++          Save_to_cloud() { this.$emit('open-account', 'save'); },
++          Open_from_cloud() { this.$emit('open-account'); },
+           Generate() { this.$d3Interface.generatePythonInBrowser(this.$kerasInterface); },
+           Generate_Javascript() {
+             this.$d3Interface.generateJavascriptInBrowser(this.$kerasInterface);
+@@ -80,6 +82,9 @@ export default {
+           Generate_PyTorch() {
+             this.$d3Interface.generatePyTorchInBrowser(this.$kerasInterface);
+           },
++          Generate_Tinygrad() {
++            this.$d3Interface.generateTinygradInBrowser(this.$kerasInterface);
++          },
+         },
+         Edit: {
+           Undo: [() => this.$d3Interface.undo(), () => (this.$d3Interface.getUndoStackContainer().e.length === 0)],
+@@ -88,6 +93,7 @@ export default {
+         },
+         Training: () => { this.$emit('open-trainer'); },
+         Tutorial: () => { this.$emit('open-tutorial'); },
++        Account: () => { this.$emit('open-account'); },
+         About: () => { this.$emit('open-about'); },
+       },
+       activatedState: false,
+diff --git a/nnvp-client-vue/src/components/WhiteBoard.vue b/nnvp-client-vue/src/components/WhiteBoard.vue
+index 3adbc90..059504c 100644
+--- a/nnvp-client-vue/src/components/WhiteBoard.vue
++++ b/nnvp-client-vue/src/components/WhiteBoard.vue
+@@ -58,65 +58,71 @@ export default {
+   position: relative; /* Needed so first layer doesn't glitch on Safari */
+ }
+ #backgroud {
+-  fill: #f0f0f0;
++  fill: var(--canvas-bg);
+ }
+ #whitePage {
+-  fill: white;
++  fill: var(--canvas-board);
+ }
+ #selectionRect {
+-  fill: lightgray;
++  fill: var(--canvas-selection);
+   fill-opacity: .75;
+   shape-rendering: crispEdges;
+ }
+ .borderClass {
+-  fill: #f0f0f0;
++  fill: var(--canvas-bg);
+   stroke: none;
+ }
+ .borderClass.active {
+-  fill: white;
++  fill: var(--canvas-board);
+   stroke: none;
+ }
+ .borderListerClass{
+-  fill: #f0f0f0;
+-  stroke: #f0f0f0;
++  fill: var(--canvas-bg);
++  stroke: var(--canvas-bg);
+   opacity: 0.1;
+ }
+ .d3Layer rect {
+-  fill: white;
+-  stroke: black;
++  fill: var(--node-fill);
++  stroke: var(--node-stroke);
+   rx: 15px;
+   ry: 15px;
+ }
+ .d3Layer rect.isolated {
+-  stroke: red;
++  stroke: var(--node-isolated-stroke);
+ }
+ .d3Layer text {
+   text-anchor: "start";
+-  fill: black;
++  fill: var(--node-text);
+ }
+ .d3Layer.selected rect {
+-  fill: rgb(250, 232, 255);
++  fill: var(--node-selected-fill);
+ }
+ .d3CompositeLayer rect {
+-  fill: white;
+-  stroke: black;
++  fill: var(--node-fill);
++  stroke: var(--node-stroke);
+   rx: 15px;
+   ry: 15px;
+ }
+ path.link {
+   fill: none;
+-  stroke: #333;
++  stroke: var(--edge-color);
+   stroke-width: 3px;
+   cursor: default;
+ }
++/* Arrow heads on connections default to black; follow the edge color so they
++   stay visible on a dark board. */
++marker#end-arrow path,
++marker#mark-end-arrow path {
++  fill: var(--edge-color);
++}
+ .edge.selected path{
+-  stroke: green;
++  stroke: var(--edge-selected);
+ }
+ path.linkError {
+-  stroke: red;
++  stroke: var(--edge-error);
+ }
+ path.linkCycle {
+-  stroke: red;
++  stroke: var(--edge-error);
+ }
+ path.link.hidden {
+     stroke-width: 0;
+@@ -125,7 +131,7 @@ path.link.hidden {
+   cursor: move;
+ }
+ .active {
+-  stroke: #000;
++  stroke: var(--node-stroke);
+   stroke-width: 2px;
+ }
+ .active-point {
+diff --git a/nnvp-client-vue/src/lib/Backend/apiClient.js b/nnvp-client-vue/src/lib/Backend/apiClient.js
+new file mode 100644
+index 0000000..ccbfda4
+--- /dev/null
++++ b/nnvp-client-vue/src/lib/Backend/apiClient.js
+@@ -0,0 +1,222 @@
++/**
++ * apiClient.js
++ *
++ * Small wrapper around the optional NNVP cloud backend (a separate Django Ninja
++ * service). This is a *progressive enhancement*: the SPA works fully without it.
++ *
++ * Configuration lives in localStorage so it survives reloads and can be set from
++ * the UI:
++ *   - nnvp_backend_url   : base URL of the backend (e.g. http://localhost:8009).
++ *                          Empty  => "no backend configured" state.
++ *   - nnvp_backend_token : JWT bearer token. Empty => "not logged in" state.
++ *
++ * All network failures surface as a single ApiError with a machine-readable
++ * `code` so the UI can react without string-matching messages.
++ */
++
++export const STORAGE_KEYS = {
++  url: 'nnvp_backend_url',
++  token: 'nnvp_backend_token',
++};
++
++export const ERROR_CODES = {
++  noBackend: 'no-backend',
++  notLoggedIn: 'not-logged-in',
++  network: 'network',
++  malformed: 'malformed',
++  http: 'http',
++};
++
++export class ApiError extends Error {
++  constructor(code, message, { status = null, body = null } = {}) {
++    super(message || code);
++    this.name = 'ApiError';
++    this.code = code;
++    this.status = status;
++    this.body = body;
++  }
++}
++
++export default class ApiClient {
++  /**
++   * @param {object} [options]
++   * @param {typeof fetch} [options.fetch]   Injectable fetch (for tests / SSR).
++   * @param {Storage}      [options.storage] Injectable storage (defaults to localStorage).
++   */
++  constructor({ fetch: fetchImpl, storage } = {}) {
++    // Bind to preserve `this` when the global fetch is used.
++    this._fetch = fetchImpl
++      || (typeof globalThis !== 'undefined' && globalThis.fetch
++        ? globalThis.fetch.bind(globalThis)
++        : undefined);
++    this._storage = storage
++      || (typeof localStorage !== 'undefined' ? localStorage : null);
++  }
++
++  // --- configuration ---------------------------------------------------------
++
++  _get(key) {
++    try {
++      return (this._storage && this._storage.getItem(key)) || '';
++    } catch {
++      return '';
++    }
++  }
++
++  _set(key, value) {
++    try {
++      if (!this._storage) return;
++      if (value) this._storage.setItem(key, value);
++      else this._storage.removeItem(key);
++    } catch { /* storage unavailable (private mode) */ }
++  }
++
++  getBaseUrl() {
++    // Trim a trailing slash so `${base}${path}` never double-slashes.
++    return this._get(STORAGE_KEYS.url).replace(/\/+$/, '');
++  }
++
++  setBaseUrl(url) {
++    this._set(STORAGE_KEYS.url, (url || '').trim());
++  }
++
++  getToken() {
++    return this._get(STORAGE_KEYS.token);
++  }
++
++  setToken(token) {
++    this._set(STORAGE_KEYS.token, token || '');
++  }
++
++  clearToken() {
++    this._set(STORAGE_KEYS.token, '');
++  }
++
++  isConfigured() {
++    return this.getBaseUrl().length > 0;
++  }
++
++  isLoggedIn() {
++    return this.isConfigured() && this.getToken().length > 0;
++  }
++
++  // --- core request ----------------------------------------------------------
++
++  /**
++   * @param {string} path   e.g. "/api/projects"
++   * @param {object} [opts]
++   * @param {string} [opts.method]
++   * @param {object} [opts.body]  serialized as JSON
++   * @param {boolean} [opts.auth] attach the bearer token (and require login)
++   */
++  async request(path, { method = 'GET', body, auth = false } = {}) {
++    const base = this.getBaseUrl();
++    if (!base) {
++      throw new ApiError(ERROR_CODES.noBackend, 'No backend URL configured');
++    }
++    if (auth && !this.getToken()) {
++      throw new ApiError(ERROR_CODES.notLoggedIn, 'Not signed in');
++    }
++    if (!this._fetch) {
++      throw new ApiError(ERROR_CODES.network, 'No fetch implementation available');
++    }
++
++    const headers = { Accept: 'application/json' };
++    if (body !== undefined) headers['Content-Type'] = 'application/json';
++    if (auth) headers.Authorization = `Bearer ${this.getToken()}`;
++
++    let response;
++    try {
++      response = await this._fetch(`${base}${path}`, {
++        method,
++        headers,
++        body: body === undefined ? undefined : JSON.stringify(body),
++      });
++    } catch (cause) {
++      throw new ApiError(ERROR_CODES.network, 'Network request failed', { body: String(cause) });
++    }
++
++    // 204 No Content (e.g. DELETE) — nothing to parse.
++    if (response.status === 204) return null;
++
++    let payload = null;
++    const raw = await response.text();
++    if (raw) {
++      try {
++        payload = JSON.parse(raw);
++      } catch {
++        if (response.ok) {
++          throw new ApiError(ERROR_CODES.malformed, 'Malformed JSON response', {
++            status: response.status,
++          });
++        }
++        // Non-ok + non-JSON: fall through to the http error below with no body.
++      }
++    }
++
++    if (!response.ok) {
++      const message = (payload && (payload.detail || payload.message || payload.error))
++        || `Request failed with status ${response.status}`;
++      throw new ApiError(ERROR_CODES.http, message, { status: response.status, body: payload });
++    }
++
++    return payload;
++  }
++
++  // --- auth ------------------------------------------------------------------
++
++  async register({ email, password }) {
++    const data = await this.request('/api/auth/register', {
++      method: 'POST',
++      body: { email, password },
++    });
++    if (data && data.token) this.setToken(data.token);
++    return data;
++  }
++
++  async login({ email, password }) {
++    const data = await this.request('/api/auth/login', {
++      method: 'POST',
++      body: { email, password },
++    });
++    if (data && data.token) this.setToken(data.token);
++    return data;
++  }
++
++  async me() {
++    return this.request('/api/auth/me', { auth: true });
++  }
++
++  logout() {
++    this.clearToken();
++  }
++
++  // --- projects --------------------------------------------------------------
++
++  async listProjects() {
++    return this.request('/api/projects', { auth: true });
++  }
++
++  async getProject(id) {
++    return this.request(`/api/projects/${id}`, { auth: true });
++  }
++
++  async createProject({ name, graph }) {
++    return this.request('/api/projects', {
++      method: 'POST',
++      auth: true,
++      body: { name, graph },
++    });
++  }
++
++  async updateProject(id, { name, graph } = {}) {
++    const body = {};
++    if (name !== undefined) body.name = name;
++    if (graph !== undefined) body.graph = graph;
++    return this.request(`/api/projects/${id}`, { method: 'PUT', auth: true, body });
++  }
++
++  async deleteProject(id) {
++    return this.request(`/api/projects/${id}`, { method: 'DELETE', auth: true });
++  }
++}
+diff --git a/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js b/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
+index 130f1c6..03416d8 100644
+--- a/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
++++ b/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
+@@ -606,6 +606,11 @@ D3GraphEditor.prototype.generatePyTorchInBrowser = function (kerasInterface) {
+   saveAs(new Blob([generatedPyTorch]), "myModel.py");
+ }
+ 
++D3GraphEditor.prototype.generateTinygradInBrowser = function (kerasInterface) {
++  const generatedTinygrad = kerasInterface.generateTinygrad(this.toJSON());
++  saveAs(new Blob([generatedTinygrad]), "myModel.py");
++}
++
+ D3GraphEditor.prototype.generateJavascriptNoSave = function (kerasInterface) {
+   return kerasInterface.generateJavascript(this.toJSON());
+ }
+@@ -717,7 +722,7 @@ D3GraphEditor.prototype.addEventHandlerDragOnHtmlClass = function (layer, htmlEl
+           .attr("height", 40)
+           .attr("width", 90)
+           .style("fill", "none")
+-          .style("stroke", "black");
++          .style("stroke", "var(--node-stroke)");
+       })
+       .on("drag", event =>
+         d3.select("#dragFromLeftbar").selectAll("rect")
+diff --git a/nnvp-client-vue/src/lib/D3Interface/D3Interface.js b/nnvp-client-vue/src/lib/D3Interface/D3Interface.js
+index e2e1f86..2ebc6d8 100644
+--- a/nnvp-client-vue/src/lib/D3Interface/D3Interface.js
++++ b/nnvp-client-vue/src/lib/D3Interface/D3Interface.js
+@@ -166,6 +166,12 @@ export default class {
+     }
+   }
+ 
++  generateTinygradInBrowser(kerasInterface) {
++    if (this.activeGraph !== null) {
++      this.activeGraph.generateTinygradInBrowser(kerasInterface);
++    }
++  }
++
+   generateJavascriptNoSave(kerasInterface) {
+     if (this.activeGraph !== null) {
+       return this.activeGraph.generateJavascriptNoSave(kerasInterface);
+@@ -189,6 +195,22 @@ export default class {
+     }
+   }
+ 
++  // Cloud save/load reuse the exact serialization the File > Save / Load uses:
++  // `activeGraph.toJSON()` (i.e. model.toJSON) produces the string, and
++  // `model.loadJSON` reads it back — the same pair `saveBoard`/`uploadToBoard` rely on.
++  getGraphJSON() {
++    if (this.activeGraph === null) return null;
++    return this.activeGraph.toJSON();
++  }
++
++  loadGraphFromJSON(graphJSON) {
++    if (this.activeGraph === null) return;
++    this.activeGraph.saveState();
++    this.activeGraph.clearBoard(true);
++    this.activeGraph.model.loadJSON(graphJSON);
++    this.activeGraph.updateGraph();
++  }
++
+   // Templates functions
+   loadTemplate(name) {
+     if (this.activeGraph !== null) {
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasGenerator.js b/nnvp-client-vue/src/lib/KerasInterface/KerasGenerator.js
+index cb6ca9a..6568f35 100644
+--- a/nnvp-client-vue/src/lib/KerasInterface/KerasGenerator.js
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasGenerator.js
+@@ -10,6 +10,7 @@
+ import KerasGeneratorPythonHelper from './KerasGeneratorPythonHelper';
+ import KerasGeneratorJavascriptHelper from './KerasGeneratorJavascriptHelper';
+ import KerasGeneratorPyTorchHelper from './KerasGeneratorPyTorchHelper';
++import KerasGeneratorTinygradHelper from './KerasGeneratorTinygradHelper';
+ 
+ 
+ export default class KerasGenerator {
+@@ -151,4 +152,10 @@ export default class KerasGenerator {
+       this.graph, this.inputs, this.outputs, this.list, this.sequential,
+     ).generate();
+   }
++
++  generateTinygradFromGraph() {
++    return new KerasGeneratorTinygradHelper(
++      this.graph, this.inputs, this.outputs, this.list, this.sequential,
++    ).generate();
++  }
+ }
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorTinygradHelper.js b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorTinygradHelper.js
+new file mode 100644
+index 0000000..ac1f5c1
+--- /dev/null
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorTinygradHelper.js
+@@ -0,0 +1,247 @@
++// class KerasTinygradGenerator {
++// Mirrors KerasGeneratorPyTorchHelper (composition pattern).
++// Produces a tinygrad `Model` class from the layer graph.
++//
++// Unlike PyTorch, tinygrad has NO lazy layers: nn.Linear / nn.Conv2d / nn.BatchNorm2d
++// all need their input dimension (in_features / in_channels / num_features) up front.
++// That size is unknown from the graph at design time, so - mirroring how the PyTorch
++// helper documented its recurrent input_size choice - we default the in-dim to the
++// SAME value as the out-dim (units / filters), and fall back to a clearly-commented
++// placeholder for BatchNorm (which has no out-dim to reuse). The emitted code is valid
++// and importable; the placeholder dimensions are the documented assumption to adjust.
++//
++// tinygrad activations are Tensor METHODS (x.relu(), x.sigmoid(), ...), not modules,
++// and Flatten is a method too (x.flatten(1)), so those nodes emit no __init__ line.
++
++/* eslint-disable no-param-reassign */
++/* eslint class-methods-use-this: ["error", { "exceptMethods": ["generateTuple",
++                                                                "renderValue",
++                                                                "activationMethod"] }] */
++
++export default class KerasGeneratorTinygradHelper {
++  constructor(graph, inputs, outputs, list, sequential) {
++    this.graph = graph;
++    this.inputs = inputs;
++    this.outputs = outputs;
++    this.list = list;
++    this.sequential = sequential || false;
++  }
++
++  // Returns the name given to the node in the generated tinygrad code.
++  nodeName(node) {
++    if (this.graph[node].keras_data.name === 'Input') {
++      return `input_${node}`;
++    }
++    if (this.graph[node].keras_data.name === 'Output') {
++      return `output_${node}`;
++    }
++    return `layer_${node}`;
++  }
++
++  // Render a Python tuple, matching the Python helper's format.
++  generateTuple(param) {
++    let tupleString = '(';
++    for (let i = 0; i < param.length; i += 1) {
++      const value = param[i];
++      if (typeof (value) === 'string') {
++        tupleString += `'${value}',`;
++      } else if (Array.isArray(value)) {
++        tupleString += `${this.generateTuple(value)},`;
++      } else {
++        tupleString += `${value},`;
++      }
++    }
++    tupleString += ')';
++    return tupleString;
++  }
++
++  // Render a single scalar/array parameter value as Python source.
++  renderValue(value) {
++    if (typeof value === 'string') return `'${value}'`;
++    if (typeof value === 'boolean') return value ? 'True' : 'False';
++    if (Array.isArray(value)) return this.generateTuple(value);
++    return `${value}`;
++  }
++
++  // Map a Keras activation name (from an Activation layer or a bare activation layer)
++  // to the matching tinygrad Tensor method suffix, or null when unsupported.
++  activationMethod(activation) {
++    switch ((activation || '').toLowerCase()) {
++      case 'relu': return '.relu()';
++      case 'leakyrelu':
++      case 'leaky_relu': return '.leakyrelu()';
++      case 'sigmoid': return '.sigmoid()';
++      case 'tanh': return '.tanh()';
++      case 'softmax': return '.softmax()';
++      case 'elu': return '.elu()';
++      case 'selu': return '.selu()';
++      case 'gelu': return '.gelu()';
++      default: return null;
++    }
++  }
++
++  // Return the tinygrad nn module constructor string for a node, or null if the node
++  // has no dedicated module (Input/Output/method node) or is unsupported.
++  moduleConstructor(node) {
++    const { name, parameterValues: params } = this.graph[node].keras_data;
++    const p = params || {};
++    switch (name) {
++      case 'Dense': {
++        // No lazy Linear in tinygrad: in_features defaults to the same value as
++        // out_features (units) since the real input size is unknown here.
++        const units = p.units !== undefined ? this.renderValue(p.units) : '1';
++        return `nn.Linear(${units}, ${units})`;
++      }
++      case 'Conv2D': {
++        // in_channels defaults to out_channels (filters); kernel_size passed through.
++        const filters = p.filters !== undefined ? this.renderValue(p.filters) : '1';
++        const kernel = p.kernel_size !== undefined ? this.renderValue(p.kernel_size) : '3';
++        return `nn.Conv2d(${filters}, ${filters}, ${kernel})`;
++      }
++      case 'BatchNormalization':
++        // BatchNorm2d needs num_features and has no out-dim to reuse; emit a clearly
++        // labelled placeholder (1) to keep the code importable - adjust to the channels.
++        return 'nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count';
++      default:
++        return null;
++    }
++  }
++
++  // Return the tinygrad Tensor method suffix for a node (Flatten / activation), or null.
++  methodCall(node) {
++    const { name, parameterValues: params } = this.graph[node].keras_data;
++    const p = params || {};
++    switch (name) {
++      case 'Flatten':
++        return '.flatten(1)';
++      case 'Activation':
++        return this.activationMethod(p.activation);
++      case 'ReLU':
++      case 'LeakyReLU':
++      case 'Sigmoid':
++      case 'Tanh':
++      case 'Softmax':
++      case 'ELU':
++      case 'SELU':
++      case 'GELU':
++        return this.activationMethod(name);
++      default:
++        return null;
++    }
++  }
++
++  // True when the node emits a real nn module in __init__ / a self.layer_N call.
++  isModuleNode(node) {
++    const { name } = this.graph[node].keras_data;
++    if (name === 'Input' || name === 'Output') return false;
++    return this.moduleConstructor(node) !== null;
++  }
++
++  // True when the node emits a Tensor method (no __init__ line, applied inline).
++  isMethodNode(node) {
++    const { name } = this.graph[node].keras_data;
++    if (name === 'Input' || name === 'Output') return false;
++    return this.methodCall(node) !== null;
++  }
++
++  // True when a node maps to nothing we know how to emit -> TODO placeholder.
++  isUnsupportedNode(node) {
++    const { name } = this.graph[node].keras_data;
++    if (name === 'Input' || name === 'Output') return false;
++    return this.moduleConstructor(node) === null && this.methodCall(node) === null;
++  }
++
++  // __init__ body: declare a self.layer_N module per module node, a TODO comment per
++  // unsupported node, and nothing for Input/Output/method nodes. A trailing `pass`
++  // keeps the body a valid statement block when no module is declared.
++  generateInit() {
++    let body = '';
++    let hasStatement = false;
++    this.list.forEach((node) => {
++      if (this.isModuleNode(node)) {
++        body += `    self.${this.nodeName(node)} = ${this.moduleConstructor(node)}\n`;
++        hasStatement = true;
++      } else if (this.isUnsupportedNode(node)) {
++        body += `    # TODO: unsupported layer ${this.graph[node].keras_data.name}\n`;
++      }
++    });
++    if (!hasStatement) body += '    pass\n';
++    return `  def __init__(self):\n${body}`;
++  }
++
++  // Sequential __call__(): a single running tensor `x` chained through each node.
++  generateSequentialForward() {
++    let rs = '  def __call__(self, x):\n';
++    this.list.forEach((node) => {
++      const { name } = this.graph[node].keras_data;
++      if (name === 'Input' || name === 'Output') return;
++      if (this.isModuleNode(node)) {
++        rs += `    x = self.${this.nodeName(node)}(x)\n`;
++      } else if (this.isMethodNode(node)) {
++        rs += `    x = x${this.methodCall(node)}\n`;
++      } else if (this.isUnsupportedNode(node)) {
++        rs += `    x = x  # TODO: unsupported layer ${name}\n`;
++      }
++    });
++    rs += '    return x\n';
++    return rs;
++  }
++
++  // Return the __call__ expression that produces a node's output from its source vars.
++  forwardExpression(node) {
++    const { name } = this.graph[node].keras_data;
++    const sources = this.graph[node].sources.map(s => this.nodeName(s));
++    if (this.isModuleNode(node)) {
++      return `self.${this.nodeName(node)}(${sources.join(', ')})`;
++    }
++    if (this.isMethodNode(node)) {
++      return `${sources[0]}${this.methodCall(node)}`;
++    }
++    // Unsupported: pass the (first) input through unchanged with a TODO marker.
++    return `${sources[0]}  # TODO: unsupported layer ${name}`;
++  }
++
++  // Functional __call__(): one named variable per node, wired by dataflow.
++  // Single input model -> __call__(self, x); multi-input -> __call__(self, input_a, ...).
++  generateFunctionalForward() {
++    const single = this.inputs.length <= 1;
++    const args = single ? 'x' : this.inputs.map(i => this.nodeName(i)).join(', ');
++    let rs = `  def __call__(self, ${args}):\n`;
++    if (single && this.inputs.length === 1) {
++      rs += `    ${this.nodeName(this.inputs[0])} = x\n`;
++    }
++    this.list.forEach((node) => {
++      const { name } = this.graph[node].keras_data;
++      if (name === 'Input' || name === 'Output') return;
++      rs += `    ${this.nodeName(node)} = ${this.forwardExpression(node)}\n`;
++    });
++    const returned = this.outputs.map(o => this.nodeName(this.graph[o].sources[0]));
++    rs += `    return ${returned.length === 1 ? returned[0] : `(${returned.join(', ')})`}\n`;
++    return rs;
++  }
++
++  generateSequential() {
++    let rs = 'from tinygrad import Tensor, nn\n';
++    rs += '\n\n';
++    rs += 'class Model:\n';
++    rs += this.generateInit();
++    rs += '\n';
++    rs += this.generateSequentialForward();
++    return rs;
++  }
++
++  generateFunctional() {
++    let rs = 'from tinygrad import Tensor, nn\n';
++    rs += '\n\n';
++    rs += 'class Model:\n';
++    rs += this.generateInit();
++    rs += '\n';
++    rs += this.generateFunctionalForward();
++    return rs;
++  }
++
++  generate(sequential) {
++    sequential = sequential === undefined ? this.sequential : sequential;
++    return sequential ? this.generateSequential() : this.generateFunctional();
++  }
++}
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasInterface.js b/nnvp-client-vue/src/lib/KerasInterface/KerasInterface.js
+index 0d2f2be..d739fb6 100644
+--- a/nnvp-client-vue/src/lib/KerasInterface/KerasInterface.js
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasInterface.js
+@@ -3,7 +3,8 @@ import KerasGenerator from './KerasGenerator';
+ 
+ /* eslint class-methods-use-this: ["error", { "exceptMethods": ["generatePython",
+                                                                 "generateJavascript",
+-                                                                "generatePyTorch"] }] */
++                                                                "generatePyTorch",
++                                                                "generateTinygrad"] }] */
+ // class KerasInterface {
+ export default class {
+   constructor(json) {
+@@ -76,4 +77,11 @@ export default class {
+     else graphJson = d3Json;
+     return new KerasGenerator(graphJson).generatePyTorchFromGraph();
+   }
++
++  generateTinygrad(d3Json) {
++    let graphJson;
++    if (typeof d3Json === 'string') graphJson = JSON.parse(d3Json);
++    else graphJson = d3Json;
++    return new KerasGenerator(graphJson).generateTinygradFromGraph();
++  }
+ }
+diff --git a/nnvp-client-vue/tests/a11y.spec.js b/nnvp-client-vue/tests/a11y.spec.js
+index 48f56ce..b729ce9 100644
+--- a/nnvp-client-vue/tests/a11y.spec.js
++++ b/nnvp-client-vue/tests/a11y.spec.js
+@@ -24,7 +24,8 @@ test.describe('Accessibility', () => {
+     await page.waitForTimeout(50);
+     // The File submenu items should now be revealed and named.
+     await expect(page.getByRole('menuitem', { name: 'New' })).toBeVisible();
+-    await expect(page.getByRole('menuitem', { name: 'Save' })).toBeVisible();
++    // exact: the File menu now also has "Save to cloud", so match the plain Save item.
++    await expect(page.getByRole('menuitem', { name: 'Save', exact: true })).toBeVisible();
+   });
+ 
+   test('layer catalog exposes a labelled search box and named add buttons', async ({ page }) => {
+diff --git a/nnvp-client-vue/tests/cloud.spec.js b/nnvp-client-vue/tests/cloud.spec.js
+new file mode 100644
+index 0000000..80d5571
+--- /dev/null
++++ b/nnvp-client-vue/tests/cloud.spec.js
+@@ -0,0 +1,113 @@
++import { test, expect } from '@playwright/test';
++
++// End-to-end for the optional cloud layer. The real Django Ninja backend is
++// never involved: every `**/api/**` call is intercepted with page.route and
++// answered from an in-memory fake, so this exercises the SPA's client + UI only.
++test.describe('Cloud accounts & projects', () => {
++  test('login -> save project -> see it listed -> open it', async ({ page }) => {
++    // Point the app at a backend URL before any script runs, so the panel
++    // starts in the "sign in" state rather than "no backend configured".
++    await page.addInitScript(() => {
++      window.localStorage.setItem('nnvp_backend_url', 'http://localhost:8009');
++    });
++
++    // --- mock backend -------------------------------------------------------
++    const state = { projects: [], nextId: 1, token: 'test-token' };
++    const json = (route, status, body) => route.fulfill({
++      status,
++      contentType: 'application/json',
++      body: JSON.stringify(body),
++    });
++
++    await page.route('**/api/**', async (route) => {
++      const req = route.request();
++      const url = new URL(req.url());
++      const { pathname } = url;
++      const method = req.method();
++      const post = () => (req.postDataJSON ? req.postDataJSON() : JSON.parse(req.postData() || '{}'));
++
++      if (pathname === '/api/auth/login' && method === 'POST') {
++        return json(route, 200, { token: state.token, user: { id: 1, email: post().email } });
++      }
++      if (pathname === '/api/auth/me' && method === 'GET') {
++        return json(route, 200, { id: 1, email: 'tester@example.com' });
++      }
++      if (pathname === '/api/projects' && method === 'GET') {
++        return json(route, 200, state.projects.map(
++          ({ id, name, updated_at }) => ({ id, name, updated_at }),
++        ));
++      }
++      if (pathname === '/api/projects' && method === 'POST') {
++        const body = post();
++        const project = {
++          id: state.nextId++,
++          name: body.name,
++          graph: body.graph,
++          updated_at: new Date().toISOString(),
++        };
++        state.projects.push(project);
++        return json(route, 201, project);
++      }
++      const match = pathname.match(/^\/api\/projects\/(\d+)$/);
++      if (match) {
++        const id = Number(match[1]);
++        const project = state.projects.find(p => p.id === id);
++        if (!project) return json(route, 404, { detail: 'Not found' });
++        if (method === 'GET') return json(route, 200, project);
++        if (method === 'DELETE') {
++          state.projects = state.projects.filter(p => p.id !== id);
++          return route.fulfill({ status: 204, body: '' });
++        }
++      }
++      return json(route, 404, { detail: 'Unhandled' });
++    });
++
++    // Auto-accept the name prompt (save) and any confirm dialogs.
++    page.on('dialog', (dialog) => {
++      if (dialog.type() === 'prompt') dialog.accept('Cloud Model');
++      else dialog.accept();
++    });
++
++    await page.goto('/');
++    await page.waitForTimeout(150);
++
++    // --- build a board we can round-trip ------------------------------------
++    await page.click('.LayerTemplate:has-text("Dense")');
++    await page.waitForTimeout(50);
++    await expect(page.locator('.d3Layer')).toHaveCount(1);
++
++    // --- sign in ------------------------------------------------------------
++    await page.click('#GeneralMenu .menuTitle:has-text("Account")');
++    await expect(page.locator('#account-modal-title')).toBeVisible();
++
++    await page.fill('input[type="email"]', 'tester@example.com');
++    await page.fill('input[type="password"]', 'secret-pw');
++    await page.click('button.btn-primary:has-text("Sign in")');
++
++    // Signed-in view shows the projects section.
++    await expect(page.locator('h2:has-text("My Projects")')).toBeVisible();
++
++    // --- save the current board to the cloud --------------------------------
++    await page.click('button:has-text("Save current")');
++    await expect(page.locator('.project-name:has-text("Cloud Model")')).toBeVisible();
++
++    // --- clear the board, then reopen the saved project ---------------------
++    // Close the panel and wipe the board directly (skipPrompt) so we can prove
++    // the reopen actually reloads the layer.
++    await page.click('.modal-close');
++    await page.evaluate(() => {
++      window.d3Interface.activeGraph.clearBoard(true);
++      window.d3Interface.activeGraph.updateGraph();
++    });
++    await expect(page.locator('.d3Layer')).toHaveCount(0);
++
++    await page.click('#GeneralMenu .menuTitle:has-text("Account")');
++    await expect(page.locator('.project-name:has-text("Cloud Model")')).toBeVisible();
++    await page.click('.project-open:has-text("Cloud Model")');
++
++    // Opening a project loads its graph back onto the board (UI updates).
++    await expect(page.locator('.d3Layer')).toHaveCount(1);
++
++    await page.screenshot({ path: '/tmp/h1-cloud.png', fullPage: true });
++  });
++});
+diff --git a/nnvp-client-vue/tests/unit/KerasGeneratorTinygrad.test.js b/nnvp-client-vue/tests/unit/KerasGeneratorTinygrad.test.js
+new file mode 100644
+index 0000000..859303a
+--- /dev/null
++++ b/nnvp-client-vue/tests/unit/KerasGeneratorTinygrad.test.js
+@@ -0,0 +1,214 @@
++import { describe, it, expect } from 'vitest';
++import KerasGenerator from '../../src/lib/KerasInterface/KerasGenerator';
++import KerasGeneratorTinygradHelper from '../../src/lib/KerasInterface/KerasGeneratorTinygradHelper';
++
++// --- Fixture builders (mirror KerasGeneratorPyTorch.test.js) -----------------
++// KerasGenerator mutates the layer objects it is given, so every fixture MUST be
++// produced fresh from a function and never shared between two instances.
++
++function leaf(id, name, {
++  params = {}, def = {}, inputLayers = [], outputLayers = [],
++} = {}) {
++  return {
++    id,
++    x: 0,
++    y: 0,
++    name,
++    inputLayers,
++    outputLayers,
++    children: null,
++    kerasLayer: {
++      name, category: 'test', parameterValues: params, parameterDef: def,
++    },
++  };
++}
++
++// Sequential: Input(1) -> Flatten(2) -> Dense(3,128) -> Dense(4,10) -> Output(5)
++function sequentialJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['5'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [28, 28] }, outputLayers: ['2'] }),
++      leaf('2', 'Flatten', { inputLayers: ['1'], outputLayers: ['3'] }),
++      leaf('3', 'Dense', { params: { units: 128 }, inputLayers: ['2'], outputLayers: ['4'] }),
++      leaf('4', 'Dense', { params: { units: 10 }, inputLayers: ['3'], outputLayers: ['5'] }),
++      leaf('5', 'Output', { inputLayers: ['4'] }),
++    ],
++  };
++}
++
++// Sequential CNN mixing module nodes (Conv2D, BatchNormalization, Dense) and Tensor
++// method nodes (ReLU, Flatten):
++// Input(1) -> Conv2D(2) -> BatchNormalization(3) -> ReLU(4) -> Flatten(5) -> Dense(6) -> Output(7)
++function cnnJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['7'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [28, 28, 1] }, outputLayers: ['2'] }),
++      leaf('2', 'Conv2D', { params: { filters: 16, kernel_size: [3, 3] }, inputLayers: ['1'], outputLayers: ['3'] }),
++      leaf('3', 'BatchNormalization', { inputLayers: ['2'], outputLayers: ['4'] }),
++      leaf('4', 'ReLU', { inputLayers: ['3'], outputLayers: ['5'] }),
++      leaf('5', 'Flatten', { inputLayers: ['4'], outputLayers: ['6'] }),
++      leaf('6', 'Dense', { params: { units: 10 }, inputLayers: ['5'], outputLayers: ['7'] }),
++      leaf('7', 'Output', { inputLayers: ['6'] }),
++    ],
++  };
++}
++
++// Branching functional:
++// Input(1) -> Dense(2,4) -\
++//          -> Dense(3,4) --> Concatenate(4) -> Output(5)
++// tinygrad only maps the listed layers, so the merge falls to a TODO placeholder.
++function functionalJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['5'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [10] }, outputLayers: ['2', '3'] }),
++      leaf('2', 'Dense', { params: { units: 4 }, inputLayers: ['1'], outputLayers: ['4'] }),
++      leaf('3', 'Dense', { params: { units: 4 }, inputLayers: ['1'], outputLayers: ['4'] }),
++      leaf('4', 'Concatenate', { inputLayers: ['2', '3'], outputLayers: ['5'] }),
++      leaf('5', 'Output', { inputLayers: ['4'] }),
++    ],
++  };
++}
++
++// A layer NNVP does not know how to map to tinygrad -> TODO placeholder.
++// Input(1) -> GaussianNoise(2) -> Output(3) (still a linear chain -> sequential path).
++function unsupportedJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['3'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [10] }, outputLayers: ['2'] }),
++      leaf('2', 'GaussianNoise', { params: { stddev: 0.1 }, inputLayers: ['1'], outputLayers: ['3'] }),
++      leaf('3', 'Output', { inputLayers: ['2'] }),
++    ],
++  };
++}
++
++// ---------------------------------------------------------------------------
++
++describe('Tinygrad: full generation', () => {
++  it('generates a Model class for a sequential chain', () => {
++    const code = new KerasGenerator(sequentialJson()).generateTinygradFromGraph();
++    expect(code).toBe(
++      'from tinygrad import Tensor, nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model:\n'
++      + '  def __init__(self):\n'
++      + '    self.layer_3 = nn.Linear(128, 128)\n'
++      + '    self.layer_4 = nn.Linear(10, 10)\n'
++      + '\n'
++      + '  def __call__(self, x):\n'
++      + '    x = x.flatten(1)\n'
++      + '    x = self.layer_3(x)\n'
++      + '    x = self.layer_4(x)\n'
++      + '    return x\n',
++    );
++  });
++
++  it('mixes module layers and Tensor-method layers in one sequential CNN', () => {
++    const code = new KerasGenerator(cnnJson()).generateTinygradFromGraph();
++    expect(code).toBe(
++      'from tinygrad import Tensor, nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model:\n'
++      + '  def __init__(self):\n'
++      + '    self.layer_2 = nn.Conv2d(16, 16, (3,3,))\n'
++      + '    self.layer_3 = nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count\n'
++      + '    self.layer_6 = nn.Linear(10, 10)\n'
++      + '\n'
++      + '  def __call__(self, x):\n'
++      + '    x = self.layer_2(x)\n'
++      + '    x = self.layer_3(x)\n'
++      + '    x = x.relu()\n'
++      + '    x = x.flatten(1)\n'
++      + '    x = self.layer_6(x)\n'
++      + '    return x\n',
++    );
++  });
++
++  it('wires a branching functional graph through __call__ dataflow', () => {
++    const code = new KerasGenerator(functionalJson()).generateTinygradFromGraph();
++    expect(code).toBe(
++      'from tinygrad import Tensor, nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model:\n'
++      + '  def __init__(self):\n'
++      + '    self.layer_2 = nn.Linear(4, 4)\n'
++      + '    self.layer_3 = nn.Linear(4, 4)\n'
++      + '    # TODO: unsupported layer Concatenate\n'
++      + '\n'
++      + '  def __call__(self, x):\n'
++      + '    input_1 = x\n'
++      + '    layer_2 = self.layer_2(input_1)\n'
++      + '    layer_3 = self.layer_3(input_1)\n'
++      + '    layer_4 = layer_2  # TODO: unsupported layer Concatenate\n'
++      + '    return layer_4\n',
++    );
++  });
++
++  it('emits a clearly-marked TODO placeholder for an unsupported layer', () => {
++    const code = new KerasGenerator(unsupportedJson()).generateTinygradFromGraph();
++    expect(code).toBe(
++      'from tinygrad import Tensor, nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model:\n'
++      + '  def __init__(self):\n'
++      + '    # TODO: unsupported layer GaussianNoise\n'
++      + '    pass\n'
++      + '\n'
++      + '  def __call__(self, x):\n'
++      + '    x = x  # TODO: unsupported layer GaussianNoise\n'
++      + '    return x\n',
++    );
++    // The placeholder must not silently emit wrong tinygrad code.
++    expect(code).not.toContain('nn.GaussianNoise');
++  });
++});
++
++describe('Tinygrad: layer -> tinygrad mapping', () => {
++  const helper = () => new KerasGeneratorTinygradHelper({}, [], [], [], false);
++  const ctor = (name, params = {}) => {
++    const graph = { n: { keras_data: { name, parameterValues: params } } };
++    return new KerasGeneratorTinygradHelper(graph, [], [], [], false).moduleConstructor('n');
++  };
++  const method = (name, params = {}) => {
++    const graph = { n: { keras_data: { name, parameterValues: params } } };
++    return new KerasGeneratorTinygradHelper(graph, [], [], [], false).methodCall('n');
++  };
++
++  it('maps module layers, defaulting the in-dim to the out-dim', () => {
++    expect(ctor('Dense', { units: 32 })).toBe('nn.Linear(32, 32)');
++    expect(ctor('Conv2D', { filters: 16, kernel_size: [3, 3] })).toBe('nn.Conv2d(16, 16, (3,3,))');
++    expect(ctor('BatchNormalization')).toBe(
++      'nn.BatchNorm2d(1)  # TODO: set num_features to the input channel count',
++    );
++  });
++
++  it('maps Flatten and activations to Tensor methods', () => {
++    expect(method('Flatten')).toBe('.flatten(1)');
++    expect(method('Activation', { activation: 'relu' })).toBe('.relu()');
++    expect(method('Activation', { activation: 'softmax' })).toBe('.softmax()');
++    expect(method('Sigmoid')).toBe('.sigmoid()');
++    expect(method('Tanh')).toBe('.tanh()');
++  });
++
++  it('maps an activation name directly to its Tensor method suffix', () => {
++    expect(helper().activationMethod('gelu')).toBe('.gelu()');
++    expect(helper().activationMethod('leaky_relu')).toBe('.leakyrelu()');
++  });
++
++  it('returns null (-> TODO) for an unmapped layer or unknown activation', () => {
++    expect(ctor('GaussianNoise', { stddev: 0.1 })).toBeNull();
++    expect(method('GaussianNoise', { stddev: 0.1 })).toBeNull();
++    expect(method('Activation', { activation: 'mish' })).toBeNull();
++  });
++});
+diff --git a/nnvp-client-vue/tests/unit/apiClient.test.js b/nnvp-client-vue/tests/unit/apiClient.test.js
+new file mode 100644
+index 0000000..45e4924
+--- /dev/null
++++ b/nnvp-client-vue/tests/unit/apiClient.test.js
+@@ -0,0 +1,213 @@
++import {
++  describe, it, expect, beforeEach, vi,
++} from 'vitest';
++import ApiClient, { ApiError, ERROR_CODES, STORAGE_KEYS } from '../../src/lib/Backend/apiClient';
++
++// Minimal in-memory Storage stand-in so tests never touch a real localStorage.
++function makeStorage(initial = {}) {
++  const map = new Map(Object.entries(initial));
++  return {
++    getItem: key => (map.has(key) ? map.get(key) : null),
++    setItem: (key, value) => map.set(key, String(value)),
++    removeItem: key => map.delete(key),
++    _map: map,
++  };
++}
++
++// Build a fetch stub returning a single canned response, and record the call.
++function makeFetch(response) {
++  const calls = [];
++  const fetchImpl = vi.fn(async (url, options) => {
++    calls.push({ url, options });
++    if (response instanceof Error) throw response;
++    return response;
++  });
++  fetchImpl.calls = calls;
++  return fetchImpl;
++}
++
++// A Response-like object good enough for the client (text() + status + ok).
++function jsonResponse(status, body) {
++  const raw = body === undefined ? '' : JSON.stringify(body);
++  return {
++    status,
++    ok: status >= 200 && status < 300,
++    text: async () => raw,
++  };
++}
++
++function rawResponse(status, raw) {
++  return {
++    status,
++    ok: status >= 200 && status < 300,
++    text: async () => raw,
++  };
++}
++
++const CONFIGURED = { [STORAGE_KEYS.url]: 'http://localhost:8009' };
++const LOGGED_IN = { [STORAGE_KEYS.url]: 'http://localhost:8009', [STORAGE_KEYS.token]: 'jwt-123' };
++
++describe('ApiClient configuration', () => {
++  it('reports not-configured with no backend url', () => {
++    const api = new ApiClient({ storage: makeStorage(), fetch: makeFetch(jsonResponse(200, {})) });
++    expect(api.isConfigured()).toBe(false);
++    expect(api.isLoggedIn()).toBe(false);
++    expect(api.getBaseUrl()).toBe('');
++  });
++
++  it('trims a trailing slash from the base url', () => {
++    const storage = makeStorage({ [STORAGE_KEYS.url]: 'http://localhost:8009/' });
++    const api = new ApiClient({ storage, fetch: makeFetch(jsonResponse(200, {})) });
++    expect(api.getBaseUrl()).toBe('http://localhost:8009');
++    expect(api.isConfigured()).toBe(true);
++  });
++
++  it('setBaseUrl / setToken / clearToken persist to storage', () => {
++    const storage = makeStorage();
++    const api = new ApiClient({ storage, fetch: makeFetch(jsonResponse(200, {})) });
++    api.setBaseUrl('  http://host:1/  ');
++    expect(storage.getItem(STORAGE_KEYS.url)).toBe('http://host:1/');
++    api.setToken('abc');
++    expect(storage.getItem(STORAGE_KEYS.token)).toBe('abc');
++    expect(api.isLoggedIn()).toBe(true);
++    api.clearToken();
++    expect(storage.getItem(STORAGE_KEYS.token)).toBeNull();
++    expect(api.isLoggedIn()).toBe(false);
++  });
++});
++
++describe('ApiClient auth', () => {
++  it('register posts credentials and stores the returned token', async () => {
++    const storage = makeStorage(CONFIGURED);
++    const fetchImpl = makeFetch(jsonResponse(201, { token: 't-reg', user: { id: 1, email: 'a@b.c' } }));
++    const api = new ApiClient({ storage, fetch: fetchImpl });
++
++    const data = await api.register({ email: 'a@b.c', password: 'pw' });
++
++    expect(data.user.email).toBe('a@b.c');
++    expect(storage.getItem(STORAGE_KEYS.token)).toBe('t-reg');
++    const { url, options } = fetchImpl.calls[0];
++    expect(url).toBe('http://localhost:8009/api/auth/register');
++    expect(options.method).toBe('POST');
++    expect(JSON.parse(options.body)).toEqual({ email: 'a@b.c', password: 'pw' });
++    expect(options.headers['Content-Type']).toBe('application/json');
++  });
++
++  it('login stores the token and later requests send it as a Bearer header', async () => {
++    const storage = makeStorage(CONFIGURED);
++    const loginFetch = makeFetch(jsonResponse(200, { token: 't-login', user: { id: 2, email: 'x@y.z' } }));
++    const api = new ApiClient({ storage, fetch: loginFetch });
++    await api.login({ email: 'x@y.z', password: 'pw' });
++    expect(storage.getItem(STORAGE_KEYS.token)).toBe('t-login');
++
++    // Swap the fetch for the authed call and assert the header plumbing.
++    const meFetch = makeFetch(jsonResponse(200, { id: 2, email: 'x@y.z' }));
++    api._fetch = meFetch;
++    const me = await api.me();
++    expect(me.email).toBe('x@y.z');
++    expect(meFetch.calls[0].options.headers.Authorization).toBe('Bearer t-login');
++  });
++
++  it('logout clears the token', () => {
++    const storage = makeStorage(LOGGED_IN);
++    const api = new ApiClient({ storage, fetch: makeFetch(jsonResponse(200, {})) });
++    expect(api.isLoggedIn()).toBe(true);
++    api.logout();
++    expect(api.isLoggedIn()).toBe(false);
++  });
++});
++
++describe('ApiClient projects CRUD', () => {
++  let storage;
++  beforeEach(() => { storage = makeStorage(LOGGED_IN); });
++
++  it('listProjects returns the array with a Bearer header', async () => {
++    const fetchImpl = makeFetch(jsonResponse(200, [{ id: 1, name: 'P', updated_at: 't' }]));
++    const api = new ApiClient({ storage, fetch: fetchImpl });
++    const projects = await api.listProjects();
++    expect(projects).toHaveLength(1);
++    expect(fetchImpl.calls[0].url).toBe('http://localhost:8009/api/projects');
++    expect(fetchImpl.calls[0].options.headers.Authorization).toBe('Bearer jwt-123');
++  });
++
++  it('createProject posts name + graph', async () => {
++    const graph = { layers: [], edges: [], inputs: [], outputs: [] };
++    const fetchImpl = makeFetch(jsonResponse(201, { id: 5, name: 'N', graph, updated_at: 't' }));
++    const api = new ApiClient({ storage, fetch: fetchImpl });
++    const created = await api.createProject({ name: 'N', graph });
++    expect(created.id).toBe(5);
++    const { url, options } = fetchImpl.calls[0];
++    expect(url).toBe('http://localhost:8009/api/projects');
++    expect(options.method).toBe('POST');
++    expect(JSON.parse(options.body)).toEqual({ name: 'N', graph });
++  });
++
++  it('getProject fetches by id', async () => {
++    const fetchImpl = makeFetch(jsonResponse(200, { id: 7, name: 'G', graph: {}, updated_at: 't' }));
++    const api = new ApiClient({ storage, fetch: fetchImpl });
++    const p = await api.getProject(7);
++    expect(p.id).toBe(7);
++    expect(fetchImpl.calls[0].url).toBe('http://localhost:8009/api/projects/7');
++    expect(fetchImpl.calls[0].options.method).toBe('GET');
++  });
++
++  it('updateProject only sends provided fields', async () => {
++    const fetchImpl = makeFetch(jsonResponse(200, { id: 7, name: 'R', updated_at: 't' }));
++    const api = new ApiClient({ storage, fetch: fetchImpl });
++    await api.updateProject(7, { name: 'R' });
++    const { url, options } = fetchImpl.calls[0];
++    expect(url).toBe('http://localhost:8009/api/projects/7');
++    expect(options.method).toBe('PUT');
++    expect(JSON.parse(options.body)).toEqual({ name: 'R' });
++  });
++
++  it('deleteProject handles a 204 No Content response', async () => {
++    const fetchImpl = makeFetch(rawResponse(204, ''));
++    const api = new ApiClient({ storage, fetch: fetchImpl });
++    const result = await api.deleteProject(9);
++    expect(result).toBeNull();
++    expect(fetchImpl.calls[0].options.method).toBe('DELETE');
++  });
++});
++
++describe('ApiClient error handling', () => {
++  it('throws no-backend when the url is not set', async () => {
++    const api = new ApiClient({ storage: makeStorage(), fetch: makeFetch(jsonResponse(200, {})) });
++    await expect(api.listProjects()).rejects.toMatchObject({ code: ERROR_CODES.noBackend });
++  });
++
++  it('throws not-logged-in for authed calls without a token', async () => {
++    const api = new ApiClient({ storage: makeStorage(CONFIGURED), fetch: makeFetch(jsonResponse(200, {})) });
++    await expect(api.listProjects()).rejects.toMatchObject({ code: ERROR_CODES.notLoggedIn });
++    await expect(api.me()).rejects.toBeInstanceOf(ApiError);
++  });
++
++  it('surfaces a 401 as an http error carrying the status and server message', async () => {
++    const storage = makeStorage(LOGGED_IN);
++    const api = new ApiClient({ storage, fetch: makeFetch(jsonResponse(401, { detail: 'Invalid token' })) });
++    const err = await api.me().catch(e => e);
++    expect(err).toBeInstanceOf(ApiError);
++    expect(err.code).toBe(ERROR_CODES.http);
++    expect(err.status).toBe(401);
++    expect(err.message).toBe('Invalid token');
++  });
++
++  it('maps a thrown fetch (network failure) to a network error', async () => {
++    const storage = makeStorage(LOGGED_IN);
++    const api = new ApiClient({ storage, fetch: makeFetch(new TypeError('Failed to fetch')) });
++    await expect(api.listProjects()).rejects.toMatchObject({ code: ERROR_CODES.network });
++  });
++
++  it('maps a malformed JSON body on a 200 to a malformed error', async () => {
++    const storage = makeStorage(LOGGED_IN);
++    const api = new ApiClient({ storage, fetch: makeFetch(rawResponse(200, '{not json')) });
++    await expect(api.listProjects()).rejects.toMatchObject({ code: ERROR_CODES.malformed });
++  });
++
++  it('does not store a token when login fails', async () => {
++    const storage = makeStorage(CONFIGURED);
++    const api = new ApiClient({ storage, fetch: makeFetch(jsonResponse(400, { detail: 'bad creds' })) });
++    await expect(api.login({ email: 'a', password: 'b' })).rejects.toMatchObject({ status: 400 });
++    expect(storage.getItem(STORAGE_KEYS.token)).toBeNull();
++  });
++});
+-- 
+2.43.0
+

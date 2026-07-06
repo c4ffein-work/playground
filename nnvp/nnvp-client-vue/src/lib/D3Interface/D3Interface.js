@@ -166,6 +166,12 @@ export default class {
     }
   }
 
+  generateTinygradInBrowser(kerasInterface) {
+    if (this.activeGraph !== null) {
+      this.activeGraph.generateTinygradInBrowser(kerasInterface);
+    }
+  }
+
   generateJavascriptNoSave(kerasInterface) {
     if (this.activeGraph !== null) {
       return this.activeGraph.generateJavascriptNoSave(kerasInterface);
@@ -187,6 +193,22 @@ export default class {
     if (this.activeGraph !== null) {
       this.activeGraph.clearBoard(false);
     }
+  }
+
+  // Cloud save/load reuse the exact serialization the File > Save / Load uses:
+  // `activeGraph.toJSON()` (i.e. model.toJSON) produces the string, and
+  // `model.loadJSON` reads it back — the same pair `saveBoard`/`uploadToBoard` rely on.
+  getGraphJSON() {
+    if (this.activeGraph === null) return null;
+    return this.activeGraph.toJSON();
+  }
+
+  loadGraphFromJSON(graphJSON) {
+    if (this.activeGraph === null) return;
+    this.activeGraph.saveState();
+    this.activeGraph.clearBoard(true);
+    this.activeGraph.model.loadJSON(graphJSON);
+    this.activeGraph.updateGraph();
   }
 
   // Templates functions
