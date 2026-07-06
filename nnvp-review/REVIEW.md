@@ -56,6 +56,14 @@ original unknown-layer fallback. No behavior change (verified against `layer-hel
   `createTreatmentList` topological ordering (linear / branching / diamond / cycles), `isSequential`,
   and Python + JS generation asserting exact output strings.
 
+### 5. Fix double-slash dataset URLs (FashionMNIST/CIFAR10) + datasets-sources tests
+- `datasets-sources.js` built FashionMNIST/CIFAR10 paths as `cdnDir+"/fashion_mnist/…"` while the
+  default `cdnDir` ends in a slash — producing `datasets//fashion_mnist/…` (MNIST correctly used no
+  leading slash). Strict CDNs/object stores can 404 on `//`; risky given the planned Netlify→OVH move.
+  Removed the leading slashes.
+- Added `tests/unit/datasets-sources.test.js` (3 tests) asserting well-formed URLs (no `//` after the
+  scheme — fails before the fix), per-dataset directories, and config/description presence.
+
 ### 4. Deselect → empty right panel (roadmap "broken features" item) + notify-guard fix
 - Added a core-features e2e that selects a layer (params shown, overview hidden), clicks empty
   canvas to deselect, and asserts the right panel returns to the empty **Network Overview** state

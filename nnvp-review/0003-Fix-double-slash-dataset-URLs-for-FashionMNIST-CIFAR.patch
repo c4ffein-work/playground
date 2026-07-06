@@ -1,0 +1,141 @@
+From 1ae3c035650deab42cfa44e4102164dbc6c8c7ec Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Mon, 6 Jul 2026 08:09:56 +0000
+Subject: [PATCH 3/3] Fix double-slash dataset URLs for FashionMNIST/CIFAR10 +
+ add datasets-sources tests
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+datasets-sources.js built FashionMNIST and CIFAR10 paths as cdnDir+"/fashion_mnist/..."
+and cdnDir+"/cifar10/...". Because the default cdnDir ("https://datasets.nnvp.io/datasets/")
+ends with a slash, those produced double-slash URLs ("datasets//fashion_mnist/..."), unlike
+MNIST which correctly used cdnDir+"mnist/...". Many CDNs/object stores treat "//" as a distinct
+missing path and 404 — a real hazard given the planned Netlify->OVH hosting migration. Removed the
+leading slashes so all datasets match MNIST's correct relative form.
+
+Added tests/unit/datasets-sources.test.js (3 tests): verifies the expected datasets exist with a
+config + description, that every image/label URL is well-formed with no double slash after the
+scheme (fails before this fix), and that each dataset lives under its own directory.
+
+Verified: 28 unit tests pass (25 + 3 new), lint 0/0, build ok.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JNQtU2ePmhzdTwymZCbh7J
+---
+ .../src/lib/JSDatasets/datasets-sources.js    |  8 +--
+ .../tests/unit/datasets-sources.test.js       | 62 +++++++++++++++++++
+ 2 files changed, 66 insertions(+), 4 deletions(-)
+ create mode 100644 nnvp-client-vue/tests/unit/datasets-sources.test.js
+
+diff --git a/nnvp-client-vue/src/lib/JSDatasets/datasets-sources.js b/nnvp-client-vue/src/lib/JSDatasets/datasets-sources.js
+index 358d923..a5d1d3f 100644
+--- a/nnvp-client-vue/src/lib/JSDatasets/datasets-sources.js
++++ b/nnvp-client-vue/src/lib/JSDatasets/datasets-sources.js
+@@ -32,7 +32,7 @@ export default (cdnDir) => {return{
+   'FashionMNIST': [
+     {
+       imagesSpritePath: [...Array(14).keys()].map(x =>
+-        [ x * 5000, 5000, cdnDir+"/fashion_mnist/fashion_mnist_"+(x > 9 ? x : "0"+x)+".png" ]
++        [ x * 5000, 5000, cdnDir+"fashion_mnist/fashion_mnist_"+(x > 9 ? x : "0"+x)+".png" ]
+       ),
+       imagesSpriteChecksum: [
+         'sha256-dVuwptjsAJXmjU1JQj0Mzhaw2Fs8JoFw557WHpPsZts=',
+@@ -53,7 +53,7 @@ export default (cdnDir) => {return{
+       shape: [28, 28, 1],
+       numDatasetElements: 70000,
+       numTrainElements: 60000,
+-      labelsPath: cdnDir+"/fashion_mnist/fashion_mnist_labels_uint8.dms",
++      labelsPath: cdnDir+"fashion_mnist/fashion_mnist_labels_uint8.dms",
+       labelsChecksum: "sha256-irlApoBkDzbAvx0lScsvOz1AaMElRxFsx7EWGx0mZj0=",
+       labelClassNames: [
+         "T-shirt/top",
+@@ -76,7 +76,7 @@ export default (cdnDir) => {return{
+   'CIFAR10': [
+     {
+       imagesSpritePath: [...Array(30).keys()].map(x =>
+-        [ x * 2000, 2000, cdnDir+"/cifar10/cifar10_"+(x > 9 ? x : "0"+x)+".png" ]
++        [ x * 2000, 2000, cdnDir+"cifar10/cifar10_"+(x > 9 ? x : "0"+x)+".png" ]
+       ),
+       imagesSpriteChecksum: [
+         'sha256-QO0+FEL2rAzw7rOUI8WAwOivVLhHGMxom59+oJtcDag=',
+@@ -113,7 +113,7 @@ export default (cdnDir) => {return{
+       shape: [32, 32, 3],
+       numDatasetElements: 60000,
+       numTrainElements: 50000,
+-      labelsPath: cdnDir+"/cifar10/cifar10_labels_uint8.dms",
++      labelsPath: cdnDir+"cifar10/cifar10_labels_uint8.dms",
+       labelsChecksum: "sha256-PttFZSTVkYrv3tgfWu98Mu+rKniCEd+Zik6wyJV7qh8=",
+       labelClassNames: [
+         "airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"
+diff --git a/nnvp-client-vue/tests/unit/datasets-sources.test.js b/nnvp-client-vue/tests/unit/datasets-sources.test.js
+new file mode 100644
+index 0000000..feadaab
+--- /dev/null
++++ b/nnvp-client-vue/tests/unit/datasets-sources.test.js
+@@ -0,0 +1,62 @@
++import { describe, it, expect } from 'vitest';
++import loadableDatasets from '../../src/lib/JSDatasets/datasets-sources';
++
++// datasets-sources exports (cdnDir) => ({ NAME: [config, description, ...], ... }).
++// The default cdnDir (see TrainingZone.vue) ends with a trailing slash, so every
++// per-dataset path must be relative (no leading slash) to avoid emitting a "//"
++// in the URL — strict CDNs/object stores treat "datasets//cifar10" as a distinct,
++// missing path.
++const CDN_DIR = 'https://datasets.nnvp.io/datasets/';
++
++// Collect every fully-qualified URL a dataset config references.
++function urlsForDataset(config) {
++  const urls = [];
++  if (Array.isArray(config.imagesSpritePath)) {
++    for (const entry of config.imagesSpritePath) {
++      // entries are [offset, count, url]
++      urls.push(entry[entry.length - 1]);
++    }
++  }
++  if (typeof config.labelsPath === 'string') urls.push(config.labelsPath);
++  return urls;
++}
++
++// Strip the scheme so the "//" check only looks at the path portion.
++function pathAfterScheme(url) {
++  return url.replace(/^https?:\/\//, '');
++}
++
++describe('datasets-sources', () => {
++  const datasets = loadableDatasets(CDN_DIR);
++
++  it('defines the expected datasets, each with a config and a description', () => {
++    expect(Object.keys(datasets).sort()).toEqual(['CIFAR10', 'FashionMNIST', 'MNIST']);
++    for (const [name, entry] of Object.entries(datasets)) {
++      expect(Array.isArray(entry), `${name} entry is a tuple`).toBe(true);
++      expect(typeof entry[0], `${name} has a config object`).toBe('object');
++      expect(typeof entry[1], `${name} has a description string`).toBe('string');
++      expect(entry[1].length, `${name} description is non-empty`).toBeGreaterThan(0);
++    }
++  });
++
++  it('builds well-formed URLs with no double slash after the scheme', () => {
++    for (const [name, entry] of Object.entries(datasets)) {
++      for (const url of urlsForDataset(entry[0])) {
++        expect(url.startsWith(CDN_DIR), `${name}: ${url} should start with the CDN dir`).toBe(true);
++        expect(
++          pathAfterScheme(url).includes('//'),
++          `${name}: ${url} must not contain a double slash`,
++        ).toBe(false);
++      }
++    }
++  });
++
++  it('references each dataset under its own directory', () => {
++    const dirByName = { MNIST: 'mnist/', FashionMNIST: 'fashion_mnist/', CIFAR10: 'cifar10/' };
++    for (const [name, dir] of Object.entries(dirByName)) {
++      for (const url of urlsForDataset(datasets[name][0])) {
++        expect(url.includes(dir), `${name}: ${url} should live under ${dir}`).toBe(true);
++      }
++    }
++  });
++});
+-- 
+2.43.0
+
