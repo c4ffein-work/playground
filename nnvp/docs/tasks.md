@@ -20,7 +20,7 @@ But if you read this and you want to get involved, you can actually create one f
   - [ ] List last small improvements
 
 ### 2. New tests for broken features
-- [ ] When deselecting a layer, we have to go back to the empty selection in the right panel
+- [x] When deselecting a layer, we have to go back to the empty selection in the right panel
 
 ### 3. Deployment
 - [ ] Migrate from Netlify to OVH for the SPA

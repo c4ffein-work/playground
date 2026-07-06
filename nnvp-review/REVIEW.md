@@ -5,8 +5,11 @@ This folder is a landing spot because this session is scoped to `c4ffein-work/pl
 and cannot push to `c4ffein/nnvp` (see **Why it's here** at the bottom).
 
 - `../nnvp/` — full self-contained copy of the project with the changes below applied (buildable).
-- `0001-Extract-layer-help-into-data-module-add-KerasGenerat.patch` — the same changes as a
-  single commit that applies cleanly onto `c4ffein/nnvp` master.
+- `0001-*.patch`, `0002-*.patch` — the changes as a commit series that `git am`s cleanly onto
+  `c4ffein/nnvp` master (see **Opening the PR** below).
+
+> This is an ongoing autonomous loop working through `nnvp/docs/tasks.md`; the patch series and
+> this doc grow as items land.
 
 ---
 
@@ -52,6 +55,15 @@ original unknown-layer fallback. No behavior change (verified against `layer-hel
 - `tests/unit/KerasGenerator.test.js` — **25 tests**: `jsonToGraph`/composite flattening,
   `createTreatmentList` topological ordering (linear / branching / diamond / cycles), `isSequential`,
   and Python + JS generation asserting exact output strings.
+
+### 4. Deselect → empty right panel (roadmap "broken features" item) + notify-guard fix
+- Added a core-features e2e that selects a layer (params shown, overview hidden), clicks empty
+  canvas to deselect, and asserts the right panel returns to the empty **Network Overview** state
+  with the node's `selected` class removed. Verified it fails when selection notification is disabled.
+- Fixed `D3GraphEditor.notifySelectionChanged`: it invoked the callback inside the `if` condition
+  (double-invoke on truthy return; would throw if unregistered) instead of guarding on existence —
+  now consistent with `notifyGraphChanged`.
+- Checked the item off in `docs/tasks.md`.
 
 ### 3. Three bug fixes (each with a test that fails without the fix)
 - **Cycle guard** in `createTreatmentList` — a cyclic graph previously infinite-recursed

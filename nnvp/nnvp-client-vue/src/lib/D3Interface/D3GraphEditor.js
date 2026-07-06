@@ -320,7 +320,7 @@ D3GraphEditor.prototype.onGraphChanged = function (callback) {
  * Calls the callback registered to the `selection changed` event
  */
 D3GraphEditor.prototype.notifySelectionChanged = function () {
-  if(this.selectionChangedCallback()) this.selectionChangedCallback();
+  if(this.selectionChangedCallback) this.selectionChangedCallback();
 };
 
 /**
