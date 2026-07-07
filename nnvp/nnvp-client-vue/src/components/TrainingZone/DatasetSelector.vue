@@ -1,0 +1,373 @@
+<template>
+  <div id="DatasetSelector" class="DatasetSelector">
+    <div id="dataset-selector-and-description">
+      <select
+        id="dataset-selector-selector"
+        class="DatasetSelector dataset-select"
+        aria-label="Select dataset"
+        v-bind:value="value"
+        v-on:change="datasetSet($event.target.value)"
+      >
+        <option v-bind:key="key" v-for="(item, key) in loadableDatasets" v-bind:value="key">
+          {{key}}
+        </option>
+      </select>
+      <div id="dataset-description">{{datasetDescription}}
+      </div>
+      <div v-if="loadError" id="dataset-load-error" class="dataset-load-error" role="alert">
+        <div class="dataset-load-error-message">
+          Couldn't load {{ errorDatasetName }} — check your connection and try again.
+        </div>
+        <button
+          id="dataset-load-error-retry"
+          class="dataset-load-error-retry"
+          v-on:click="retryLoad"
+        >Retry</button>
+      </div>
+    </div>
+    <div id="samples-container">
+      <div id="samples-title"></div>
+      <div v-if="loadingShown" id="data-selector-loading-bar-container">
+        <div
+          id="data-selector-loading-bar-contained"
+          v-bind:style="{width: loadingPercentage * 100 + '%'}"
+        ></div>
+      </div>
+      <div v-bind:style="{display: loadingShown ? 'none' : 'block'}" id="samples"></div>
+    </div>
+
+    <!-- Warning Modal -->
+    <div v-if="showWarning" class="warning-modal-overlay" @click.self="cancelWarning">
+      <div class="warning-modal" role="dialog" aria-modal="true" aria-label="Dataset download warning">
+        <div class="warning-modal-message">{{ warningMessage }}</div>
+        <div class="warning-modal-buttons">
+          <button @click="cancelWarning" class="warning-modal-button warning-cancel">Cancel</button>
+          <button @click="confirmWarning" class="warning-modal-button warning-confirm">Load Dataset</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<script>
+import { loadTf } from '../../lib/tf/loadTf';
+
+export default {
+  name: 'DatasetSelector',
+  props: {
+    value: {type: String, default: null},
+    loadableDatasets: {type: Object, default: {}},
+    getDatasets: {type: Function, default: () => ({})},
+    loadDataset: {type: Function, default: () => null},
+    getWarningMessage: {type: Function, default: () => null},
+  },
+  computed: {
+    datasetDescription() { return this.loadableDatasets?.[this.value]?.[1] ?? ''; },
+  },
+  data() {
+    return {
+      newestSelected: null, // Needed to simplify access before propagation
+      neededSamples: null,
+      loadingId: 0, // Incrementing ID to cancel stale loading operations
+      currentLoadingId: null,
+      loadingPercentage: 0,
+      loadingShown: true,
+      showWarning: false,
+      warningMessage: '',
+      pendingDataset: null,
+      loadError: false, // Whether the last load attempt failed
+      errorDatasetName: null, // Name of the dataset whose load failed (for the retry action)
+    };
+  },
+  methods: {
+    async datasetSet(name) {
+      const debugEnabled = window.nnvp?.debug?.enableDatasets;
+      if (debugEnabled) console.log(`[DatasetSelector] datasetSet called with: ${name}`);
+
+      const warningMessage = this.getWarningMessage(name);
+      if (warningMessage) {
+        this.warningMessage = warningMessage;
+        this.pendingDataset = name;
+        this.showWarning = true;
+        document.getElementById('dataset-selector-selector').value = this.value;
+        return;
+      }
+      this.proceedWithDatasetLoad(name);
+    },
+    confirmWarning() {
+      const debugEnabled = window.nnvp?.debug?.enableDatasets;
+      this.showWarning = false;
+      const datasetName = this.pendingDataset;
+      this.pendingDataset = null;
+      this.warningMessage = '';
+      if (debugEnabled) console.log(`[DatasetSelector] User confirmed warning for: ${datasetName}`);
+      this.proceedWithDatasetLoad(datasetName);
+    },
+    cancelWarning() {
+      const debugEnabled = window.nnvp?.debug?.enableDatasets;
+      this.showWarning = false;
+      const cancelledDataset = this.pendingDataset;
+      this.pendingDataset = null;
+      this.warningMessage = '';
+      document.getElementById('dataset-selector-selector').value = this.value;
+      if (debugEnabled) console.log(`[DatasetSelector] User cancelled warning for: ${cancelledDataset}`);
+    },
+    async proceedWithDatasetLoad(name) {
+      const debugEnabled = window.nnvp?.debug?.enableDatasets;
+      this.newestSelected = name;
+      this.$emit('input', name);
+      const loadId = ++this.loadingId;
+      this.currentLoadingId = loadId;
+      // Fresh attempt: clear any previous error and show the loading indicator.
+      this.loadError = false;
+      this.errorDatasetName = null;
+      this.loadingPercentage = 0;
+      this.loadingShown = true;
+
+      if (debugEnabled) console.log(`[DatasetSelector] Starting load for: ${name}, ID: ${loadId}`);
+
+      const updateProgress = (progress, id) => {
+        if (id !== this.currentLoadingId) return;
+        this.loadingShown = true;
+        this.loadingPercentage = progress;
+        if (debugEnabled) console.log(`[DatasetSelector] Loading progress for ${name}: ${(progress * 100).toFixed(1)}%`);
+      };
+      this.loadDataset(name, x => updateProgress(x, loadId))
+        .then(async () => {
+          if (this.currentLoadingId !== loadId) {
+            if (debugEnabled) console.log(`[DatasetSelector] Load cancelled for: ${name} (ID mismatch: ${loadId} vs ${this.currentLoadingId})`);
+            return;
+          }
+          if (debugEnabled) console.log(`[DatasetSelector] Load complete for: ${name}, filling samples...`);
+          await this.fillSamples(name);
+          this.loadingShown = false;
+          if (debugEnabled) console.log(`[DatasetSelector] Samples filled for: ${name}`);
+        })
+        .catch(error => {
+          if (debugEnabled) console.error(`[DatasetSelector] Error loading ${name}:`, error);
+          // Ignore failures from stale (superseded) load attempts.
+          if (this.currentLoadingId !== loadId) return;
+          // Surface a clear, styled error state and reset the half-loaded UI:
+          // hide the loading bar, clear any leftover samples, and offer a retry.
+          this.loadingShown = false;
+          this.loadingPercentage = 0;
+          const drawArea = document.getElementById('samples');
+          if (drawArea) drawArea.innerHTML = '';
+          this.errorDatasetName = name;
+          this.loadError = true;
+        });
+    },
+    retryLoad() {
+      const name = this.errorDatasetName;
+      if (!name) return;
+      const debugEnabled = window.nnvp?.debug?.enableDatasets;
+      if (debugEnabled) console.log(`[DatasetSelector] Retrying load for: ${name}`);
+      this.proceedWithDatasetLoad(name);
+    },
+    // Mostly from https://storage.googleapis.com/tfjs-vis/mnist/dist/index.html
+    async fillSamples(name) {
+      if (this.value !== name) return;
+      // tfjs is loaded lazily; ensure it is ready before using tf ops below.
+      const tf = await loadTf();
+      const drawArea = document.getElementById('samples');
+      if (!drawArea) {
+        this.neededSamples = name;
+        return;
+      }
+      drawArea.innerHTML = '';
+      const dataset = this.getDatasets()[name];
+      if(!dataset) {
+        console.error(`Dataset "${name}" not found`);
+        drawArea.innerHTML = `<div style="color: var(--text-primary); padding: 20px; text-align: center;">Error: Dataset "${name}" could not be loaded</div>`;
+        return;
+      }
+      const examples = dataset.nextTestBatch(40);
+      const numExamples = examples.xs.shape[0];
+      for (let i = 0; i < numExamples; i += 1) {
+        const imageTensor = tf.tidy(
+          () => examples.xs.slice([i, 0], [1, examples.xs.shape[1]]).reshape(dataset.shape),
+        );
+        const canvas = document.createElement('canvas');
+        canvas.width = dataset.shape[0]; // eslint-disable-line prefer-destructuring
+        canvas.height = dataset.shape[1]; // eslint-disable-line prefer-destructuring
+        canvas.style = 'margin: 4px;';
+        await tf.browser.toPixels(imageTensor, canvas); // eslint-disable-line
+        drawArea.appendChild(canvas);
+      }
+    },
+    refresh() {
+      if (this.neededSamples && this.neededSamples === this.newestSelected) {
+        this.fillSamples(this.neededSamples);
+      }
+    },
+  },
+  mounted() {
+    this.newestSelected = this.value;
+    setTimeout(() => {
+      if (this.newestSelected === this.value) this.datasetSet(this.newestSelected);
+    }, 3000);
+  },
+};
+</script>
+
+<style>
+@font-face {
+  font-family: var(--font-medium); font-weight: var(--font-weight-medium);
+  src: url("/assets/fonts/Roboto-Regular-webfont.woff") format("woff");
+}
+@font-face {
+  font-family: var(--font-regular); font-weight: var(--font-weight-regular);
+  src: url("/assets/fonts/Roboto-Thin-webfont.woff") format("woff");
+}
+#DatasetSelector {
+  height: 100%;
+  width: 100%;
+  cursor: default;
+  font-family: var(--font-regular); font-weight: var(--font-weight-regular);
+  font-size: 15px;
+  overflow: hidden;
+  display: grid;
+  grid-template-columns: 40% 60%;
+}
+#dataset-selector-and-description {
+  grid-columns: 1/2;
+  display: grid;
+  grid-template-rows: auto 1fr;
+}
+#dataset-selector-and-description {
+  grid-rows: 1/2;
+}
+#samples-container {
+  grid-columns: 2/2;
+}
+#data-selector-loading-bar-container {
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  border-radius: 15px;
+  width: calc(100% - 40px);
+  height: 23px;
+  box-sizing: border-box;
+  padding: 2px;
+  margin: 20px;
+  overflow: hidden;
+}
+#data-selector-loading-bar-contained {
+  background-color: var(--accent);
+  border-radius: 13px;
+  height: 100%;
+}
+.DatasetSelector.dataset-select {
+  float: left;
+  padding-left: 10px;
+  margin: 20px 10px 15px 10px;
+  height: 23px;
+  box-sizing: border-box;
+}
+#dataset-description {
+  margin: 0px 10px 10px 10px;
+  padding: 0;
+  border: 0;
+  text-align: justify;
+  text-justify: auto;
+  overflow: auto;
+}
+#samples {
+  margin: 15px 0 0 0;
+}
+
+/* Dataset load error (inline, in the description column) */
+.dataset-load-error {
+  margin: 4px 10px 10px 10px;
+  padding: 12px;
+  border: var(--border-width) solid #c0392b;
+  border-radius: var(--border-radius);
+  background-color: #fdecea;
+  color: #a12b1e;
+  font-family: var(--font-regular);
+  font-weight: var(--font-weight-regular);
+  font-size: 14px;
+  line-height: 1.4;
+}
+.dataset-load-error-message {
+  margin-bottom: 10px;
+}
+.dataset-load-error-retry {
+  padding: 6px 18px;
+  border: var(--border-width) solid #c0392b;
+  border-radius: var(--border-radius);
+  background-color: #c0392b;
+  color: #ffffff;
+  font-size: 14px;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+  font-family: var(--font-regular);
+  font-weight: var(--font-weight-medium);
+}
+.dataset-load-error-retry:hover {
+  transform: translate(1px, -1px);
+}
+
+/* Warning Modal */
+.warning-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+}
+
+.warning-modal {
+  background-color: var(--bg-panel);
+  border: var(--border-width) solid var(--panel-border);
+  border-radius: 15px;
+  padding: 30px;
+  max-width: 400px;
+  box-shadow: var(--panel-shadow);
+}
+
+.warning-modal-message {
+  color: var(--text-primary);
+  font-size: 15px;
+  line-height: 1.5;
+  margin-bottom: 20px;
+  text-align: center;
+}
+
+.warning-modal-buttons {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+}
+
+.warning-modal-button {
+  padding: 8px 20px;
+  border: 1px solid var(--input-border);
+  border-radius: 15px;
+  background-color: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 14px;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+  font-family: var(--font-regular);
+  font-weight: var(--font-weight-regular);
+}
+
+.warning-modal-button:hover {
+  transform: translate(1px, -1px);
+}
+
+.warning-confirm {
+  background-color: var(--fill-strong);
+  border-color: var(--fill-strong);
+  color: var(--fill-strong-text);
+}
+
+.warning-confirm:hover {
+  background-color: var(--fill-strong);
+}
+</style>

@@ -1,0 +1,2554 @@
+From bfaaba8dc9ccdb27590430adb45262d317e503e0 Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Mon, 6 Jul 2026 12:03:09 +0000
+Subject: [PATCH 5/8] Add 4 features in parallel: AI chat-assistant, MNIST
+ tutorial, PyTorch codegen, tfjs 4 upgrade
+
+Integrated from four independent subagent branches (each built on the theme-v0.1 base),
+merged with a combined verification pass.
+
+- AI chat-assistant bubble (src/lib/Assistant/*, src/components/Assistant/ChatBubble.vue):
+  bottom-right chat with an actions API over D3Interface/KerasInterface (addLayer, listLayers,
+  setParam, getModelSummary, generateCode, delete/undo/redo) exposed to Claude via an Anthropic
+  tool-use client (bring-your-own-key from localStorage). 11 unit tests.
+- MNIST tutorial mode (src/lib/Tutorial/mnistTutorial.js, src/components/Tutorial/TutorialOverlay.vue):
+  8-step guided build with coachmark highlights that auto-advance on real editor state; "Tutorial"
+  top-menu entry. 15 unit tests + tutorial.spec.js e2e.
+- PyTorch code generation (src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js): torch.nn.Module
+  generation (LazyLinear/LazyConv2d), sequential + functional, unsupported layers -> explicit TODO;
+  "Generate PyTorch" File-menu entry. 6 exact-string unit tests.
+- @tensorflow/tfjs 3.3.0 -> 4.22.0: no code changes required (the v3 APIs in use are v4-compatible);
+  builds against v4.
+
+Merge notes: App.vue mounts both ChatBubble and TutorialOverlay; GeneralMenu.vue carries both the
+PyTorch and Tutorial items (3-way merged).
+
+Verified: lint 0/0, 60 unit tests (5 files), build ok on tfjs 4, e2e app/layer-help/tutorial 11/11
+and non-network core-features 32/32. Not verifiable in this sandbox (network-blocked): live LLM chat
+(needs an API key) and in-browser tfjs-4 training (needs a real browser + network).
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01JNQtU2ePmhzdTwymZCbh7J
+---
+ nnvp-client-vue/package-lock.json             | 129 +++---
+ nnvp-client-vue/package.json                  |   2 +-
+ nnvp-client-vue/src/App.vue                   |  15 +-
+ .../src/components/Assistant/ChatBubble.vue   | 370 ++++++++++++++++++
+ .../src/components/GeneralMenu.vue            |   4 +
+ .../components/Tutorial/TutorialOverlay.vue   | 289 ++++++++++++++
+ .../src/lib/Assistant/anthropicClient.js      | 234 +++++++++++
+ .../src/lib/Assistant/assistantActions.js     | 135 +++++++
+ .../src/lib/D3Interface/D3GraphEditor.js      |   5 +
+ .../src/lib/D3Interface/D3Interface.js        |   6 +
+ .../src/lib/KerasInterface/KerasGenerator.js  |   7 +
+ .../KerasGeneratorPyTorchHelper.js            | 243 ++++++++++++
+ .../src/lib/KerasInterface/KerasInterface.js  |  10 +-
+ .../src/lib/Tutorial/mnistTutorial.js         | 158 ++++++++
+ nnvp-client-vue/tests/tutorial.spec.js        |  43 ++
+ .../tests/unit/KerasGeneratorPyTorch.test.js  | 167 ++++++++
+ .../tests/unit/assistantActions.test.js       | 204 ++++++++++
+ .../tests/unit/mnistTutorial.test.js          | 156 ++++++++
+ 18 files changed, 2105 insertions(+), 72 deletions(-)
+ create mode 100644 nnvp-client-vue/src/components/Assistant/ChatBubble.vue
+ create mode 100644 nnvp-client-vue/src/components/Tutorial/TutorialOverlay.vue
+ create mode 100644 nnvp-client-vue/src/lib/Assistant/anthropicClient.js
+ create mode 100644 nnvp-client-vue/src/lib/Assistant/assistantActions.js
+ create mode 100644 nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js
+ create mode 100644 nnvp-client-vue/src/lib/Tutorial/mnistTutorial.js
+ create mode 100644 nnvp-client-vue/tests/tutorial.spec.js
+ create mode 100644 nnvp-client-vue/tests/unit/KerasGeneratorPyTorch.test.js
+ create mode 100644 nnvp-client-vue/tests/unit/assistantActions.test.js
+ create mode 100644 nnvp-client-vue/tests/unit/mnistTutorial.test.js
+
+diff --git a/nnvp-client-vue/package-lock.json b/nnvp-client-vue/package-lock.json
+index 3f30314..397f1fc 100644
+--- a/nnvp-client-vue/package-lock.json
++++ b/nnvp-client-vue/package-lock.json
+@@ -8,7 +8,7 @@
+       "name": "nnvp-client-vue",
+       "version": "0.1.0",
+       "dependencies": {
+-        "@tensorflow/tfjs": "^3.3.0",
++        "@tensorflow/tfjs": "^4.22.0",
+         "d3": "^7.9.0",
+         "file-saver": "^2.0.5",
+         "vue": "^3.5.13"
+@@ -1356,20 +1356,20 @@
+       "license": "MIT"
+     },
+     "node_modules/@tensorflow/tfjs": {
+-      "version": "3.21.0",
+-      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs/-/tfjs-3.21.0.tgz",
+-      "integrity": "sha512-khcARd3/872llL/oF4ouR40qlT71mylU66PGT8kHP/GJ5YKj44sv8lDRjU7lOVlJK7jsJFWEsNVHI3eMc/GWNQ==",
++      "version": "4.22.0",
++      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs/-/tfjs-4.22.0.tgz",
++      "integrity": "sha512-0TrIrXs6/b7FLhLVNmfh8Sah6JgjBPH4mZ8JGb7NU6WW+cx00qK5BcAZxw7NCzxj6N8MRAIfHq+oNbPUNG5VAg==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@tensorflow/tfjs-backend-cpu": "3.21.0",
+-        "@tensorflow/tfjs-backend-webgl": "3.21.0",
+-        "@tensorflow/tfjs-converter": "3.21.0",
+-        "@tensorflow/tfjs-core": "3.21.0",
+-        "@tensorflow/tfjs-data": "3.21.0",
+-        "@tensorflow/tfjs-layers": "3.21.0",
++        "@tensorflow/tfjs-backend-cpu": "4.22.0",
++        "@tensorflow/tfjs-backend-webgl": "4.22.0",
++        "@tensorflow/tfjs-converter": "4.22.0",
++        "@tensorflow/tfjs-core": "4.22.0",
++        "@tensorflow/tfjs-data": "4.22.0",
++        "@tensorflow/tfjs-layers": "4.22.0",
+         "argparse": "^1.0.10",
+         "chalk": "^4.1.0",
+-        "core-js": "3",
++        "core-js": "3.29.1",
+         "regenerator-runtime": "^0.13.5",
+         "yargs": "^16.0.3"
+       },
+@@ -1378,9 +1378,9 @@
+       }
+     },
+     "node_modules/@tensorflow/tfjs-backend-cpu": {
+-      "version": "3.21.0",
+-      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-backend-cpu/-/tfjs-backend-cpu-3.21.0.tgz",
+-      "integrity": "sha512-88S21UAdzyK0CsLUrH17GPTD+26E85OP9CqmLZslaWjWUmBkeTQ5Zqyp6iK+gELnLxPx6q7JsNEeFuPv4254lQ==",
++      "version": "4.22.0",
++      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-backend-cpu/-/tfjs-backend-cpu-4.22.0.tgz",
++      "integrity": "sha512-1u0FmuLGuRAi8D2c3cocHTASGXOmHc/4OvoVDENJayjYkS119fcTcQf4iHrtLthWyDIPy3JiPhRrZQC9EwnhLw==",
+       "license": "Apache-2.0",
+       "dependencies": {
+         "@types/seedrandom": "^2.4.28",
+@@ -1390,49 +1390,46 @@
+         "yarn": ">= 1.3.2"
+       },
+       "peerDependencies": {
+-        "@tensorflow/tfjs-core": "3.21.0"
++        "@tensorflow/tfjs-core": "4.22.0"
+       }
+     },
+     "node_modules/@tensorflow/tfjs-backend-webgl": {
+-      "version": "3.21.0",
+-      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-backend-webgl/-/tfjs-backend-webgl-3.21.0.tgz",
+-      "integrity": "sha512-N4zitIAT9IX8B8oe489qM3f3VcESxGZIZvHmVP8varOQakTvTX859aaPo1s8hK1qCy4BjSGbweooZe4U8D4kTQ==",
++      "version": "4.22.0",
++      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-backend-webgl/-/tfjs-backend-webgl-4.22.0.tgz",
++      "integrity": "sha512-H535XtZWnWgNwSzv538czjVlbJebDl5QTMOth4RXr2p/kJ1qSIXE0vZvEtO+5EC9b00SvhplECny2yDewQb/Yg==",
+       "license": "Apache-2.0",
+       "dependencies": {
+-        "@tensorflow/tfjs-backend-cpu": "3.21.0",
++        "@tensorflow/tfjs-backend-cpu": "4.22.0",
+         "@types/offscreencanvas": "~2019.3.0",
+         "@types/seedrandom": "^2.4.28",
+-        "@types/webgl-ext": "0.0.30",
+-        "@types/webgl2": "0.0.6",
+         "seedrandom": "^3.0.5"
+       },
+       "engines": {
+         "yarn": ">= 1.3.2"
+       },
+       "peerDependencies": {
+-        "@tensorflow/tfjs-core": "3.21.0"
++        "@tensorflow/tfjs-core": "4.22.0"
+       }
+     },
+     "node_modules/@tensorflow/tfjs-converter": {
+-      "version": "3.21.0",
+-      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-converter/-/tfjs-converter-3.21.0.tgz",
+-      "integrity": "sha512-12Y4zVDq3yW+wSjSDpSv4HnpL2sDZrNiGSg8XNiDE4HQBdjdA+a+Q3sZF/8NV9y2yoBhL5L7V4mMLDdbZBd9/Q==",
++      "version": "4.22.0",
++      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-converter/-/tfjs-converter-4.22.0.tgz",
++      "integrity": "sha512-PT43MGlnzIo+YfbsjM79Lxk9lOq6uUwZuCc8rrp0hfpLjF6Jv8jS84u2jFb+WpUeuF4K33ZDNx8CjiYrGQ2trQ==",
+       "license": "Apache-2.0",
+       "peerDependencies": {
+-        "@tensorflow/tfjs-core": "3.21.0"
++        "@tensorflow/tfjs-core": "4.22.0"
+       }
+     },
+     "node_modules/@tensorflow/tfjs-core": {
+-      "version": "3.21.0",
+-      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-core/-/tfjs-core-3.21.0.tgz",
+-      "integrity": "sha512-YSfsswOqWfd+M4bXIhT3hwtAb+IV8+ODwIxwdFR/7jTAPZP1wMVnSlpKnXHAN64HFOiP+Tm3HmKusEZ0+09A0w==",
++      "version": "4.22.0",
++      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-core/-/tfjs-core-4.22.0.tgz",
++      "integrity": "sha512-LEkOyzbknKFoWUwfkr59vSB68DMJ4cjwwHgicXN0DUi3a0Vh1Er3JQqCI1Hl86GGZQvY8ezVrtDIvqR1ZFW55A==",
+       "license": "Apache-2.0",
+       "dependencies": {
+         "@types/long": "^4.0.1",
+-        "@types/offscreencanvas": "~2019.3.0",
++        "@types/offscreencanvas": "~2019.7.0",
+         "@types/seedrandom": "^2.4.28",
+-        "@types/webgl-ext": "0.0.30",
+-        "@webgpu/types": "0.1.16",
++        "@webgpu/types": "0.1.38",
+         "long": "4.0.0",
+         "node-fetch": "~2.6.1",
+         "seedrandom": "^3.0.5"
+@@ -1441,10 +1438,16 @@
+         "yarn": ">= 1.3.2"
+       }
+     },
++    "node_modules/@tensorflow/tfjs-core/node_modules/@types/offscreencanvas": {
++      "version": "2019.7.3",
++      "resolved": "https://registry.npmjs.org/@types/offscreencanvas/-/offscreencanvas-2019.7.3.tgz",
++      "integrity": "sha512-ieXiYmgSRXUDeOntE1InxjWyvEelZGP63M+cGuquuRLuIKKT1osnkXjxev9B7d1nXSug5vpunx+gNlbVxMlC9A==",
++      "license": "MIT"
++    },
+     "node_modules/@tensorflow/tfjs-data": {
+-      "version": "3.21.0",
+-      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-data/-/tfjs-data-3.21.0.tgz",
+-      "integrity": "sha512-eFLfw2wIcFNxnP2Iv/SnVlihehzKMumk1b5Prcx1ixk/SbkCo5u0Lt7OVOWaEOKVqvB2sT+dJcTjAh6lrCC/QA==",
++      "version": "4.22.0",
++      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-data/-/tfjs-data-4.22.0.tgz",
++      "integrity": "sha512-dYmF3LihQIGvtgJrt382hSRH4S0QuAp2w1hXJI2+kOaEqo5HnUPG0k5KA6va+S1yUhx7UBToUKCBHeLHFQRV4w==",
+       "license": "Apache-2.0",
+       "dependencies": {
+         "@types/node-fetch": "^2.1.2",
+@@ -1452,17 +1455,17 @@
+         "string_decoder": "^1.3.0"
+       },
+       "peerDependencies": {
+-        "@tensorflow/tfjs-core": "3.21.0",
++        "@tensorflow/tfjs-core": "4.22.0",
+         "seedrandom": "^3.0.5"
+       }
+     },
+     "node_modules/@tensorflow/tfjs-layers": {
+-      "version": "3.21.0",
+-      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-layers/-/tfjs-layers-3.21.0.tgz",
+-      "integrity": "sha512-CMVXsraakXgnXEnqD9QbtResA7nvV7Jz20pGmjFIodcQkClgmFFhdCG5N+zlVRHEz7VKG2OyfhltZ0dBq/OAhA==",
++      "version": "4.22.0",
++      "resolved": "https://registry.npmjs.org/@tensorflow/tfjs-layers/-/tfjs-layers-4.22.0.tgz",
++      "integrity": "sha512-lybPj4ZNj9iIAPUj7a8ZW1hg8KQGfqWLlCZDi9eM/oNKCCAgchiyzx8OrYoWmRrB+AM6VNEeIT+2gZKg5ReihA==",
+       "license": "Apache-2.0 AND MIT",
+       "peerDependencies": {
+-        "@tensorflow/tfjs-core": "3.21.0"
++        "@tensorflow/tfjs-core": "4.22.0"
+       }
+     },
+     "node_modules/@types/chai": {
+@@ -1527,18 +1530,6 @@
+       "integrity": "sha512-ytDiArvrn/3Xk6/vtylys5tlY6eo7Ane0hvcx++TKo6RxQXuVfW0AF/oeWqAj9dN29SyhtawuXstgmPlwNcv/A==",
+       "license": "MIT"
+     },
+-    "node_modules/@types/webgl-ext": {
+-      "version": "0.0.30",
+-      "resolved": "https://registry.npmjs.org/@types/webgl-ext/-/webgl-ext-0.0.30.tgz",
+-      "integrity": "sha512-LKVgNmBxN0BbljJrVUwkxwRYqzsAEPcZOe6S2T6ZaBDIrFp0qu4FNlpc5sM1tGbXUYFgdVQIoeLk1Y1UoblyEg==",
+-      "license": "MIT"
+-    },
+-    "node_modules/@types/webgl2": {
+-      "version": "0.0.6",
+-      "resolved": "https://registry.npmjs.org/@types/webgl2/-/webgl2-0.0.6.tgz",
+-      "integrity": "sha512-50GQhDVTq/herLMiqSQkdtRu+d5q/cWHn4VvKJtrj4DJAjo1MNkWYa2MA41BaBO1q1HgsUjuQvEOk0QHvlnAaQ==",
+-      "license": "MIT"
+-    },
+     "node_modules/@vitejs/plugin-vue": {
+       "version": "5.2.4",
+       "resolved": "https://registry.npmjs.org/@vitejs/plugin-vue/-/plugin-vue-5.2.4.tgz",
+@@ -1850,9 +1841,9 @@
+       "license": "MIT"
+     },
+     "node_modules/@webgpu/types": {
+-      "version": "0.1.16",
+-      "resolved": "https://registry.npmjs.org/@webgpu/types/-/types-0.1.16.tgz",
+-      "integrity": "sha512-9E61voMP4+Rze02jlTXud++Htpjyyk8vw5Hyw9FGRrmhHQg2GqbuOfwf5Klrb8vTxc2XWI3EfO7RUHMpxTj26A==",
++      "version": "0.1.38",
++      "resolved": "https://registry.npmjs.org/@webgpu/types/-/types-0.1.38.tgz",
++      "integrity": "sha512-7LrhVKz2PRh+DD7+S+PVaFd5HxaWQvoMqBbsV9fNJO1pjUs1P8bM2vQVNfk+3URTqbuTI7gkXi0rfsN0IadoBA==",
+       "license": "BSD-3-Clause"
+     },
+     "node_modules/ansi-regex": {
+@@ -2066,9 +2057,9 @@
+       "license": "MIT"
+     },
+     "node_modules/core-js": {
+-      "version": "3.46.0",
+-      "resolved": "https://registry.npmjs.org/core-js/-/core-js-3.46.0.tgz",
+-      "integrity": "sha512-vDMm9B0xnqqZ8uSBpZ8sNtRtOdmfShrvT6h2TuQGLs0Is+cR0DYbj/KWP6ALVNbWPpqA/qPLoOuppJN07humpA==",
++      "version": "3.29.1",
++      "resolved": "https://registry.npmjs.org/core-js/-/core-js-3.29.1.tgz",
++      "integrity": "sha512-+jwgnhg6cQxKYIIjGtAHq2nwUOolo9eoFZ4sHfUH09BLXBgxnH4gA0zEd+t+BO2cNB8idaBtZFcFTRjQJRJmAw==",
+       "hasInstallScript": true,
+       "license": "MIT",
+       "funding": {
+@@ -2584,9 +2575,9 @@
+       "license": "MIT"
+     },
+     "node_modules/es-object-atoms": {
+-      "version": "1.1.1",
+-      "resolved": "https://registry.npmjs.org/es-object-atoms/-/es-object-atoms-1.1.1.tgz",
+-      "integrity": "sha512-FGgH2h8zKNim9ljj7dankFPcICIK9Cp5bm+c2gQSYePhpaG5+esrLODihIorn+Pe6FGJzWhXQotPv73jTaldXA==",
++      "version": "1.1.2",
++      "resolved": "https://registry.npmjs.org/es-object-atoms/-/es-object-atoms-1.1.2.tgz",
++      "integrity": "sha512-HWcBoN6NileqtSydK2FqHbS/LoDd2pqrnQHLyJzBj4kOp/ky2MWMN694xOfkK8/SnUsW2DH7EfyVlydKCsm1Zw==",
+       "license": "MIT",
+       "dependencies": {
+         "es-errors": "^1.3.0"
+@@ -2702,16 +2693,16 @@
+       "license": "MIT"
+     },
+     "node_modules/form-data": {
+-      "version": "4.0.4",
+-      "resolved": "https://registry.npmjs.org/form-data/-/form-data-4.0.4.tgz",
+-      "integrity": "sha512-KrGhL9Q4zjj0kiUt5OO4Mr/A/jlI2jDYs5eHBpYHPcBEVSiipAvn2Ko2HnPe20rmcuuvMHNdZFp+4IlGTMF0Ow==",
++      "version": "4.0.6",
++      "resolved": "https://registry.npmjs.org/form-data/-/form-data-4.0.6.tgz",
++      "integrity": "sha512-vKatAh4SlVfgbv+YtmhiRjhEMJsYpsG1Y2rMQtR+SVSbytsSD1YGzDIcrAJmdFec88u/+VoGmxnl+80gL1tRCQ==",
+       "license": "MIT",
+       "dependencies": {
+         "asynckit": "^0.4.0",
+         "combined-stream": "^1.0.8",
+         "es-set-tostringtag": "^2.1.0",
+-        "hasown": "^2.0.2",
+-        "mime-types": "^2.1.12"
++        "hasown": "^2.0.4",
++        "mime-types": "^2.1.35"
+       },
+       "engines": {
+         "node": ">= 6"
+@@ -2846,9 +2837,9 @@
+       }
+     },
+     "node_modules/hasown": {
+-      "version": "2.0.2",
+-      "resolved": "https://registry.npmjs.org/hasown/-/hasown-2.0.2.tgz",
+-      "integrity": "sha512-0hJU9SCPvmMzIBdZFqNPXWa6dqh7WdH0cII9y+CyS8rG3nL48Bclra9HmKhVVUHyPWNH5Y7xDwAB7bfgSjkUMQ==",
++      "version": "2.0.4",
++      "resolved": "https://registry.npmjs.org/hasown/-/hasown-2.0.4.tgz",
++      "integrity": "sha512-T2UbfbBEF32wiepXIsMlTW9+dDYC6wMh/t/vYA4tuOMKqWz/n3vr1NFSxQiyP+zk2mXsoMA/i/7qV6LKut1t1A==",
+       "license": "MIT",
+       "dependencies": {
+         "function-bind": "^1.1.2"
+diff --git a/nnvp-client-vue/package.json b/nnvp-client-vue/package.json
+index f40003f..e6ad6af 100644
+--- a/nnvp-client-vue/package.json
++++ b/nnvp-client-vue/package.json
+@@ -18,7 +18,7 @@
+     "lint:fix": "oxlint src tests --fix"
+   },
+   "dependencies": {
+-    "@tensorflow/tfjs": "^3.3.0",
++    "@tensorflow/tfjs": "^4.22.0",
+     "d3": "^7.9.0",
+     "file-saver": "^2.0.5",
+     "vue": "^3.5.13"
+diff --git a/nnvp-client-vue/src/App.vue b/nnvp-client-vue/src/App.vue
+index 5862baa..0fc56b0 100644
+--- a/nnvp-client-vue/src/App.vue
++++ b/nnvp-client-vue/src/App.vue
+@@ -2,13 +2,15 @@
+   <div id="canvas-background" class="canvas-background">
+     <WhiteBoard :isTraining="isTraining"/>
+   </div>
+-  <div id="generalMenu" class="floating-panel general-menu"><GeneralMenu @open-trainer="openTrainer" @open-about="openAboutModal"/></div>
++  <div id="generalMenu" class="floating-panel general-menu"><GeneralMenu @open-trainer="openTrainer" @open-about="openAboutModal" @open-tutorial="startTutorial"/></div>
+   <div id="layerCatalog" class="floating-panel layer-catalog"><LayerCatalog/></div>
+   <div id="layerOptions" class="floating-panel layer-options"><LayerOptions msg="NNVP"/></div>
+   <div id="trainingZone" class="floating-panel training-zone" v-if="trainerHeight > 0" v-bind:style="{height: trainerHeight+'vh'}">
+     <TrainingZone @close-trainer="closeTrainer" :trainingZoneSize="trainerHeight" @training-started="isTraining = true" @training-stopped="isTraining = false"/>
+   </div>
+   <AboutModal :show="showAboutModal" @close="closeAboutModal"/>
++  <ChatBubble/>
++  <TutorialOverlay :active="tutorialActive" @exit="stopTutorial"/>
+ </template>
+ 
+ 
+@@ -19,6 +21,8 @@ import LayerOptions from './components/LayerOptions/LayerOptions.vue';
+ import WhiteBoard from './components/WhiteBoard.vue';
+ import TrainingZone from './components/TrainingZone/TrainingZone.vue';
+ import AboutModal from './components/AboutModal.vue';
++import ChatBubble from './components/Assistant/ChatBubble.vue';
++import TutorialOverlay from './components/Tutorial/TutorialOverlay.vue';
+ 
+ export default {
+   name: 'app',
+@@ -29,8 +33,16 @@ export default {
+     WhiteBoard,
+     TrainingZone,
+     AboutModal,
++    ChatBubble,
++    TutorialOverlay,
+   },
+   methods: {
++    startTutorial() {
++      this.tutorialActive = true;
++    },
++    stopTutorial() {
++      this.tutorialActive = false;
++    },
+     openTrainer() {
+       this.trainerOpenHeight = this.trainerOpenHeight > 25 ? this.trainerOpenHeight : 25;
+       this.trainerHeight = this.trainerOpenHeight;
+@@ -51,6 +63,7 @@ export default {
+       trainerOpenHeight: 50,
+       showAboutModal: false,
+       isTraining: false,
++      tutorialActive: false,
+     };
+   },
+   mounted() {
+diff --git a/nnvp-client-vue/src/components/Assistant/ChatBubble.vue b/nnvp-client-vue/src/components/Assistant/ChatBubble.vue
+new file mode 100644
+index 0000000..39f1f40
+--- /dev/null
++++ b/nnvp-client-vue/src/components/Assistant/ChatBubble.vue
+@@ -0,0 +1,370 @@
++<template>
++  <div class="chat-assistant">
++    <!-- Chat panel -->
++    <Transition name="chat-panel">
++      <div v-if="open" class="chat-panel floating-panel">
++        <div class="chat-header">
++          <div class="chat-title">Assistant</div>
++          <div class="chat-header-actions">
++            <button class="chat-icon-btn" aria-label="Settings" @click="toggleSettings">⚙</button>
++            <button class="chat-icon-btn" aria-label="Close" @click="open = false">×</button>
++          </div>
++        </div>
++
++        <!-- Settings popover -->
++        <div v-if="settingsOpen" class="chat-settings">
++          <label class="chat-field">
++            <span>Anthropic API key</span>
++            <input
++              type="password"
++              v-model="apiKey"
++              placeholder="sk-ant-..."
++              autocomplete="off"
++            >
++          </label>
++          <label class="chat-field">
++            <span>Model</span>
++            <input type="text" v-model="model" :placeholder="defaultModel">
++          </label>
++          <label class="chat-field">
++            <span>Base URL (optional proxy)</span>
++            <input type="text" v-model="baseUrl" :placeholder="defaultBaseUrl">
++          </label>
++          <div class="chat-settings-actions">
++            <button class="chat-btn" @click="saveSettings">Save</button>
++          </div>
++        </div>
++
++        <div class="chat-messages" ref="messagesEl">
++          <div v-if="!hasKey" class="chat-empty">
++            Add your Anthropic API key in settings (⚙) to start chatting.
++          </div>
++          <div v-else-if="messages.length === 0" class="chat-empty">
++            Ask me to inspect or build your Keras model.
++          </div>
++          <div
++            v-for="(message, index) in messages"
++            :key="index"
++            :class="['chat-message', 'chat-' + message.role]"
++          >
++            <div v-if="message.role === 'tool'" class="chat-tool">
++              <span class="chat-tool-name">{{ message.text }}</span>
++            </div>
++            <div v-else class="chat-bubble-text">{{ message.text }}</div>
++          </div>
++          <div v-if="sending" class="chat-message chat-assistant-msg">
++            <div class="chat-bubble-text chat-typing">…</div>
++          </div>
++        </div>
++
++        <form class="chat-input-row" @submit.prevent="send">
++          <input
++            v-model="draft"
++            class="chat-input"
++            placeholder="Message the assistant"
++            :disabled="sending || !hasKey"
++          >
++          <button
++            type="submit"
++            class="chat-send"
++            :disabled="sending || !hasKey || draft.trim() === ''"
++          >
++            Send
++          </button>
++        </form>
++      </div>
++    </Transition>
++
++    <!-- Bubble toggle -->
++    <button class="chat-fab" aria-label="Toggle assistant" @click="open = !open">
++      <span v-if="!open">💬</span>
++      <span v-else>×</span>
++    </button>
++  </div>
++</template>
++
++<script>
++import AssistantActions from '../../lib/Assistant/assistantActions';
++import AnthropicClient, {
++  STORAGE_KEY,
++  STORAGE_BASE_URL,
++  STORAGE_MODEL,
++  DEFAULT_MODEL,
++  DEFAULT_BASE_URL,
++} from '../../lib/Assistant/anthropicClient';
++
++export default {
++  name: 'ChatBubble',
++  data() {
++    return {
++      open: false,
++      settingsOpen: false,
++      draft: '',
++      sending: false,
++      messages: [],
++      history: [],
++      apiKey: '',
++      model: '',
++      baseUrl: '',
++      defaultModel: DEFAULT_MODEL,
++      defaultBaseUrl: DEFAULT_BASE_URL,
++      hasKey: false,
++    };
++  },
++  created() {
++    if (typeof localStorage !== 'undefined') {
++      this.apiKey = localStorage.getItem(STORAGE_KEY) || '';
++      this.model = localStorage.getItem(STORAGE_MODEL) || '';
++      this.baseUrl = localStorage.getItem(STORAGE_BASE_URL) || '';
++    }
++    this.hasKey = Boolean(this.apiKey);
++    this.actions = new AssistantActions(this.$d3Interface, this.$kerasInterface);
++    this.client = new AnthropicClient(this.actions);
++  },
++  methods: {
++    toggleSettings() {
++      this.settingsOpen = !this.settingsOpen;
++    },
++    saveSettings() {
++      if (typeof localStorage !== 'undefined') {
++        if (this.apiKey) localStorage.setItem(STORAGE_KEY, this.apiKey);
++        else localStorage.removeItem(STORAGE_KEY);
++        if (this.model) localStorage.setItem(STORAGE_MODEL, this.model);
++        else localStorage.removeItem(STORAGE_MODEL);
++        if (this.baseUrl) localStorage.setItem(STORAGE_BASE_URL, this.baseUrl);
++        else localStorage.removeItem(STORAGE_BASE_URL);
++      }
++      this.hasKey = Boolean(this.apiKey);
++      this.settingsOpen = false;
++    },
++    scrollToBottom() {
++      this.$nextTick(() => {
++        const el = this.$refs.messagesEl;
++        if (el) el.scrollTop = el.scrollHeight;
++      });
++    },
++    pushMessage(role, text) {
++      this.messages.push({ role, text });
++      this.scrollToBottom();
++    },
++    async send() {
++      const text = this.draft.trim();
++      if (text === '' || this.sending || !this.hasKey) return;
++      this.draft = '';
++      this.pushMessage('user', text);
++      this.history.push({ role: 'user', content: text });
++      this.sending = true;
++      try {
++        const onActivity = (event) => {
++          if (event.type === 'tool_use') {
++            this.pushMessage('tool', `⚙ ${event.name}`);
++          }
++        };
++        const reply = await this.client.send(this.history, onActivity);
++        if (reply) this.pushMessage('assistant', reply);
++      } catch (error) {
++        this.pushMessage('assistant', `Error: ${error.message || error}`);
++      } finally {
++        this.sending = false;
++        this.scrollToBottom();
++      }
++    },
++  },
++};
++</script>
++
++<style scoped>
++.chat-assistant {
++  position: absolute;
++  right: var(--panel-margin);
++  bottom: var(--panel-margin);
++  z-index: 200;
++  font-family: var(--font-regular);
++  font-weight: var(--font-weight-regular);
++}
++
++.chat-fab {
++  position: absolute;
++  right: 0;
++  bottom: 0;
++  width: 52px;
++  height: 52px;
++  border-radius: 50%;
++  border: var(--border-width) solid var(--panel-border);
++  background-color: var(--bg-panel);
++  box-shadow: var(--panel-shadow);
++  font-size: 22px;
++  line-height: 1;
++  cursor: pointer;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  transition: transform 0.15s ease;
++}
++
++.chat-fab:hover {
++  transform: translateY(-1px);
++}
++
++.chat-panel {
++  position: absolute;
++  right: 0;
++  bottom: 64px;
++  width: 340px;
++  height: 460px;
++  max-height: 70vh;
++  display: flex;
++  flex-direction: column;
++  overflow: visible;
++}
++
++.chat-header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  padding: 10px 14px;
++  border-bottom: 1px solid var(--panel-border);
++  font-weight: var(--font-weight-semibold);
++}
++
++.chat-title {
++  font-weight: var(--font-weight-semibold);
++}
++
++.chat-header-actions {
++  display: flex;
++  gap: 4px;
++}
++
++.chat-icon-btn {
++  border: none;
++  background: transparent;
++  font-size: 16px;
++  line-height: 1;
++  cursor: pointer;
++  padding: 4px 6px;
++  border-radius: 4px;
++}
++
++.chat-icon-btn:hover {
++  background-color: #f0f0f0;
++}
++
++.chat-settings {
++  padding: 12px 14px;
++  border-bottom: 1px solid var(--panel-border);
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++  background-color: #fafafa;
++}
++
++.chat-field {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  font-size: 12px;
++}
++
++.chat-field input {
++  font-size: 13px;
++}
++
++.chat-settings-actions {
++  display: flex;
++  justify-content: flex-end;
++}
++
++.chat-btn {
++  cursor: pointer;
++}
++
++.chat-messages {
++  flex: 1;
++  overflow-y: auto;
++  padding: 12px 14px;
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++}
++
++.chat-empty {
++  color: #666666;
++  font-size: 13px;
++  text-align: center;
++  margin: auto 0;
++}
++
++.chat-message {
++  display: flex;
++}
++
++.chat-user {
++  justify-content: flex-end;
++}
++
++.chat-bubble-text {
++  max-width: 85%;
++  padding: 8px 10px;
++  border-radius: 12px;
++  font-size: 13px;
++  white-space: pre-wrap;
++  word-break: break-word;
++}
++
++.chat-user .chat-bubble-text {
++  background-color: #000000;
++  color: #ffffff;
++}
++
++.chat-assistant .chat-bubble-text,
++.chat-assistant-msg .chat-bubble-text {
++  background-color: #f0f0f0;
++  color: #000000;
++}
++
++.chat-tool {
++  font-size: 11px;
++  color: #666666;
++}
++
++.chat-tool-name {
++  font-family: monospace;
++}
++
++.chat-typing {
++  letter-spacing: 2px;
++}
++
++.chat-input-row {
++  display: flex;
++  gap: 6px;
++  padding: 10px 12px;
++  border-top: 1px solid var(--panel-border);
++}
++
++.chat-input {
++  flex: 1;
++  font-size: 13px;
++}
++
++.chat-send {
++  cursor: pointer;
++}
++
++.chat-send:disabled {
++  opacity: 0.5;
++  cursor: default;
++}
++
++.chat-panel-enter-active,
++.chat-panel-leave-active {
++  transition: opacity 0.15s ease, transform 0.15s ease;
++}
++
++.chat-panel-enter-from,
++.chat-panel-leave-to {
++  opacity: 0;
++  transform: translateY(8px);
++}
++</style>
+diff --git a/nnvp-client-vue/src/components/GeneralMenu.vue b/nnvp-client-vue/src/components/GeneralMenu.vue
+index ba91b81..7c15e51 100644
+--- a/nnvp-client-vue/src/components/GeneralMenu.vue
++++ b/nnvp-client-vue/src/components/GeneralMenu.vue
+@@ -58,6 +58,9 @@ export default {
+           Generate_Javascript() {
+             this.$d3Interface.generateJavascriptInBrowser(this.$kerasInterface);
+           },
++          Generate_PyTorch() {
++            this.$d3Interface.generatePyTorchInBrowser(this.$kerasInterface);
++          },
+         },
+         Edit: {
+           Undo: [() => this.$d3Interface.undo(), () => (this.$d3Interface.getUndoStackContainer().e.length === 0)],
+@@ -65,6 +68,7 @@ export default {
+           Group() { this.$d3Interface.createGroup(); },
+         },
+         Training: () => { this.$emit('open-trainer'); },
++        Tutorial: () => { this.$emit('open-tutorial'); },
+         About: () => { this.$emit('open-about'); },
+       },
+       activatedState: false,
+diff --git a/nnvp-client-vue/src/components/Tutorial/TutorialOverlay.vue b/nnvp-client-vue/src/components/Tutorial/TutorialOverlay.vue
+new file mode 100644
+index 0000000..f324261
+--- /dev/null
++++ b/nnvp-client-vue/src/components/Tutorial/TutorialOverlay.vue
+@@ -0,0 +1,289 @@
++<template>
++  <div v-if="active" class="tutorial-overlay">
++    <!-- Coachmark ring highlighting the current step's target element -->
++    <div
++      v-if="highlight"
++      class="tutorial-highlight"
++      :style="{
++        top: highlight.top + 'px',
++        left: highlight.left + 'px',
++        width: highlight.width + 'px',
++        height: highlight.height + 'px',
++      }"
++    ></div>
++
++    <!-- Floating instruction card, bottom-center -->
++    <div class="tutorial-card" role="dialog" aria-label="Tutorial step">
++      <div class="tutorial-card-header">
++        <span class="tutorial-progress">Step {{ currentStep + 1 }} / {{ totalSteps }}</span>
++        <button class="tutorial-exit" type="button" @click="exit">Exit</button>
++      </div>
++      <h3 class="tutorial-title">{{ step.title }}</h3>
++      <p class="tutorial-instruction">{{ step.instruction }}</p>
++      <div class="tutorial-card-footer">
++        <button
++          class="tutorial-btn"
++          type="button"
++          :disabled="currentStep === 0"
++          @click="back"
++        >Back</button>
++        <span v-if="stepComplete" class="tutorial-done">✓ Done</span>
++        <button
++          v-if="currentStep < totalSteps - 1"
++          class="tutorial-btn tutorial-btn-primary"
++          type="button"
++          @click="next"
++        >Next</button>
++        <button
++          v-else
++          class="tutorial-btn tutorial-btn-primary"
++          type="button"
++          @click="exit"
++        >Finish</button>
++      </div>
++    </div>
++  </div>
++</template>
++
++<script>
++import { steps, totalSteps } from '../../lib/Tutorial/mnistTutorial';
++
++export default {
++  name: 'TutorialOverlay',
++  props: {
++    active: {
++      type: Boolean,
++      default: false,
++    },
++  },
++  data() {
++    return {
++      steps,
++      totalSteps,
++      currentStep: 0,
++      stepComplete: false,
++      highlight: null,
++    };
++  },
++  computed: {
++    step() {
++      return this.steps[this.currentStep];
++    },
++  },
++  watch: {
++    active(isActive) {
++      if (isActive) {
++        this.startTutorial();
++      } else {
++        this.teardown();
++      }
++    },
++    currentStep() {
++      this.refreshState();
++    },
++  },
++  mounted() {
++    // Bound handlers reused for subscribe/unsubscribe.
++    this.stateChangeHandler = () => this.checkCompletion();
++    this.reposition = () => this.updateHighlight();
++    if (this.active) this.startTutorial();
++  },
++  beforeUnmount() {
++    this.teardown();
++  },
++  methods: {
++    startTutorial() {
++      this.currentStep = 0;
++      this.stepComplete = false;
++      this.$d3Interface.on('graph-changed', this.stateChangeHandler);
++      this.$d3Interface.on('selection-changed', this.stateChangeHandler);
++      window.addEventListener('resize', this.reposition);
++      window.addEventListener('scroll', this.reposition, true);
++      // Poll as a backup: some state changes (e.g. editing a parameter value)
++      // do not necessarily emit graph-changed.
++      this.pollTimer = setInterval(() => this.checkCompletion(), 500);
++      this.$nextTick(() => this.refreshState());
++    },
++    teardown() {
++      this.$d3Interface.off('graph-changed', this.stateChangeHandler);
++      this.$d3Interface.off('selection-changed', this.stateChangeHandler);
++      window.removeEventListener('resize', this.reposition);
++      window.removeEventListener('scroll', this.reposition, true);
++      if (this.pollTimer) {
++        clearInterval(this.pollTimer);
++        this.pollTimer = null;
++      }
++      this.highlight = null;
++    },
++    refreshState() {
++      this.updateHighlight();
++      this.checkCompletion();
++    },
++    checkCompletion() {
++      if (!this.active) return;
++      let complete = false;
++      try {
++        complete = this.step.isComplete(this.$d3Interface);
++      } catch {
++        complete = false;
++      }
++      this.stepComplete = complete;
++      // Auto-advance when the current step becomes complete.
++      if (complete && this.currentStep < this.totalSteps - 1) {
++        this.currentStep += 1;
++      }
++    },
++    resolveTarget() {
++      const { target } = this.step;
++      if (!target) return null;
++      if (typeof target === 'function') return target(document);
++      return document.querySelector(target);
++    },
++    updateHighlight() {
++      const element = this.resolveTarget();
++      if (!element || typeof element.getBoundingClientRect !== 'function') {
++        this.highlight = null;
++        return;
++      }
++      const rect = element.getBoundingClientRect();
++      const pad = 6;
++      this.highlight = {
++        top: rect.top - pad,
++        left: rect.left - pad,
++        width: rect.width + pad * 2,
++        height: rect.height + pad * 2,
++      };
++    },
++    next() {
++      if (this.currentStep < this.totalSteps - 1) {
++        this.currentStep += 1;
++      } else {
++        this.exit();
++      }
++    },
++    back() {
++      if (this.currentStep > 0) {
++        this.currentStep -= 1;
++      }
++    },
++    exit() {
++      this.$emit('exit');
++    },
++  },
++};
++</script>
++
++<style scoped>
++.tutorial-overlay {
++  position: fixed;
++  inset: 0;
++  z-index: 2000;
++  pointer-events: none; /* let the user interact with the editor underneath */
++}
++
++/* Coachmark ring around the current target element */
++.tutorial-highlight {
++  position: fixed;
++  border: 2px solid #2563eb;
++  border-radius: 10px;
++  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.25), 0 0 0 9999px rgba(0, 0, 0, 0.04);
++  transition: all 0.2s ease;
++  pointer-events: none;
++}
++
++.tutorial-card {
++  position: fixed;
++  bottom: 24px;
++  left: 50%;
++  transform: translateX(-50%);
++  width: min(440px, calc(100vw - 48px));
++  background-color: var(--bg-panel);
++  border: var(--border-width) solid var(--panel-border);
++  border-radius: var(--border-radius);
++  box-shadow: var(--panel-shadow);
++  padding: 16px 18px;
++  box-sizing: border-box;
++  font-family: var(--font-regular);
++  color: #000000;
++  pointer-events: auto; /* the card itself is interactive */
++}
++
++.tutorial-card-header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  margin-bottom: 8px;
++}
++
++.tutorial-progress {
++  font-weight: var(--font-weight-semibold);
++  font-size: 13px;
++  color: #2563eb;
++}
++
++.tutorial-exit {
++  background: transparent;
++  border: none;
++  color: #6b7280;
++  font-size: 13px;
++  cursor: pointer;
++  padding: 2px 6px;
++}
++
++.tutorial-exit:hover {
++  color: #000000;
++}
++
++.tutorial-title {
++  margin: 0 0 6px 0;
++  font-size: 16px;
++  font-weight: var(--font-weight-semibold);
++}
++
++.tutorial-instruction {
++  margin: 0 0 14px 0;
++  font-size: 14px;
++  line-height: 1.45;
++  color: #374151;
++}
++
++.tutorial-card-footer {
++  display: flex;
++  align-items: center;
++  justify-content: flex-end;
++  gap: 10px;
++}
++
++.tutorial-done {
++  margin-right: auto;
++  font-size: 13px;
++  font-weight: var(--font-weight-medium);
++  color: #16a34a;
++}
++
++.tutorial-btn {
++  font-family: var(--font-regular);
++  font-size: 14px;
++  padding: 6px 14px;
++  border: 1px solid #cccccc;
++  border-radius: 8px;
++  background-color: #ffffff;
++  cursor: pointer;
++  transition: transform 0.15s ease;
++}
++
++.tutorial-btn:hover:not(:disabled) {
++  transform: translate(1px, -1px);
++}
++
++.tutorial-btn:disabled {
++  opacity: 0.5;
++  cursor: default;
++}
++
++.tutorial-btn-primary {
++  background-color: #2563eb;
++  border-color: #2563eb;
++  color: #ffffff;
++}
++</style>
+diff --git a/nnvp-client-vue/src/lib/Assistant/anthropicClient.js b/nnvp-client-vue/src/lib/Assistant/anthropicClient.js
+new file mode 100644
+index 0000000..ac407cd
+--- /dev/null
++++ b/nnvp-client-vue/src/lib/Assistant/anthropicClient.js
+@@ -0,0 +1,234 @@
++// Browser-side Anthropic Messages API client with a tool-use loop.
++//
++// A static NNVP SPA can't hide a key, so this is bring-your-own-key: the API key
++// (and an optional custom base URL) live in localStorage and are read at call
++// time. Each AssistantActions method is exposed as a tool; the loop sends the
++// conversation, executes any tool_use blocks against the actions, feeds back
++// tool_result blocks, and repeats until the model returns a final text answer.
++
++export const STORAGE_KEY = 'nnvp_anthropic_key';
++export const STORAGE_BASE_URL = 'nnvp_anthropic_base_url';
++export const STORAGE_MODEL = 'nnvp_anthropic_model';
++
++export const DEFAULT_MODEL = 'claude-sonnet-5';
++export const DEFAULT_BASE_URL = 'https://api.anthropic.com';
++export const ANTHROPIC_VERSION = '2023-06-01';
++
++export const SYSTEM_PROMPT = [
++  'You are the NNVP assistant, embedded in a visual editor that builds Keras models.',
++  'You can inspect and modify the model graph through the provided tools.',
++  'Prefer calling a tool over guessing. When you add layers or change parameters,',
++  'briefly confirm what you did. Keep answers concise.',
++].join(' ');
++
++// Tool surface: one entry per AssistantActions method the model may call.
++// buildTools() returns the array sent to the API; TOOL_DISPATCH maps each tool
++// name to how it invokes the actions instance.
++export function buildTools() {
++  return [
++    {
++      name: 'list_layer_types',
++      description: 'List every available Keras layer type name that can be added.',
++      input_schema: { type: 'object', properties: {} },
++    },
++    {
++      name: 'add_layer',
++      description: 'Add a new layer of the given type to the model graph.',
++      input_schema: {
++        type: 'object',
++        properties: {
++          type_name: { type: 'string', description: 'A layer type from list_layer_types.' },
++        },
++        required: ['type_name'],
++      },
++    },
++    {
++      name: 'list_layers',
++      description: 'List the current layers with their id, type, name and parameter values.',
++      input_schema: { type: 'object', properties: {} },
++    },
++    {
++      name: 'set_param',
++      description: 'Set a parameter value on a layer, identified by its id.',
++      input_schema: {
++        type: 'object',
++        properties: {
++          layer_id: { description: 'The id of the layer to modify.' },
++          param_name: { type: 'string', description: 'The parameter name.' },
++          value: { description: 'The new parameter value (any JSON value).' },
++        },
++        required: ['layer_id', 'param_name', 'value'],
++      },
++    },
++    {
++      name: 'get_model_summary',
++      description: 'Get counts of layers/inputs/outputs/edges plus a compact layer list.',
++      input_schema: { type: 'object', properties: {} },
++    },
++    {
++      name: 'generate_code',
++      description: 'Generate the Keras model source code and return it as a string.',
++      input_schema: {
++        type: 'object',
++        properties: {
++          lang: { type: 'string', enum: ['python', 'javascript'] },
++        },
++        required: ['lang'],
++      },
++    },
++    {
++      name: 'delete_selected',
++      description: 'Delete the currently selected layers/edges from the graph.',
++      input_schema: { type: 'object', properties: {} },
++    },
++    {
++      name: 'undo',
++      description: 'Undo the last graph change.',
++      input_schema: { type: 'object', properties: {} },
++    },
++    {
++      name: 'redo',
++      description: 'Redo the last undone graph change.',
++      input_schema: { type: 'object', properties: {} },
++    },
++  ];
++}
++
++const TOOL_DISPATCH = {
++  list_layer_types: (actions) => actions.listLayerTypes(),
++  add_layer: (actions, input) => actions.addLayer(input.type_name),
++  list_layers: (actions) => actions.listLayers(),
++  set_param: (actions, input) => actions.setParam(input.layer_id, input.param_name, input.value),
++  get_model_summary: (actions) => actions.getModelSummary(),
++  generate_code: (actions, input) => actions.generateCode(input.lang),
++  delete_selected: (actions) => actions.deleteSelected(),
++  undo: (actions) => actions.undo(),
++  redo: (actions) => actions.redo(),
++};
++
++// Read config from localStorage when available, letting explicit options win.
++export function readStoredConfig(overrides = {}) {
++  let stored = {};
++  if (typeof localStorage !== 'undefined') {
++    stored = {
++      apiKey: localStorage.getItem(STORAGE_KEY) || '',
++      baseUrl: localStorage.getItem(STORAGE_BASE_URL) || '',
++      model: localStorage.getItem(STORAGE_MODEL) || '',
++    };
++  }
++  return {
++    apiKey: overrides.apiKey || stored.apiKey || '',
++    baseUrl: overrides.baseUrl || stored.baseUrl || DEFAULT_BASE_URL,
++    model: overrides.model || stored.model || DEFAULT_MODEL,
++  };
++}
++
++export default class AnthropicClient {
++  constructor(actions, options = {}) {
++    this.actions = actions;
++    this.options = options;
++    // Allow tests to inject a fetch implementation.
++    this.fetchImpl = options.fetch || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : null);
++    this.maxTurns = options.maxTurns || 12;
++  }
++
++  config() {
++    return readStoredConfig(this.options);
++  }
++
++  hasApiKey() {
++    return Boolean(this.config().apiKey);
++  }
++
++  // The tools array sent to the API, one per exposed action.
++  tools() {
++    return buildTools();
++  }
++
++  // Execute a single tool call against the actions, returning the JSON-string
++  // content and an is_error flag for the tool_result block.
++  runTool(name, input) {
++    const handler = TOOL_DISPATCH[name];
++    if (handler === undefined) {
++      return { content: `Unknown tool "${name}".`, isError: true };
++    }
++    try {
++      const result = handler(this.actions, input || {});
++      const content = typeof result === 'string' ? result : JSON.stringify(result);
++      return { content, isError: false };
++    } catch (error) {
++      return { content: error.message || String(error), isError: true };
++    }
++  }
++
++  async postMessages(messages) {
++    const { apiKey, baseUrl, model } = this.config();
++    if (!apiKey) {
++      throw new Error('No Anthropic API key set. Add one in the assistant settings.');
++    }
++    if (!this.fetchImpl) {
++      throw new Error('No fetch implementation available.');
++    }
++    const response = await this.fetchImpl(`${baseUrl}/v1/messages`, {
++      method: 'POST',
++      headers: {
++        'x-api-key': apiKey,
++        'anthropic-version': ANTHROPIC_VERSION,
++        'anthropic-dangerous-direct-browser-access': 'true',
++        'content-type': 'application/json',
++      },
++      body: JSON.stringify({
++        model,
++        max_tokens: this.options.maxTokens || 2048,
++        system: SYSTEM_PROMPT,
++        messages,
++        tools: this.tools(),
++      }),
++    });
++    if (!response.ok) {
++      let detail = '';
++      try {
++        detail = await response.text();
++      } catch { /* ignore */ }
++      throw new Error(`Anthropic API error ${response.status}: ${detail}`);
++    }
++    return response.json();
++  }
++
++  // Run the tool-use loop for one user turn. `history` is the running list of
++  // Anthropic messages; it is mutated in place with the new turns. `onActivity`
++  // (optional) is called with { type, ... } as tools run, for UI feedback.
++  // Returns the final assistant text.
++  async send(history, onActivity) {
++    const notify = onActivity || (() => {});
++    for (let turn = 0; turn < this.maxTurns; turn += 1) {
++      const reply = await this.postMessages(history);
++      history.push({ role: 'assistant', content: reply.content });
++
++      const toolUses = reply.content.filter(block => block.type === 'tool_use');
++      const texts = reply.content
++        .filter(block => block.type === 'text')
++        .map(block => block.text)
++        .join('\n');
++
++      if (toolUses.length === 0) {
++        return texts;
++      }
++      if (texts) notify({ type: 'text', text: texts });
++
++      const toolResults = toolUses.map(block => {
++        notify({ type: 'tool_use', name: block.name, input: block.input });
++        const { content, isError } = this.runTool(block.name, block.input);
++        notify({ type: 'tool_result', name: block.name, content, isError });
++        return {
++          type: 'tool_result',
++          tool_use_id: block.id,
++          content,
++          is_error: isError,
++        };
++      });
++      history.push({ role: 'user', content: toolResults });
++    }
++    throw new Error('Assistant stopped after too many tool-use turns.');
++  }
++}
+diff --git a/nnvp-client-vue/src/lib/Assistant/assistantActions.js b/nnvp-client-vue/src/lib/Assistant/assistantActions.js
+new file mode 100644
+index 0000000..9dd10af
+--- /dev/null
++++ b/nnvp-client-vue/src/lib/Assistant/assistantActions.js
+@@ -0,0 +1,135 @@
++// Assistant actions API.
++//
++// A thin, Vue-decoupled facade over the app's $d3Interface / $kerasInterface so
++// the AI assistant can inspect and modify the Keras model through a small set of
++// clean, unit-testable functions. Every method is defensive about the graph
++// being empty (activeGraph === null) and about unknown layer types / ids so the
++// tool-use loop can surface friendly errors instead of throwing opaquely.
++
++export default class AssistantActions {
++  constructor(d3Interface, kerasInterface) {
++    this.d3Interface = d3Interface;
++    this.kerasInterface = kerasInterface;
++  }
++
++  // Internal: the active D3Model, or throw a friendly error if no graph is ready.
++  requireModel() {
++    const graph = this.d3Interface.activeGraph;
++    if (graph === null || graph === undefined || graph.model === undefined) {
++      throw new Error('No active graph is available yet.');
++    }
++    return graph.model;
++  }
++
++  // The type name the Keras generators use for a given d3 layer.
++  static layerType(layer) {
++    if (layer.kerasLayer && layer.kerasLayer.name) return layer.kerasLayer.name;
++    return layer.class || 'Unknown';
++  }
++
++  static layerParams(layer) {
++    if (layer.kerasLayer && layer.kerasLayer.parameterValues) {
++      return layer.kerasLayer.parameterValues;
++    }
++    return {};
++  }
++
++  // Available Keras layer type names (from the generated layers JSON).
++  listLayerTypes() {
++    return Object.keys(this.kerasInterface.getLayerList());
++  }
++
++  // Add a layer of the given type. Mirrors how LayerCatalog/LayerTemplate build
++  // the layer: take the catalog's KerasLayer, clone it, hand the clone to
++  // $d3Interface.addLayer(...). Returns the created layer's id and type.
++  addLayer(typeName) {
++    const catalog = this.kerasInterface.getLayerList();
++    const template = catalog[typeName];
++    if (template === undefined) {
++      throw new Error(`Unknown layer type "${typeName}".`);
++    }
++    const model = this.requireModel();
++    const beforeIds = new Set(model.d3Layers.map(layer => layer.id));
++    this.d3Interface.addLayer(template.clone());
++    const created = model.d3Layers.find(layer => !beforeIds.has(layer.id));
++    return {
++      id: created ? created.id : null,
++      type: typeName,
++    };
++  }
++
++  // Current layers with id, type, name and parameter values.
++  listLayers() {
++    const model = this.requireModel();
++    return model.d3Layers.map(layer => ({
++      id: layer.id,
++      type: AssistantActions.layerType(layer),
++      name: layer.name,
++      params: AssistantActions.layerParams(layer),
++    }));
++  }
++
++  // Set a parameter value on a layer, found by its id.
++  setParam(layerId, paramName, value) {
++    const layer = this.d3Interface.findLayerById(layerId);
++    if (layer === null || layer === undefined) {
++      throw new Error(`No layer with id "${layerId}".`);
++    }
++    if (!layer.kerasLayer) {
++      throw new Error(`Layer "${layerId}" has no editable parameters.`);
++    }
++    layer.kerasLayer.setParameterValue(paramName, value);
++    return {
++      id: layerId,
++      params: layer.kerasLayer.parameterValues,
++    };
++  }
++
++  // Counts (layers / inputs / outputs / edges) plus a compact layer list.
++  getModelSummary() {
++    const model = this.requireModel();
++    return {
++      layerCount: model.d3Layers.length,
++      inputCount: model.modelInputs.length,
++      outputCount: model.modelOutputs.length,
++      edgeCount: model.d3Edges.length,
++      layers: model.d3Layers.map(layer => ({
++        id: layer.id,
++        type: AssistantActions.layerType(layer),
++        name: layer.name,
++      })),
++    };
++  }
++
++  // Generate the Keras model source. Reuses KerasGenerator through the same
++  // KerasInterface entry points the File > Generate menu uses.
++  generateCode(lang) {
++    const graph = this.d3Interface.activeGraph;
++    if (graph === null || graph === undefined) {
++      throw new Error('No active graph is available yet.');
++    }
++    const graphJson = graph.toJSON();
++    if (lang === 'python') {
++      return this.kerasInterface.generatePython(graphJson);
++    }
++    if (lang === 'javascript') {
++      return this.kerasInterface.generateJavascript(graphJson);
++    }
++    throw new Error(`Unknown language "${lang}" (expected "python" or "javascript").`);
++  }
++
++  deleteSelected() {
++    this.d3Interface.deleteSelectedElements();
++    return { ok: true };
++  }
++
++  undo() {
++    this.d3Interface.undo();
++    return { ok: true };
++  }
++
++  redo() {
++    this.d3Interface.redo();
++    return { ok: true };
++  }
++}
+diff --git a/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js b/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
+index 9f85557..130f1c6 100644
+--- a/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
++++ b/nnvp-client-vue/src/lib/D3Interface/D3GraphEditor.js
+@@ -601,6 +601,11 @@ D3GraphEditor.prototype.generateJavascriptInBrowser = function (kerasInterface)
+   saveAs(new Blob([generatedJavascript]), "myModel.js");
+ }
+ 
++D3GraphEditor.prototype.generatePyTorchInBrowser = function (kerasInterface) {
++  const generatedPyTorch = kerasInterface.generatePyTorch(this.toJSON());
++  saveAs(new Blob([generatedPyTorch]), "myModel.py");
++}
++
+ D3GraphEditor.prototype.generateJavascriptNoSave = function (kerasInterface) {
+   return kerasInterface.generateJavascript(this.toJSON());
+ }
+diff --git a/nnvp-client-vue/src/lib/D3Interface/D3Interface.js b/nnvp-client-vue/src/lib/D3Interface/D3Interface.js
+index b0bec85..5b93033 100644
+--- a/nnvp-client-vue/src/lib/D3Interface/D3Interface.js
++++ b/nnvp-client-vue/src/lib/D3Interface/D3Interface.js
+@@ -160,6 +160,12 @@ export default class {
+     }
+   }
+ 
++  generatePyTorchInBrowser(kerasInterface) {
++    if (this.activeGraph !== null) {
++      this.activeGraph.generatePyTorchInBrowser(kerasInterface);
++    }
++  }
++
+   generateJavascriptNoSave(kerasInterface) {
+     if (this.activeGraph !== null) {
+       return this.activeGraph.generateJavascriptNoSave(kerasInterface);
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasGenerator.js b/nnvp-client-vue/src/lib/KerasInterface/KerasGenerator.js
+index 39d1c2d..cb6ca9a 100644
+--- a/nnvp-client-vue/src/lib/KerasInterface/KerasGenerator.js
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasGenerator.js
+@@ -9,6 +9,7 @@
+ 
+ import KerasGeneratorPythonHelper from './KerasGeneratorPythonHelper';
+ import KerasGeneratorJavascriptHelper from './KerasGeneratorJavascriptHelper';
++import KerasGeneratorPyTorchHelper from './KerasGeneratorPyTorchHelper';
+ 
+ 
+ export default class KerasGenerator {
+@@ -144,4 +145,10 @@ export default class KerasGenerator {
+       this.graph, this.inputs, this.outputs, this.list, this.sequential,
+     ).generate();
+   }
++
++  generatePyTorchFromGraph() {
++    return new KerasGeneratorPyTorchHelper(
++      this.graph, this.inputs, this.outputs, this.list, this.sequential,
++    ).generate();
++  }
+ }
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js
+new file mode 100644
+index 0000000..6642e33
+--- /dev/null
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasGeneratorPyTorchHelper.js
+@@ -0,0 +1,243 @@
++// class KerasPyTorchGenerator {
++// Mirrors KerasGeneratorPythonHelper / KerasGeneratorJavascriptHelper (composition pattern).
++// Produces a torch.nn.Module subclass from the layer graph.
++//
++// Keras layers are lazily-shaped (input size is often unknown at design time), so we
++// prefer PyTorch's lazy modules (LazyLinear, LazyConv2d, LazyBatchNorm*, ...) whose
++// input dimension is inferred on the first forward pass.
++
++/* eslint-disable no-param-reassign */
++/* eslint class-methods-use-this: ["error", { "exceptMethods": ["generateTuple",
++                                                                "renderValue",
++                                                                "activationModule",
++                                                                "isMerge"] }] */
++
++export default class KerasGeneratorPyTorchHelper {
++  constructor(graph, inputs, outputs, list, sequential) {
++    this.graph = graph;
++    this.inputs = inputs;
++    this.outputs = outputs;
++    this.list = list;
++    this.sequential = sequential || false;
++  }
++
++  // Returns the name given to the node in the generated PyTorch code.
++  nodeName(node) {
++    if (this.graph[node].keras_data.name === 'Input') {
++      return `input_${node}`;
++    }
++    if (this.graph[node].keras_data.name === 'Output') {
++      return `output_${node}`;
++    }
++    return `layer_${node}`;
++  }
++
++  // Render a Python tuple, matching the Python helper's format.
++  generateTuple(param) {
++    let tupleString = '(';
++    for (let i = 0; i < param.length; i += 1) {
++      const value = param[i];
++      if (typeof (value) === 'string') {
++        tupleString += `'${value}',`;
++      } else if (Array.isArray(value)) {
++        tupleString += `${this.generateTuple(value)},`;
++      } else {
++        tupleString += `${value},`;
++      }
++    }
++    tupleString += ')';
++    return tupleString;
++  }
++
++  // Render a single scalar/array parameter value as Python source.
++  renderValue(value) {
++    if (typeof value === 'string') return `'${value}'`;
++    if (typeof value === 'boolean') return value ? 'True' : 'False';
++    if (Array.isArray(value)) return this.generateTuple(value);
++    return `${value}`;
++  }
++
++  // Map a Keras activation name (from an Activation layer or a bare activation layer)
++  // to the matching torch.nn module constructor, or null when unsupported.
++  activationModule(activation) {
++    switch ((activation || '').toLowerCase()) {
++      case 'relu': return 'nn.ReLU()';
++      case 'leakyrelu':
++      case 'leaky_relu': return 'nn.LeakyReLU()';
++      case 'sigmoid': return 'nn.Sigmoid()';
++      case 'tanh': return 'nn.Tanh()';
++      case 'softmax': return 'nn.Softmax(dim=1)';
++      case 'elu': return 'nn.ELU()';
++      case 'selu': return 'nn.SELU()';
++      case 'gelu': return 'nn.GELU()';
++      default: return null;
++    }
++  }
++
++  // Merge layers have no learnable module: they are wired directly in forward().
++  isMerge(name) {
++    return name === 'Concatenate' || name === 'Add';
++  }
++
++  // Return the torch.nn module constructor string for a node, or null if the node has
++  // no dedicated module (Input/Output/merge) or is unsupported (handled by the caller).
++  moduleConstructor(node) {
++    const { name, parameterValues: params } = this.graph[node].keras_data;
++    const p = params || {};
++    switch (name) {
++      case 'Dense':
++        return p.units !== undefined
++          ? `nn.LazyLinear(${this.renderValue(p.units)})`
++          : 'nn.LazyLinear()';
++      case 'Conv1D':
++      case 'Conv2D':
++      case 'Conv3D': {
++        const dim = name.charAt(4);
++        const args = [];
++        if (p.filters !== undefined) args.push(this.renderValue(p.filters));
++        if (p.kernel_size !== undefined) args.push(this.renderValue(p.kernel_size));
++        return `nn.LazyConv${dim}d(${args.join(', ')})`;
++      }
++      case 'MaxPooling1D':
++      case 'MaxPooling2D':
++      case 'MaxPooling3D': {
++        const dim = name.charAt(10);
++        return `nn.MaxPool${dim}d(${p.pool_size !== undefined ? this.renderValue(p.pool_size) : '2'})`;
++      }
++      case 'AveragePooling1D':
++      case 'AveragePooling2D':
++      case 'AveragePooling3D': {
++        const dim = name.charAt(14);
++        return `nn.AvgPool${dim}d(${p.pool_size !== undefined ? this.renderValue(p.pool_size) : '2'})`;
++      }
++      case 'Flatten':
++        return 'nn.Flatten()';
++      case 'Dropout':
++        return `nn.Dropout(${p.rate !== undefined ? this.renderValue(p.rate) : '0.5'})`;
++      case 'BatchNormalization':
++        // Lazy variant infers num_features; 1d is the dimension-agnostic default.
++        return 'nn.LazyBatchNorm1d()';
++      case 'Activation':
++        return this.activationModule(p.activation);
++      case 'ReLU':
++      case 'LeakyReLU':
++      case 'Sigmoid':
++      case 'Tanh':
++      case 'Softmax':
++      case 'ELU':
++      case 'SELU':
++      case 'GELU':
++        return this.activationModule(name);
++      default:
++        return null;
++    }
++  }
++
++  // True when the node emits a real nn module in __init__ / a self.layer_N call in forward.
++  isModuleNode(node) {
++    const { name } = this.graph[node].keras_data;
++    if (name === 'Input' || name === 'Output' || this.isMerge(name)) return false;
++    return this.moduleConstructor(node) !== null;
++  }
++
++  // True when a node maps to nothing we know how to emit -> TODO placeholder.
++  isUnsupportedNode(node) {
++    const { name } = this.graph[node].keras_data;
++    if (name === 'Input' || name === 'Output' || this.isMerge(name)) return false;
++    return this.moduleConstructor(node) === null;
++  }
++
++  // __init__ body: declare a self.layer_N module per module node, a TODO comment per
++  // unsupported node, and nothing for Input/Output/merge nodes.
++  generateInit() {
++    let rs = '  def __init__(self):\n';
++    rs += '    super().__init__()\n';
++    this.list.forEach((node) => {
++      if (this.isModuleNode(node)) {
++        rs += `    self.${this.nodeName(node)} = ${this.moduleConstructor(node)}\n`;
++      } else if (this.isUnsupportedNode(node)) {
++        rs += `    # TODO: unsupported layer ${this.graph[node].keras_data.name}\n`;
++      }
++    });
++    return rs;
++  }
++
++  // Sequential forward(): a single running tensor `x` chained through each module.
++  generateSequentialForward() {
++    let rs = '  def forward(self, x):\n';
++    this.list.forEach((node) => {
++      const { name } = this.graph[node].keras_data;
++      if (name === 'Input' || name === 'Output') return;
++      if (this.isModuleNode(node)) {
++        rs += `    x = self.${this.nodeName(node)}(x)\n`;
++      } else if (this.isUnsupportedNode(node)) {
++        rs += `    x = x  # TODO: unsupported layer ${name}\n`;
++      }
++    });
++    rs += '    return x\n';
++    return rs;
++  }
++
++  // Return the forward expression that produces a node's output from its source vars.
++  forwardExpression(node) {
++    const { name } = this.graph[node].keras_data;
++    const sources = this.graph[node].sources.map(s => this.nodeName(s));
++    if (name === 'Concatenate') {
++      return `torch.cat([${sources.join(', ')}], dim=1)`;
++    }
++    if (name === 'Add') {
++      return sources.join(' + ');
++    }
++    if (this.isModuleNode(node)) {
++      return `self.${this.nodeName(node)}(${sources.join(', ')})`;
++    }
++    // Unsupported: pass the (first) input through unchanged with a TODO marker.
++    return `${sources[0]}  # TODO: unsupported layer ${name}`;
++  }
++
++  // Functional forward(): one named variable per node, wired by dataflow.
++  // Single input model -> forward(self, x); multi-input -> forward(self, input_a, ...).
++  generateFunctionalForward() {
++    const single = this.inputs.length <= 1;
++    const args = single ? 'x' : this.inputs.map(i => this.nodeName(i)).join(', ');
++    let rs = `  def forward(self, ${args}):\n`;
++    if (single && this.inputs.length === 1) {
++      rs += `    ${this.nodeName(this.inputs[0])} = x\n`;
++    }
++    this.list.forEach((node) => {
++      const { name } = this.graph[node].keras_data;
++      if (name === 'Input' || name === 'Output') return;
++      rs += `    ${this.nodeName(node)} = ${this.forwardExpression(node)}\n`;
++    });
++    const returned = this.outputs.map(o => this.nodeName(this.graph[o].sources[0]));
++    rs += `    return ${returned.length === 1 ? returned[0] : `(${returned.join(', ')})`}\n`;
++    return rs;
++  }
++
++  generateSequential() {
++    let rs = 'import torch\n';
++    rs += 'import torch.nn as nn\n';
++    rs += '\n\n';
++    rs += 'class Model(nn.Module):\n';
++    rs += this.generateInit();
++    rs += '\n';
++    rs += this.generateSequentialForward();
++    return rs;
++  }
++
++  generateFunctional() {
++    let rs = 'import torch\n';
++    rs += 'import torch.nn as nn\n';
++    rs += '\n\n';
++    rs += 'class Model(nn.Module):\n';
++    rs += this.generateInit();
++    rs += '\n';
++    rs += this.generateFunctionalForward();
++    return rs;
++  }
++
++  generate(sequential) {
++    sequential = sequential === undefined ? this.sequential : sequential;
++    return sequential ? this.generateSequential() : this.generateFunctional();
++  }
++}
+diff --git a/nnvp-client-vue/src/lib/KerasInterface/KerasInterface.js b/nnvp-client-vue/src/lib/KerasInterface/KerasInterface.js
+index aa11d07..0d2f2be 100644
+--- a/nnvp-client-vue/src/lib/KerasInterface/KerasInterface.js
++++ b/nnvp-client-vue/src/lib/KerasInterface/KerasInterface.js
+@@ -2,7 +2,8 @@ import KerasLayer from './KerasLayer';
+ import KerasGenerator from './KerasGenerator';
+ 
+ /* eslint class-methods-use-this: ["error", { "exceptMethods": ["generatePython",
+-                                                                "generateJavascript"] }] */
++                                                                "generateJavascript",
++                                                                "generatePyTorch"] }] */
+ // class KerasInterface {
+ export default class {
+   constructor(json) {
+@@ -68,4 +69,11 @@ export default class {
+     else graphJson = d3Json;
+     return new KerasGenerator(graphJson).generateJavascriptFromGraph();
+   }
++
++  generatePyTorch(d3Json) {
++    let graphJson;
++    if (typeof d3Json === 'string') graphJson = JSON.parse(d3Json);
++    else graphJson = d3Json;
++    return new KerasGenerator(graphJson).generatePyTorchFromGraph();
++  }
+ }
+diff --git a/nnvp-client-vue/src/lib/Tutorial/mnistTutorial.js b/nnvp-client-vue/src/lib/Tutorial/mnistTutorial.js
+new file mode 100644
+index 0000000..beab483
+--- /dev/null
++++ b/nnvp-client-vue/src/lib/Tutorial/mnistTutorial.js
+@@ -0,0 +1,158 @@
++// Guided "Tutorial mode" driver for building a small MNIST CNN.
++//
++// This module is intentionally Vue-agnostic and side-effect free so it can be
++// unit-tested in isolation. It exports a declarative list of steps; each step's
++// `isComplete` predicate inspects the real editor state exposed through the
++// `$d3Interface` (see src/lib/D3Interface/D3Interface.js).
++//
++// Editor-state contract used here (verified against D3Interface / D3Model / D3Layer):
++//   $d3Interface.activeGraph.model.d3Layers  -> array of placed layers
++//   layer.kerasLayer.name                    -> Keras layer type, e.g. "Conv2D"
++//   layer.kerasLayer.parameterValues         -> object of set parameter values
++
++/**
++ * Return the array of placed layers for the active graph, or [] when the graph
++ * (or interface) is not ready yet. Never throws so predicates stay safe to poll.
++ * @param {object} $d3 the $d3Interface instance (or a fake in tests)
++ * @returns {Array} placed layers
++ */
++export function placedLayers($d3) {
++  const graph = $d3 && $d3.activeGraph;
++  if (!graph || !graph.model || !Array.isArray(graph.model.d3Layers)) return [];
++  return graph.model.d3Layers;
++}
++
++/**
++ * Count placed layers whose Keras type matches `name`.
++ * @param {object} $d3 the $d3Interface instance
++ * @param {string} name the Keras layer name (e.g. "Dense")
++ * @returns {number}
++ */
++export function countLayersNamed($d3, name) {
++  return placedLayers($d3).filter(
++    layer => layer && layer.kerasLayer && layer.kerasLayer.name === name,
++  ).length;
++}
++
++/**
++ * True when at least one placed Input layer has a non-empty `shape` parameter.
++ * The Input layer's shape is stored in kerasLayer.parameterValues.shape as a
++ * tuple_int (array). We treat any non-empty value as "set".
++ * @param {object} $d3 the $d3Interface instance
++ * @returns {boolean}
++ */
++export function inputShapeIsSet($d3) {
++  return placedLayers($d3).some((layer) => {
++    if (!layer || !layer.kerasLayer || layer.kerasLayer.name !== 'Input') return false;
++    const values = layer.kerasLayer.parameterValues || {};
++    const shape = values.shape;
++    if (shape === undefined || shape === null || shape === '') return false;
++    if (Array.isArray(shape)) return shape.some(v => v !== '' && v !== null && v !== undefined);
++    return true;
++  });
++}
++
++/**
++ * True when the Training panel is currently open in the DOM. Guarded so the
++ * predicate is safe to call in a non-DOM (unit test) environment.
++ * @returns {boolean}
++ */
++export function trainingPanelIsOpen() {
++  if (typeof document === 'undefined') return false;
++  return document.getElementById('trainingZone') !== null;
++}
++
++// Declarative step list. Each step:
++//   id          unique string id
++//   title       short heading for the card
++//   instruction what the user should do
++//   target      CSS selector (string) or (document) => Element locating the
++//               UI element to highlight
++//   isComplete  ($d3Interface) => boolean, inspecting real editor state
++export const steps = [
++  {
++    id: 'add-input',
++    title: 'Add an Input layer',
++    instruction:
++      'Every model starts with an Input. In the left Layer Catalog, click "Input" '
++      + 'to place an Input layer on the canvas.',
++    target: '#layer-template-Input',
++    isComplete: $d3 => countLayersNamed($d3, 'Input') >= 1,
++  },
++  {
++    id: 'set-input-shape',
++    title: 'Set the input shape',
++    instruction:
++      'Select the Input layer on the canvas, then in the right panel set its '
++      + 'shape to 28, 28, 1 — the dimensions of an MNIST image.',
++    target: '#layerOptions',
++    isComplete: $d3 => inputShapeIsSet($d3),
++  },
++  {
++    id: 'add-conv2d',
++    title: 'Add a Conv2D layer',
++    instruction:
++      'Convolutions extract spatial features. Click "Conv2D" in the Layer Catalog '
++      + 'to add a convolutional layer.',
++    target: '#layer-template-Conv2D',
++    isComplete: $d3 => countLayersNamed($d3, 'Conv2D') >= 1,
++  },
++  {
++    id: 'add-maxpooling2d',
++    title: 'Add a MaxPooling2D layer',
++    instruction:
++      'Pooling downsamples the feature maps. Click "MaxPooling2D" in the Layer '
++      + 'Catalog to add a pooling layer.',
++    target: '#layer-template-MaxPooling2D',
++    isComplete: $d3 => countLayersNamed($d3, 'MaxPooling2D') >= 1,
++  },
++  {
++    id: 'add-flatten',
++    title: 'Add a Flatten layer',
++    instruction:
++      'Before the dense classifier the 2D feature maps must be flattened. Click '
++      + '"Flatten" in the Layer Catalog.',
++    target: '#layer-template-Flatten',
++    isComplete: $d3 => countLayersNamed($d3, 'Flatten') >= 1,
++  },
++  {
++    id: 'add-dense-hidden',
++    title: 'Add a Dense layer',
++    instruction:
++      'Add a fully-connected hidden layer: click "Dense" in the Layer Catalog.',
++    target: '#layer-template-Dense',
++    isComplete: $d3 => countLayersNamed($d3, 'Dense') >= 1,
++  },
++  {
++    id: 'add-dense-output',
++    title: 'Add the output Dense layer',
++    instruction:
++      'Add a second Dense layer to act as the 10-class output (one unit per MNIST '
++      + 'digit). Click "Dense" again in the Layer Catalog.',
++    target: '#layer-template-Dense',
++    isComplete: $d3 => countLayersNamed($d3, 'Dense') >= 2,
++  },
++  {
++    id: 'open-training',
++    title: 'Compile & train on MNIST',
++    instruction:
++      'Your MNIST CNN is complete: Input → Conv2D → MaxPooling2D → Flatten → Dense '
++      + '→ Dense. Open "Training" in the top menu to compile the model and train it '
++      + 'on the MNIST dataset.',
++    target: '#generalMenu',
++    isComplete: () => trainingPanelIsOpen(),
++  },
++];
++
++/**
++ * Look up a step by id (handy for tests and callers).
++ * @param {string} id
++ * @returns {object|undefined}
++ */
++export function getStep(id) {
++  return steps.find(step => step.id === id);
++}
++
++export const totalSteps = steps.length;
++
++export default steps;
+diff --git a/nnvp-client-vue/tests/tutorial.spec.js b/nnvp-client-vue/tests/tutorial.spec.js
+new file mode 100644
+index 0000000..75fb9b1
+--- /dev/null
++++ b/nnvp-client-vue/tests/tutorial.spec.js
+@@ -0,0 +1,43 @@
++import { test, expect } from '@playwright/test';
++
++test.describe('MNIST Tutorial mode', () => {
++  test.beforeEach(async ({ page }) => {
++    await page.goto('/');
++    await page.waitForTimeout(50);
++  });
++
++  test('starts the tutorial and advances after the first step action', async ({ page }) => {
++    // Start the tutorial from the top menu.
++    await page.click('text=Tutorial');
++    await page.waitForTimeout(50);
++
++    // The overlay card should appear on the first step.
++    const card = page.locator('.tutorial-card');
++    await expect(card).toBeVisible();
++    await expect(page.locator('.tutorial-progress')).toHaveText('Step 1 / 8');
++    await expect(card).toContainText('Add an Input layer');
++
++    // The coachmark ring highlights the Input layer template.
++    await expect(page.locator('.tutorial-highlight')).toBeVisible();
++
++    // Capture the overlay for the deliverable screenshot.
++    await page.screenshot({ path: '/tmp/f2-tutorial.png' });
++
++    // Perform the first step's action: add an Input layer from the catalog.
++    await page.click('#layer-template-Input');
++    await page.waitForTimeout(200);
++
++    // The tutorial should auto-advance to step 2 (set the input shape).
++    await expect(page.locator('.tutorial-progress')).toHaveText('Step 2 / 8');
++    await expect(card).toContainText('Set the input shape');
++  });
++
++  test('can be exited', async ({ page }) => {
++    await page.click('text=Tutorial');
++    await page.waitForTimeout(50);
++    await expect(page.locator('.tutorial-card')).toBeVisible();
++    await page.click('.tutorial-exit');
++    await page.waitForTimeout(50);
++    await expect(page.locator('.tutorial-card')).toHaveCount(0);
++  });
++});
+diff --git a/nnvp-client-vue/tests/unit/KerasGeneratorPyTorch.test.js b/nnvp-client-vue/tests/unit/KerasGeneratorPyTorch.test.js
+new file mode 100644
+index 0000000..8b375aa
+--- /dev/null
++++ b/nnvp-client-vue/tests/unit/KerasGeneratorPyTorch.test.js
+@@ -0,0 +1,167 @@
++import { describe, it, expect } from 'vitest';
++import KerasGenerator from '../../src/lib/KerasInterface/KerasGenerator';
++import KerasGeneratorPyTorchHelper from '../../src/lib/KerasInterface/KerasGeneratorPyTorchHelper';
++
++// --- Fixture builders (mirror KerasGenerator.test.js) -----------------------
++// KerasGenerator mutates the layer objects it is given, so every fixture MUST be
++// produced fresh from a function and never shared between two instances.
++
++function leaf(id, name, {
++  params = {}, def = {}, inputLayers = [], outputLayers = [],
++} = {}) {
++  return {
++    id,
++    x: 0,
++    y: 0,
++    name,
++    inputLayers,
++    outputLayers,
++    children: null,
++    kerasLayer: {
++      name, category: 'test', parameterValues: params, parameterDef: def,
++    },
++  };
++}
++
++// Sequential: Input(1) -> Flatten(2) -> Dense(3,128) -> Dense(4,10) -> Output(5)
++function sequentialJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['5'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [28, 28] }, outputLayers: ['2'] }),
++      leaf('2', 'Flatten', { inputLayers: ['1'], outputLayers: ['3'] }),
++      leaf('3', 'Dense', { params: { units: 128 }, inputLayers: ['2'], outputLayers: ['4'] }),
++      leaf('4', 'Dense', { params: { units: 10 }, inputLayers: ['3'], outputLayers: ['5'] }),
++      leaf('5', 'Output', { inputLayers: ['4'] }),
++    ],
++  };
++}
++
++// Branching functional:
++// Input(1) -> Dense(2,4) -\
++//          -> Dense(3,4) --> Concatenate(4) -> Output(5)
++function functionalJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['5'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [10] }, outputLayers: ['2', '3'] }),
++      leaf('2', 'Dense', { params: { units: 4 }, inputLayers: ['1'], outputLayers: ['4'] }),
++      leaf('3', 'Dense', { params: { units: 4 }, inputLayers: ['1'], outputLayers: ['4'] }),
++      leaf('4', 'Concatenate', { inputLayers: ['2', '3'], outputLayers: ['5'] }),
++      leaf('5', 'Output', { inputLayers: ['4'] }),
++    ],
++  };
++}
++
++// A layer NNVP does not know how to map to torch.nn -> TODO placeholder.
++// Input(1) -> LSTM(2) -> Output(3) (still a linear chain -> sequential path).
++function unsupportedJson() {
++  return {
++    inputs: ['1'],
++    outputs: ['3'],
++    layers: [
++      leaf('1', 'Input', { params: { shape: [10] }, outputLayers: ['2'] }),
++      leaf('2', 'LSTM', { params: { units: 8 }, inputLayers: ['1'], outputLayers: ['3'] }),
++      leaf('3', 'Output', { inputLayers: ['2'] }),
++    ],
++  };
++}
++
++// ---------------------------------------------------------------------------
++
++describe('PyTorch: full generation', () => {
++  it('generates a nn.Module subclass for a sequential chain', () => {
++    const code = new KerasGenerator(sequentialJson()).generatePyTorchFromGraph();
++    expect(code).toBe(
++      'import torch\n'
++      + 'import torch.nn as nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model(nn.Module):\n'
++      + '  def __init__(self):\n'
++      + '    super().__init__()\n'
++      + '    self.layer_2 = nn.Flatten()\n'
++      + '    self.layer_3 = nn.LazyLinear(128)\n'
++      + '    self.layer_4 = nn.LazyLinear(10)\n'
++      + '\n'
++      + '  def forward(self, x):\n'
++      + '    x = self.layer_2(x)\n'
++      + '    x = self.layer_3(x)\n'
++      + '    x = self.layer_4(x)\n'
++      + '    return x\n',
++    );
++  });
++
++  it('wires a branching functional graph through forward() dataflow', () => {
++    const code = new KerasGenerator(functionalJson()).generatePyTorchFromGraph();
++    expect(code).toBe(
++      'import torch\n'
++      + 'import torch.nn as nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model(nn.Module):\n'
++      + '  def __init__(self):\n'
++      + '    super().__init__()\n'
++      + '    self.layer_2 = nn.LazyLinear(4)\n'
++      + '    self.layer_3 = nn.LazyLinear(4)\n'
++      + '\n'
++      + '  def forward(self, x):\n'
++      + '    input_1 = x\n'
++      + '    layer_2 = self.layer_2(input_1)\n'
++      + '    layer_3 = self.layer_3(input_1)\n'
++      + '    layer_4 = torch.cat([layer_2, layer_3], dim=1)\n'
++      + '    return layer_4\n',
++    );
++  });
++
++  it('emits a clearly-marked TODO placeholder for an unsupported layer', () => {
++    const code = new KerasGenerator(unsupportedJson()).generatePyTorchFromGraph();
++    expect(code).toBe(
++      'import torch\n'
++      + 'import torch.nn as nn\n'
++      + '\n'
++      + '\n'
++      + 'class Model(nn.Module):\n'
++      + '  def __init__(self):\n'
++      + '    super().__init__()\n'
++      + '    # TODO: unsupported layer LSTM\n'
++      + '\n'
++      + '  def forward(self, x):\n'
++      + '    x = x  # TODO: unsupported layer LSTM\n'
++      + '    return x\n',
++    );
++    // The placeholder must not silently emit wrong torch code.
++    expect(code).not.toContain('nn.LSTM');
++  });
++});
++
++describe('PyTorch: layer -> torch.nn mapping', () => {
++  const ctor = (name, params = {}) => {
++    const graph = { n: { keras_data: { name, parameterValues: params } } };
++    return new KerasGeneratorPyTorchHelper(graph, [], [], [], false).moduleConstructor('n');
++  };
++
++  it('maps the common layers to lazy modules where shape is unknown', () => {
++    expect(ctor('Dense', { units: 32 })).toBe('nn.LazyLinear(32)');
++    expect(ctor('Conv2D', { filters: 16, kernel_size: [3, 3] })).toBe('nn.LazyConv2d(16, (3,3,))');
++    expect(ctor('Conv1D', { filters: 8, kernel_size: 5 })).toBe('nn.LazyConv1d(8, 5)');
++    expect(ctor('Flatten')).toBe('nn.Flatten()');
++    expect(ctor('MaxPooling2D', { pool_size: [2, 2] })).toBe('nn.MaxPool2d((2,2,))');
++    expect(ctor('AveragePooling2D', { pool_size: [2, 2] })).toBe('nn.AvgPool2d((2,2,))');
++    expect(ctor('Dropout', { rate: 0.25 })).toBe('nn.Dropout(0.25)');
++    expect(ctor('BatchNormalization')).toBe('nn.LazyBatchNorm1d()');
++  });
++
++  it('maps activations to matching nn modules', () => {
++    expect(ctor('Activation', { activation: 'relu' })).toBe('nn.ReLU()');
++    expect(ctor('Activation', { activation: 'softmax' })).toBe('nn.Softmax(dim=1)');
++    expect(ctor('Sigmoid')).toBe('nn.Sigmoid()');
++  });
++
++  it('returns null (-> TODO) for an unmapped layer or unknown activation', () => {
++    expect(ctor('LSTM', { units: 8 })).toBeNull();
++    expect(ctor('Activation', { activation: 'mish' })).toBeNull();
++  });
++});
+diff --git a/nnvp-client-vue/tests/unit/assistantActions.test.js b/nnvp-client-vue/tests/unit/assistantActions.test.js
+new file mode 100644
+index 0000000..2f15501
+--- /dev/null
++++ b/nnvp-client-vue/tests/unit/assistantActions.test.js
+@@ -0,0 +1,204 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import AssistantActions from '../../src/lib/Assistant/assistantActions';
++import AnthropicClient, { buildTools } from '../../src/lib/Assistant/anthropicClient';
++
++// --- Fakes ------------------------------------------------------------------
++// A minimal stand-in for a KerasLayer: name + parameterValues + setter + clone,
++// matching the surface AssistantActions relies on.
++function makeKerasLayer(name) {
++  return {
++    name,
++    parameterValues: {},
++    setParameterValue(paramName, value) {
++      this.parameterValues[paramName] = value;
++    },
++    clone() {
++      const copy = makeKerasLayer(this.name);
++      copy.parameterValues = JSON.parse(JSON.stringify(this.parameterValues));
++      return copy;
++    },
++  };
++}
++
++// A fake $d3Interface mirroring the real add/find/model structure closely
++// enough to exercise the actions (activeGraph.model.d3Layers, findLayerById...).
++function makeFakeD3Interface() {
++  const model = {
++    d3Layers: [],
++    d3Edges: [],
++    modelInputs: [],
++    modelOutputs: [],
++  };
++  let nextId = 1;
++  const activeGraph = {
++    model,
++    toJSON() {
++      return JSON.stringify({ layers: model.d3Layers.map(l => l.id) });
++    },
++    findLayerById(id) {
++      return model.d3Layers.find(layer => layer.id === id) || null;
++    },
++  };
++  return {
++    activeGraph,
++    calls: { deleteSelected: 0, undo: 0, redo: 0 },
++    addLayer(kerasLayer) {
++      const id = nextId;
++      nextId += 1;
++      model.d3Layers.push({ id, name: kerasLayer.name, kerasLayer });
++    },
++    findLayerById(id) {
++      return activeGraph.findLayerById(id);
++    },
++    deleteSelectedElements() {
++      this.calls.deleteSelected += 1;
++    },
++    undo() {
++      this.calls.undo += 1;
++    },
++    redo() {
++      this.calls.redo += 1;
++    },
++  };
++}
++
++function makeFakeKerasInterface() {
++  const layerList = {
++    Dense: makeKerasLayer('Dense'),
++    Input: makeKerasLayer('Input'),
++  };
++  return {
++    getLayerList() {
++      return layerList;
++    },
++    generatePython(json) {
++      return `# python for ${json}`;
++    },
++    generateJavascript(json) {
++      return `// javascript for ${json}`;
++    },
++  };
++}
++
++// --- Tests ------------------------------------------------------------------
++describe('AssistantActions', () => {
++  let actions;
++  let d3;
++  let keras;
++
++  beforeEach(() => {
++    d3 = makeFakeD3Interface();
++    keras = makeFakeKerasInterface();
++    actions = new AssistantActions(d3, keras);
++  });
++
++  it('lists available layer types', () => {
++    expect(actions.listLayerTypes()).toEqual(['Dense', 'Input']);
++  });
++
++  it('adds a layer and lists it', () => {
++    const added = actions.addLayer('Dense');
++    expect(added.type).toBe('Dense');
++    expect(added.id).not.toBeNull();
++
++    const layers = actions.listLayers();
++    expect(layers).toHaveLength(1);
++    expect(layers[0].type).toBe('Dense');
++    expect(layers[0].id).toBe(added.id);
++    expect(layers[0].params).toEqual({});
++  });
++
++  it('rejects an unknown layer type', () => {
++    expect(() => actions.addLayer('NotALayer')).toThrow(/Unknown layer type/);
++  });
++
++  it('sets a parameter value on a layer', () => {
++    const added = actions.addLayer('Dense');
++    const result = actions.setParam(added.id, 'units', 64);
++    expect(result.params.units).toBe(64);
++
++    const layers = actions.listLayers();
++    expect(layers[0].params.units).toBe(64);
++  });
++
++  it('throws when setting a param on a missing layer', () => {
++    expect(() => actions.setParam(999, 'units', 1)).toThrow(/No layer with id/);
++  });
++
++  it('summarizes the model with counts and a compact layer list', () => {
++    actions.addLayer('Input');
++    actions.addLayer('Dense');
++    d3.activeGraph.model.modelInputs.push(d3.activeGraph.model.d3Layers[0]);
++    d3.activeGraph.model.d3Edges.push({});
++
++    const summary = actions.getModelSummary();
++    expect(summary.layerCount).toBe(2);
++    expect(summary.inputCount).toBe(1);
++    expect(summary.outputCount).toBe(0);
++    expect(summary.edgeCount).toBe(1);
++    expect(summary.layers.map(l => l.type)).toEqual(['Input', 'Dense']);
++  });
++
++  it('generates python and javascript code', () => {
++    actions.addLayer('Dense');
++    expect(actions.generateCode('python')).toContain('# python for');
++    expect(actions.generateCode('javascript')).toContain('// javascript for');
++    expect(() => actions.generateCode('ruby')).toThrow(/Unknown language/);
++  });
++
++  it('delegates delete/undo/redo to the d3 interface', () => {
++    actions.deleteSelected();
++    actions.undo();
++    actions.redo();
++    expect(d3.calls).toEqual({ deleteSelected: 1, undo: 1, redo: 1 });
++  });
++
++  it('reports a friendly error when no graph is active', () => {
++    const bare = new AssistantActions({ activeGraph: null }, keras);
++    expect(() => bare.listLayers()).toThrow(/No active graph/);
++  });
++});
++
++describe('AnthropicClient tool mapping', () => {
++  it('builds a valid tools array from the actions', () => {
++    const tools = buildTools();
++    const names = tools.map(t => t.name);
++    expect(names).toEqual([
++      'list_layer_types',
++      'add_layer',
++      'list_layers',
++      'set_param',
++      'get_model_summary',
++      'generate_code',
++      'delete_selected',
++      'undo',
++      'redo',
++    ]);
++    tools.forEach((tool) => {
++      expect(typeof tool.name).toBe('string');
++      expect(typeof tool.description).toBe('string');
++      expect(tool.input_schema).toBeDefined();
++      expect(tool.input_schema.type).toBe('object');
++    });
++  });
++
++  it('executes a mapped tool against the actions', () => {
++    const d3 = makeFakeD3Interface();
++    const keras = makeFakeKerasInterface();
++    const actions = new AssistantActions(d3, keras);
++    const client = new AnthropicClient(actions);
++
++    const listed = client.runTool('list_layer_types', {});
++    expect(listed.isError).toBe(false);
++    expect(JSON.parse(listed.content)).toEqual(['Dense', 'Input']);
++
++    const added = client.runTool('add_layer', { type_name: 'Dense' });
++    expect(added.isError).toBe(false);
++
++    const bad = client.runTool('add_layer', { type_name: 'Nope' });
++    expect(bad.isError).toBe(true);
++
++    const unknown = client.runTool('does_not_exist', {});
++    expect(unknown.isError).toBe(true);
++  });
++});
+diff --git a/nnvp-client-vue/tests/unit/mnistTutorial.test.js b/nnvp-client-vue/tests/unit/mnistTutorial.test.js
+new file mode 100644
+index 0000000..7d79a06
+--- /dev/null
++++ b/nnvp-client-vue/tests/unit/mnistTutorial.test.js
+@@ -0,0 +1,156 @@
++import { describe, it, expect } from 'vitest';
++import steps, {
++  steps as namedSteps,
++  totalSteps,
++  getStep,
++  placedLayers,
++  countLayersNamed,
++  inputShapeIsSet,
++} from '../../src/lib/Tutorial/mnistTutorial';
++
++// Build a fake $d3Interface exposing only what the tutorial predicates read:
++// activeGraph.model.d3Layers, each layer with a kerasLayer { name, parameterValues }.
++function makeLayer(name, parameterValues = {}) {
++  return { kerasLayer: { name, parameterValues } };
++}
++
++function makeD3Interface(layers) {
++  return {
++    activeGraph: {
++      model: { d3Layers: layers },
++    },
++  };
++}
++
++describe('mnistTutorial step definitions', () => {
++  it('default export and named export are the same step list', () => {
++    expect(steps).toBe(namedSteps);
++  });
++
++  it('exposes a well-formed, non-empty step list', () => {
++    expect(Array.isArray(steps)).toBe(true);
++    expect(steps.length).toBeGreaterThan(0);
++    expect(totalSteps).toBe(steps.length);
++    const ids = new Set();
++    for (const step of steps) {
++      expect(typeof step.id).toBe('string');
++      expect(typeof step.title).toBe('string');
++      expect(typeof step.instruction).toBe('string');
++      expect(step.target === undefined
++        || typeof step.target === 'string'
++        || typeof step.target === 'function').toBe(true);
++      expect(typeof step.isComplete).toBe('function');
++      expect(ids.has(step.id)).toBe(false);
++      ids.add(step.id);
++    }
++  });
++
++  it('describes the minimal MNIST CNN path in order', () => {
++    expect(steps.map(s => s.id)).toEqual([
++      'add-input',
++      'set-input-shape',
++      'add-conv2d',
++      'add-maxpooling2d',
++      'add-flatten',
++      'add-dense-hidden',
++      'add-dense-output',
++      'open-training',
++    ]);
++  });
++
++  it('getStep looks up by id', () => {
++    expect(getStep('add-conv2d')).toBe(steps[2]);
++    expect(getStep('nope')).toBeUndefined();
++  });
++});
++
++describe('helpers tolerate an unready interface', () => {
++  it('placedLayers returns [] for missing graph/model', () => {
++    expect(placedLayers(undefined)).toEqual([]);
++    expect(placedLayers({})).toEqual([]);
++    expect(placedLayers({ activeGraph: {} })).toEqual([]);
++    expect(placedLayers({ activeGraph: { model: {} } })).toEqual([]);
++  });
++
++  it('predicates return false for an unready interface', () => {
++    expect(countLayersNamed(undefined, 'Dense')).toBe(0);
++    expect(inputShapeIsSet(undefined)).toBe(false);
++    expect(getStep('add-input').isComplete(undefined)).toBe(false);
++  });
++});
++
++describe('isComplete predicates against a fake model', () => {
++  it('add-input completes once an Input layer exists', () => {
++    const step = getStep('add-input');
++    expect(step.isComplete(makeD3Interface([]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Dense')]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Input')]))).toBe(true);
++  });
++
++  it('set-input-shape completes only once the Input shape is set', () => {
++    const step = getStep('set-input-shape');
++    expect(step.isComplete(makeD3Interface([makeLayer('Input')]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Input', { shape: [] })]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Input', { shape: ['', ''] })]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Input', { shape: [28, 28, 1] })]))).toBe(true);
++  });
++
++  it('add-conv2d completes once a Conv2D exists', () => {
++    const step = getStep('add-conv2d');
++    expect(step.isComplete(makeD3Interface([makeLayer('Input', { shape: [28, 28, 1] })]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Conv2D')]))).toBe(true);
++  });
++
++  it('add-maxpooling2d completes once a MaxPooling2D exists', () => {
++    const step = getStep('add-maxpooling2d');
++    expect(step.isComplete(makeD3Interface([makeLayer('Conv2D')]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('MaxPooling2D')]))).toBe(true);
++  });
++
++  it('add-flatten completes once a Flatten exists', () => {
++    const step = getStep('add-flatten');
++    expect(step.isComplete(makeD3Interface([makeLayer('MaxPooling2D')]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Flatten')]))).toBe(true);
++  });
++
++  it('add-dense-hidden completes once one Dense exists', () => {
++    const step = getStep('add-dense-hidden');
++    expect(step.isComplete(makeD3Interface([makeLayer('Flatten')]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Dense')]))).toBe(true);
++  });
++
++  it('add-dense-output requires a second Dense', () => {
++    const step = getStep('add-dense-output');
++    expect(step.isComplete(makeD3Interface([makeLayer('Dense')]))).toBe(false);
++    expect(step.isComplete(makeD3Interface([makeLayer('Dense'), makeLayer('Dense')]))).toBe(true);
++  });
++
++  it('open-training does not complete without a Training panel in the DOM', () => {
++    // Unit tests run in a node environment (no document), so the guard returns false.
++    const step = getStep('open-training');
++    const fullModel = makeD3Interface([
++      makeLayer('Input', { shape: [28, 28, 1] }),
++      makeLayer('Conv2D'),
++      makeLayer('MaxPooling2D'),
++      makeLayer('Flatten'),
++      makeLayer('Dense'),
++      makeLayer('Dense'),
++    ]);
++    expect(step.isComplete(fullModel)).toBe(false);
++  });
++
++  it('a full MNIST CNN model satisfies every layer-building step', () => {
++    const fullModel = makeD3Interface([
++      makeLayer('Input', { shape: [28, 28, 1] }),
++      makeLayer('Conv2D'),
++      makeLayer('MaxPooling2D'),
++      makeLayer('Flatten'),
++      makeLayer('Dense'),
++      makeLayer('Dense'),
++    ]);
++    const buildingSteps = steps.filter(s => s.id !== 'open-training');
++    for (const step of buildingSteps) {
++      expect(step.isComplete(fullModel)).toBe(true);
++    }
++  });
++});
+-- 
+2.43.0
+
