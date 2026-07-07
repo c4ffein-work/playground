@@ -1,5 +1,9 @@
 # NNVP — review & improvements
 
+> **Reviewing from a fresh machine? Start with [`REVIEW-GUIDE.md`](REVIEW-GUIDE.md)** — repo map,
+> how to re-run every verification, what was NOT verifiable in the sandbox, known issues, and the
+> screenshot index.
+
 Source reviewed: `c4ffein/nnvp` @ `4e26758` ("clearer TODOs").
 This folder is a landing spot because this session is scoped to `c4ffein-work/playground`
 and cannot push to `c4ffein/nnvp` (see **Why it's here** at the bottom).
