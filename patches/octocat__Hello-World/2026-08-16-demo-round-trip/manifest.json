@@ -1,0 +1,9 @@
+{
+  "repo": "octocat/Hello-World",
+  "remote": "https://github.com/octocat/Hello-World.git",
+  "base_branch": "master",
+  "base_sha": "7fd1a60b01f91b314f59955a4e4d4e80d8edf11d",
+  "created": "2026-08-16",
+  "patches": 1,
+  "title": "Add a greeting line to README"
+}

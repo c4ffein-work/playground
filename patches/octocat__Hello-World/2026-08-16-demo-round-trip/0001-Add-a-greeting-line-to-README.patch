@@ -1,0 +1,26 @@
+From cd68f2a67b9edd26fab3a1c2e071ae4f61736832 Mon Sep 17 00:00:00 2001
+From: c4ffein-work <c4ffein.work@gmail.com>
+Date: Sun, 16 Aug 2026 09:06:55 +0000
+Subject: [PATCH] Add a greeting line to README
+
+Demo commit for the playground patch drop-box: cut on a cloud session,
+stored as a format-patch series, applied locally with git am.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CWzkSsbvpHy68WHSCysExS
+---
+ README | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/README b/README
+index 980a0d5..efb2e1b 100644
+--- a/README
++++ b/README
+@@ -1 +1,3 @@
+ Hello World!
++
++Greetings from a Claude cloud session — this commit travelled here as a patch file.
+-- 
+2.43.0
+
