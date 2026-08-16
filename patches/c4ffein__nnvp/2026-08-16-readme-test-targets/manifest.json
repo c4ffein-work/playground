@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/nnvp",
+  "remote": "https://github.com/c4ffein/nnvp.git",
+  "base_branch": "master",
+  "base_sha": "32515f8dfaff8aa9ff02a8f5fda04b876a5cd773",
+  "created": "2026-08-16",
+  "patches": 1,
+  "title": "README: list all test targets in the Testing section"
+}

@@ -1,0 +1,32 @@
+From 7e09ad1d29423f779de73ddf7484a3f7261ba549 Mon Sep 17 00:00:00 2001
+From: c4ffein-work <c4ffein.work@gmail.com>
+Date: Sun, 16 Aug 2026 09:17:53 +0000
+Subject: [PATCH] README: list all test targets in the Testing section
+
+The Makefile provides make test (unit + e2e) and make test-unit alongside
+make test-e2e, but the README's Testing snippet only mentioned the last
+one. Show all three so the quick start matches make help.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+
+Claude-Session: https://claude.ai/code/session_01CWzkSsbvpHy68WHSCysExS
+---
+ README.md | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/README.md b/README.md
+index 9997cf2..0c32eac 100644
+--- a/README.md
++++ b/README.md
+@@ -29,6 +29,8 @@ bun run build
+ 
+ **Testing:**
+ ```bash
++make test      # Run all tests (unit + e2e)
++make test-unit # Run unit tests headlessly
+ make test-e2e  # Run Playwright e2e tests
+ ```
+ 
+-- 
+2.43.0
+
