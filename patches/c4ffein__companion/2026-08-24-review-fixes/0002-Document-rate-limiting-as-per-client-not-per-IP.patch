@@ -1,0 +1,40 @@
+From a548a5ce610f5669f5c161f71652da08e91fd939 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 24 Aug 2026 07:14:23 +0000
+Subject: [PATCH 2/4] Document rate limiting as per-client, not per-IP
+
+The limiter is keyed on the authenticated client id
+(_check_rate_limit(client["client_id"])), and authentication runs
+before the rate-limit check, so unauthenticated requests were never
+throttled. The README claimed per-IP limiting in two places; describe
+the actual behavior and its implications instead.
+---
+ README.md | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/README.md b/README.md
+index 689ffad..5a2eaca 100644
+--- a/README.md
++++ b/README.md
+@@ -13,7 +13,7 @@ A minimal, single-file Python tool for ephemeral file sharing on local networks.
+ - **Presentation mode**: Control what all clients see from the CLI
+ - **Shared pad**: Real-time shared text pad between all clients
+ - **CLI client**: Upload files, list files, and control previews from command line
+-- **Rate limiting**: Per-IP sliding window rate limiting on write endpoints
++- **Rate limiting**: Per-client sliding window rate limiting on write endpoints
+ - **Storage limits**: Per-client storage caps (4GB default)
+ - **Tested**: Comprehensive E2E test suite included
+ 
+@@ -175,7 +175,8 @@ The build process:
+ 
+ - Files are stored in memory without encryption (E2E encryption planned for future)
+ - Per-client Bearer token authentication with salted SHA-256 hashing (timing-attack safe)
+-- Per-IP rate limiting on write endpoints (30 requests/60s sliding window)
++- Per-client rate limiting on write endpoints (30 requests/60s sliding window, keyed by client id — all devices sharing a client id share one window)
++- Unauthenticated requests are not rate limited: rejecting them costs at most one hash, and credential brute force is impractical against the 64-hex-char generated secrets (pick long secrets if you provide your own)
+ - Per-client storage caps (4GB default)
+ - No HTTPS support (use a reverse proxy if needed)
+ - Listens dual-stack on `[::]:<port>` — reachable from both IPv4 and IPv6 clients on the LAN (falls back to IPv4-only on hosts without IPv6)
+-- 
+2.43.0
+

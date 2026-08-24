@@ -1,0 +1,169 @@
+From 124f1217951b3203266d1e06c8be6ca3bd2addfe Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 24 Aug 2026 07:14:09 +0000
+Subject: [PATCH 1/4] Fall back to IPv4-only when the host has no IPv6
+
+run_server hard-required AF_INET6: on hosts where IPv6 is entirely
+disabled (common in containers), socket creation raised
+'OSError: [Errno 97] Address family not supported by protocol' and the
+server could not start at all.
+
+Probe for AF_INET6 support at startup and bind 0.0.0.0 with AF_INET
+when it is missing, keeping dual-stack behavior everywhere else. The
+IPV6_V6ONLY sockopt is now only attempted on IPv6 sockets, and the
+startup banner reports the actual stack instead of always claiming
+IPv4+IPv6.
+---
+ README.md        |  2 +-
+ companion.py     | 31 +++++++++++++++++++++----------
+ src/companion.py | 31 +++++++++++++++++++++----------
+ 3 files changed, 43 insertions(+), 21 deletions(-)
+
+diff --git a/README.md b/README.md
+index 036a06e..689ffad 100644
+--- a/README.md
++++ b/README.md
+@@ -178,7 +178,7 @@ The build process:
+ - Per-IP rate limiting on write endpoints (30 requests/60s sliding window)
+ - Per-client storage caps (4GB default)
+ - No HTTPS support (use a reverse proxy if needed)
+-- Listens dual-stack on `[::]:<port>` — reachable from both IPv4 and IPv6 clients on the LAN
++- Listens dual-stack on `[::]:<port>` — reachable from both IPv4 and IPv6 clients on the LAN (falls back to IPv4-only on hosts without IPv6)
+ - Not intended for production or internet-facing deployments
+ - Only use on trusted networks with trusted users
+ 
+diff --git a/companion.py b/companion.py
+index bc26a39..01f2fdb 100644
+--- a/companion.py
++++ b/companion.py
+@@ -25133,17 +25133,27 @@ def run_server(port: int):
+     """Run the file sharing server"""
+ 
+     logger.debug(f"Starting server on port {port}...")
+-    logger.debug(f"Binding to [::]:{port} (dual-stack IPv4+IPv6)")
+ 
+     # Dual-stack: bind a single IPv6 socket with IPV6_V6ONLY=0 so it accepts
+     # both IPv6 clients and IPv4-mapped clients. Linux defaults to V6ONLY=0,
+     # but macOS/BSD/Windows default to 1, so we set it explicitly.
+-    server_address = ("::", port)
++    # Some hosts (e.g. containers with IPv6 disabled) cannot create an
++    # AF_INET6 socket at all — probe first and fall back to IPv4-only.
++    try:
++        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
++        ipv6_available = True
++    except OSError:
++        ipv6_available = False
++        logger.info("IPv6 unavailable on this host; falling back to IPv4 only")
++
++    server_address = ("::", port) if ipv6_available else ("0.0.0.0", port)
++    stack_label = "IPv4+IPv6" if ipv6_available else "IPv4 only"
++    logger.debug(f"Binding to {server_address[0]}:{port} ({stack_label})")
+ 
+     class FastHTTPServer(http.server.ThreadingHTTPServer):
+         """ThreadingHTTPServer that skips slow getfqdn() call during binding and ensures socket reuse"""
+ 
+-        address_family = socket.AF_INET6
++        address_family = socket.AF_INET6 if ipv6_available else socket.AF_INET
+         allow_reuse_address = True  # Enable SO_REUSEADDR for instant socket reuse
+ 
+         def server_bind(self):
+@@ -25152,11 +25162,12 @@ def run_server(port: int):
+             # Explicitly set SO_REUSEADDR to allow immediate port reuse
+             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+             # Accept both IPv6 and IPv4-mapped connections on the same socket.
+-            try:
+-                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+-            except (OSError, AttributeError):
+-                # Kernel/Python without dual-stack support; carry on as v6-only.
+-                logger.debug("IPV6_V6ONLY=0 not supported; serving IPv6 only")
++            if self.address_family == socket.AF_INET6:
++                try:
++                    self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
++                except (OSError, AttributeError):
++                    # Kernel/Python without dual-stack support; carry on as v6-only.
++                    logger.debug("IPV6_V6ONLY=0 not supported; serving IPv6 only")
+             self.socket.bind(self.server_address)
+             self.server_address = self.socket.getsockname()
+             # Skip the slow socket.getfqdn() call - just use the host directly
+@@ -25170,10 +25181,10 @@ def run_server(port: int):
+ 
+     client_count = len(ACTIVE_SERVER_CLIENTS)
+     logger.debug("Server bound successfully")
+-    logger.info(f"File sharing server running on port {port} (IPv4+IPv6)")
++    logger.info(f"File sharing server running on port {port} ({stack_label})")
+     logger.info(f"Registered clients: {client_count}")
+ 
+-    print(f"🚀 File sharing server running on port {port} (IPv4+IPv6)")
++    print(f"🚀 File sharing server running on port {port} ({stack_label})")
+     print(f"👥 Registered clients: {client_count}")
+     print(f"📝 Open http://localhost:{port} in your browser")
+     print("Press Ctrl+C to stop\n")
+diff --git a/src/companion.py b/src/companion.py
+index f463319..9e21152 100644
+--- a/src/companion.py
++++ b/src/companion.py
+@@ -1383,17 +1383,27 @@ def run_server(port: int):
+     """Run the file sharing server"""
+ 
+     logger.debug(f"Starting server on port {port}...")
+-    logger.debug(f"Binding to [::]:{port} (dual-stack IPv4+IPv6)")
+ 
+     # Dual-stack: bind a single IPv6 socket with IPV6_V6ONLY=0 so it accepts
+     # both IPv6 clients and IPv4-mapped clients. Linux defaults to V6ONLY=0,
+     # but macOS/BSD/Windows default to 1, so we set it explicitly.
+-    server_address = ("::", port)
++    # Some hosts (e.g. containers with IPv6 disabled) cannot create an
++    # AF_INET6 socket at all — probe first and fall back to IPv4-only.
++    try:
++        socket.socket(socket.AF_INET6, socket.SOCK_STREAM).close()
++        ipv6_available = True
++    except OSError:
++        ipv6_available = False
++        logger.info("IPv6 unavailable on this host; falling back to IPv4 only")
++
++    server_address = ("::", port) if ipv6_available else ("0.0.0.0", port)
++    stack_label = "IPv4+IPv6" if ipv6_available else "IPv4 only"
++    logger.debug(f"Binding to {server_address[0]}:{port} ({stack_label})")
+ 
+     class FastHTTPServer(http.server.ThreadingHTTPServer):
+         """ThreadingHTTPServer that skips slow getfqdn() call during binding and ensures socket reuse"""
+ 
+-        address_family = socket.AF_INET6
++        address_family = socket.AF_INET6 if ipv6_available else socket.AF_INET
+         allow_reuse_address = True  # Enable SO_REUSEADDR for instant socket reuse
+ 
+         def server_bind(self):
+@@ -1402,11 +1412,12 @@ def run_server(port: int):
+             # Explicitly set SO_REUSEADDR to allow immediate port reuse
+             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+             # Accept both IPv6 and IPv4-mapped connections on the same socket.
+-            try:
+-                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+-            except (OSError, AttributeError):
+-                # Kernel/Python without dual-stack support; carry on as v6-only.
+-                logger.debug("IPV6_V6ONLY=0 not supported; serving IPv6 only")
++            if self.address_family == socket.AF_INET6:
++                try:
++                    self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
++                except (OSError, AttributeError):
++                    # Kernel/Python without dual-stack support; carry on as v6-only.
++                    logger.debug("IPV6_V6ONLY=0 not supported; serving IPv6 only")
+             self.socket.bind(self.server_address)
+             self.server_address = self.socket.getsockname()
+             # Skip the slow socket.getfqdn() call - just use the host directly
+@@ -1420,10 +1431,10 @@ def run_server(port: int):
+ 
+     client_count = len(ACTIVE_SERVER_CLIENTS)
+     logger.debug("Server bound successfully")
+-    logger.info(f"File sharing server running on port {port} (IPv4+IPv6)")
++    logger.info(f"File sharing server running on port {port} ({stack_label})")
+     logger.info(f"Registered clients: {client_count}")
+ 
+-    print(f"🚀 File sharing server running on port {port} (IPv4+IPv6)")
++    print(f"🚀 File sharing server running on port {port} ({stack_label})")
+     print(f"👥 Registered clients: {client_count}")
+     print(f"📝 Open http://localhost:{port} in your browser")
+     print("Press Ctrl+C to stop\n")
+-- 
+2.43.0
+

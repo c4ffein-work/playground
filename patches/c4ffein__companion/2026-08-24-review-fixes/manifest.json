@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/companion",
+  "remote": "https://github.com/c4ffein/companion",
+  "base_branch": "main",
+  "base_sha": "0dd6c81c972d9640bfd01958c2475293db7af8b4",
+  "created": "2026-08-24",
+  "patches": 4,
+  "title": "Fall back to IPv4-only when the host has no IPv6"
+}

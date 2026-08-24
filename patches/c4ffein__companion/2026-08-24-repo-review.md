@@ -107,6 +107,41 @@ success flows elsewhere), or reword the message.
   interruption, config locking, storage limits, TLS pinning behavior — and CI
   runs it on both the dev and built artifacts across 3 OSes.
 
+## Files persistence (roadmap item) — design sketch
+
+Asked as a follow-up: "what about the files persistence?" Assessment:
+
+Ephemerality is currently a *feature* ("ephemeral by design", files gone on
+restart), so persistence must stay opt-in — a `persist-files: true` per-server
+config key (or `COMPANION_PERSIST=1`), default off.
+
+The natural shape, reusing patterns the codebase already has:
+
+- **Location**: the state dir, `servers/<name>/files/` — blobs named by
+  `file_id` (UUID, never the user filename → no traversal surface), plus a
+  `files.json` index holding what `FileEntry` holds minus `content`
+  (filename, mimetype, upload_time, client_id, size).
+- **Write path**: on upload, write blob via tempfile + `os.replace`, then
+  update the index under the same lock+atomic-write discipline as
+  `_json_file_locked`. Crash between the two leaves an orphan blob; sweep
+  blobs not in the index at startup.
+- **Read path**: the big win is to stop keeping bytes in `FILES` at all when
+  persisting — store metadata in memory, `open(blob).read()` (or better,
+  stream in chunks) on `/download`. Today every file lives in RAM
+  (4GB/client cap is a RAM cap!), so disk-backed storage *reduces* memory
+  pressure and would pave the way for Range support (the iOS-video issue in
+  finding 5).
+- **Storage accounting**: sum sizes from the index instead of
+  `len(f.content)`.
+- **Pad**: trivially persistable with the exact `clients.json` pattern;
+  preview state probably shouldn't persist (it's a live-session concept).
+
+Caveats: persistence alone doesn't fix the upload-side RAM spike —
+`_read_body` still buffers the whole request to parse multipart; streaming
+multipart is a separate, bigger change. And it interacts with two other
+roadmap items: file deletion API (needs unlink + index update) and E2E
+encryption (orthogonal — server would persist ciphertext).
+
 ## Suggested priority
 
 1. Finding 2 (IPv6-less hosts can't run the server at all) — small fix, real
