@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/companion",
+  "remote": "https://github.com/c4ffein/companion",
+  "base_branch": "6e1346e",
+  "base_sha": "6e1346e95dbabf96116aa6347dbfedf9b8f78a9d",
+  "created": "2026-08-24",
+  "patches": 1,
+  "title": "Add opt-in disk persistence for uploaded files and the shared pad"
+}

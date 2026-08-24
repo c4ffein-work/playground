@@ -1,0 +1,1103 @@
+From 6ecd4dd77da20d926fb8f00c193e7eb9b5973c31 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 24 Aug 2026 07:29:54 +0000
+Subject: [PATCH] Add opt-in disk persistence for uploaded files and the shared
+ pad
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Ephemerality stays the default and a feature; persistence is opt-in per
+server via config keys persist-files / persist-pad in the server entry,
+overridable with COMPANION_PERSIST_FILES / COMPANION_PERSIST_PAD.
+
+Files: blobs are written atomically (tempfile + os.replace) under the
+state dir at servers/<name>/files/blobs/<file_id> — UUID names only,
+never user filenames — with metadata in files/index.json. Persisted
+file content is no longer held in memory: FileEntry grows size and
+file_id fields, content becomes Optional, and /download reads the blob
+from disk, so the per-client storage cap stops doubling as a RAM cap.
+At startup the index is reloaded, entries with missing blobs are
+dropped, and orphan blobs (including stale .tmp files from interrupted
+writes) are swept.
+
+Pad: mirrored to servers/<name>/pad.json on every update (best effort —
+a failed mirror write is logged, not surfaced) and reloaded at startup.
+Preview state stays ephemeral: it is a live-session concept.
+
+All writes happen in the single server process under WORKSPACE_LOCK, so
+atomic replace is enough — no cross-process file lock like clients.json.
+
+Tests cover blob+index layout, restart survival for files and pad,
+storage accounting after reload, orphan sweep, missing-blob drop,
+ephemeral default, and env/config flag resolution.
+---
+ README.md                 |  29 +++-
+ companion.py              | 235 ++++++++++++++++++++++++++++--
+ src/companion.py          | 235 ++++++++++++++++++++++++++++--
+ tests/test_persistence.py | 290 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 767 insertions(+), 22 deletions(-)
+ create mode 100644 tests/test_persistence.py
+
+diff --git a/README.md b/README.md
+index 5a2eaca..e5387f5 100644
+--- a/README.md
++++ b/README.md
+@@ -7,6 +7,7 @@ A minimal, single-file Python tool for ephemeral file sharing on local networks.
+ - **Single file**: Just `companion.py` - easy to audit and deploy, works as both server and client
+ - **Zero dependencies**: Python 3.7+ standard library only
+ - **In-memory storage**: Ephemeral by design - files disappear on restart
++- **Optional persistence**: Opt-in disk persistence for files and the shared pad (`persist-files` / `persist-pad`)
+ - **Per-client auth**: Bearer token authentication with per-client salted SHA-256 hashing
+ - **Web interface**: Clean, responsive UI with tab navigation and auto-refresh
+ - **File preview**: Preview images, videos, audio, PDFs, and text files in-browser
+@@ -34,6 +35,30 @@ python companion.py server --port 9000
+ 
+ Open http://localhost:8080 in your browser to see the web interface.
+ 
++### Optional Persistence
++
++By default everything is ephemeral: a restart wipes uploaded files and the
++shared pad. To keep them across restarts, opt in per server — either in the
++server's config entry:
++
++```json
++"servers": { "main": { "url": "...", "persist-files": true, "persist-pad": true } }
++```
++
++or via environment variables (override config per-key):
++
++```bash
++COMPANION_PERSIST_FILES=1 COMPANION_PERSIST_PAD=1 python companion.py server
++```
++
++With `persist-files` on, uploaded blobs are stored under the state dir
++(`servers/<name>/files/blobs/<uuid>` plus a `files/index.json` metadata
++index) and file content is no longer held in memory — it is read from disk
++on download. The pad is mirrored to `servers/<name>/pad.json` on every
++update. Both are reloaded at startup; blobs with no index entry (e.g. from
++an interrupted write) are swept away. The preview state stays ephemeral —
++it is a live-session concept.
++
+ ### Add Users
+ 
+ ```bash
+@@ -173,7 +198,7 @@ The build process:
+ 
+ **⚠️ Currently, this tool is designed for temporary, trusted, local network use only.**
+ 
+-- Files are stored in memory without encryption (E2E encryption planned for future)
++- Files are stored without encryption, in memory or — with opt-in persistence — on disk under the state dir (E2E encryption planned for future)
+ - Per-client Bearer token authentication with salted SHA-256 hashing (timing-attack safe)
+ - Per-client rate limiting on write endpoints (30 requests/60s sliding window, keyed by client id — all devices sharing a client id share one window)
+ - Unauthenticated requests are not rate limited: rejecting them costs at most one hash, and credential brute force is impractical against the 64-hex-char generated secrets (pick long secrets if you provide your own)
+@@ -217,7 +242,7 @@ All authenticated endpoints require `Authorization: Bearer <client_id>:<client_s
+ - [ ] End-to-end encryption
+ - [ ] File deletion API
+ - [ ] Password-protected downloads
+-- [ ] Optional persistence (save to disk)
++- [x] Optional persistence (save to disk — files + pad, opt-in via `persist-files` / `persist-pad`)
+ - [ ] WebSocket support for real-time updates
+ - [ ] Multi-file upload support
+ - [ ] Optional FastAPI version for production use
+diff --git a/companion.py b/companion.py
+index 050e135..d6f2cbf 100644
+--- a/companion.py
++++ b/companion.py
+@@ -56,6 +56,8 @@ Example config.json (annotated; '#' marks role, strip for valid JSON):
+       "servers": {
+         "main": {
+           "url": "https://companion.example",    # both — server reads :port, client dials it
++          "persist-files": false,                # server — keep uploads on disk across restarts
++          "persist-pad": false,                  # server — keep the shared pad across restarts
+           "client-id": "admin-id",               # client — CLI's outgoing identity
+           "client-secrets": ["admin-secret"],    # client — list (newest last) for rotation
+           "cert-sha256": "ab12...<64 hex>",      # client — pin server cert (defense in depth)
+@@ -77,6 +79,8 @@ Example environment (works alongside config.json, or fully replaces it):
+     COMPANION_DEFAULT_SERVER=main                   # named server to run as
+     COMPANION_BOOTSTRAP_ADMIN=admin-id:admin-secret # seed on first boot only
+     COMPANION_CORS_ORIGIN=*                         # CORS Access-Control-Allow-Origin
++    COMPANION_PERSIST_FILES=1                       # keep uploads on disk across restarts
++    COMPANION_PERSIST_PAD=1                         # keep the shared pad across restarts
+     COMPANION_RATE_LIMIT_MAX=30                     # requests / 60s window / client
+     COMPANION_MAX_REQUEST_BODY=4294967296           # bytes; default = per-client limit
+     (TLS knobs above are per-server, so they live in config or as CLI flags:
+@@ -23935,10 +23939,12 @@ _APPLE_TOUCH_ICON_PNG = base64.b64decode(
+ @dataclass
+ class FileEntry:
+     filename: str
+-    content: bytes
++    content: Optional[bytes]  # None when the blob lives on disk (see PERSIST_FILES)
+     mimetype: str
+     upload_time: str
+     client_id: str
++    size: int
++    file_id: str
+ 
+ 
+ # In-memory file storage: {file_id (UUID): FileEntry}
+@@ -23960,6 +23966,16 @@ PREVIEW_STATE = {"file_id": None, "timestamp": 0}
+ PAD_STATE = {"content": "", "timestamp": 0}
+ PAD_MAX_SIZE = 10 * 1024 * 1024  # 10MB character limit
+ 
++# Optional persistence (opt-in — ephemerality is a feature, so default off).
++# When PERSIST_FILES is on, uploaded blobs live on disk under the state dir
++# (servers/<name>/files/blobs/<file_id>) with a files/index.json metadata
++# index, and file content is NOT kept in memory. When PERSIST_PAD is on, the
++# pad is mirrored to servers/<name>/pad.json. Both are reloaded at startup.
++# Resolved in resolve_server_config from config keys persist-files/persist-pad
++# (server entry) with env overrides COMPANION_PERSIST_FILES/COMPANION_PERSIST_PAD.
++PERSIST_FILES = False
++PERSIST_PAD = False
++
+ # Per-client storage limit
+ MAX_STORAGE_PER_CLIENT = 4 * 1024 * 1024 * 1024  # 4GB
+ 
+@@ -24049,6 +24065,144 @@ def load_clients(server_name: str) -> dict:
+     return {}
+ 
+ 
++# ─────────────────────────────────────────────────────────────────────────────
++# Optional persistence (files + pad). All writes happen under WORKSPACE_LOCK
++# (single writer: the server process), so plain tempfile + os.replace atomic
++# writes are enough — no cross-process file lock like the client database.
++# ─────────────────────────────────────────────────────────────────────────────
++
++
++def _server_state_dir() -> Path:
++    """State dir for the active server (servers/<name>/)."""
++    return get_state_dir() / "servers" / (_ACTIVE_SERVER_NAME or "default")
++
++
++def _files_blobs_dir() -> Path:
++    return _server_state_dir() / "files" / "blobs"
++
++
++def _files_index_path() -> Path:
++    return _server_state_dir() / "files" / "index.json"
++
++
++def _pad_path() -> Path:
++    return _server_state_dir() / "pad.json"
++
++
++def _atomic_write_json(path: Path, data) -> None:
++    """Write JSON via tempfile + os.replace so readers never see a partial file."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.stem + ".", suffix=".tmp")
++    try:
++        with os.fdopen(fd, "w") as f:
++            json.dump(data, f)
++        os.replace(tmp_path, str(path))
++    except OSError:
++        with contextlib.suppress(OSError):
++            os.unlink(tmp_path)
++        raise
++
++
++def _read_json_or_none(path: Path):
++    if not path.exists():
++        return None
++    try:
++        with open(path) as f:
++            return json.load(f)
++    except (json.JSONDecodeError, OSError) as e:
++        logger.warning("Failed to load %s: %s", path, e)
++        return None
++
++
++def _write_file_blob(file_id: str, content: bytes) -> None:
++    """Persist a file blob atomically as files/blobs/<file_id> (file_id is a UUID)."""
++    blobs = _files_blobs_dir()
++    blobs.mkdir(parents=True, exist_ok=True)
++    fd, tmp_path = tempfile.mkstemp(dir=str(blobs), prefix=file_id + ".", suffix=".tmp")
++    try:
++        with os.fdopen(fd, "wb") as f:
++            f.write(content)
++        os.replace(tmp_path, str(blobs / file_id))
++    except OSError:
++        with contextlib.suppress(OSError):
++            os.unlink(tmp_path)
++        raise
++
++
++def _read_file_blob(file_id: str) -> bytes:
++    with open(_files_blobs_dir() / file_id, "rb") as f:
++        return f.read()
++
++
++def _save_files_index() -> None:
++    """Write the metadata index for all persisted files. Call under WORKSPACE_LOCK."""
++    index = {
++        file_id: {
++            "filename": entry.filename,
++            "mimetype": entry.mimetype,
++            "uploaded": entry.upload_time,
++            "client_id": entry.client_id,
++            "size": entry.size,
++        }
++        for file_id, entry in FILES.items()
++    }
++    _atomic_write_json(_files_index_path(), index)
++
++
++def _save_pad() -> None:
++    """Mirror PAD_STATE to disk. Call under WORKSPACE_LOCK."""
++    _atomic_write_json(_pad_path(), {"content": PAD_STATE["content"], "timestamp": PAD_STATE["timestamp"]})
++
++
++def load_persisted_state() -> None:
++    """Reload persisted files/pad into memory at startup, per PERSIST_FILES/PERSIST_PAD.
++
++    Files: index entries whose blob is missing are dropped (with a warning);
++    blobs not in the index — including stale .tmp files from interrupted
++    writes — are deleted (orphan sweep).
++    """
++    if PERSIST_FILES:
++        index = _read_json_or_none(_files_index_path()) or {}
++        blobs_dir = _files_blobs_dir()
++        loaded = {}
++        dropped = []
++        for file_id, meta in index.items():
++            if not (blobs_dir / file_id).exists():
++                dropped.append(file_id)
++                continue
++            loaded[file_id] = FileEntry(
++                filename=meta["filename"],
++                content=None,
++                mimetype=meta["mimetype"],
++                upload_time=meta["uploaded"],
++                client_id=meta["client_id"],
++                size=meta["size"],
++                file_id=file_id,
++            )
++        with WORKSPACE_LOCK:
++            FILES.clear()
++            FILES.update(loaded)
++            if dropped:
++                logger.warning(
++                    "Dropped %d index entr%s with missing blobs", len(dropped), "y" if len(dropped) == 1 else "ies"
++                )
++                _save_files_index()
++        if blobs_dir.is_dir():
++            for stray in blobs_dir.iterdir():
++                if stray.name not in loaded:
++                    logger.warning("Removing orphan blob %s", stray)
++                    with contextlib.suppress(OSError):
++                        stray.unlink()
++        logger.info("Loaded %d persisted file(s) from %s", len(loaded), blobs_dir.parent)
++    if PERSIST_PAD:
++        pad = _read_json_or_none(_pad_path())
++        if pad is not None and isinstance(pad.get("content"), str):
++            with WORKSPACE_LOCK:
++                PAD_STATE["content"] = pad["content"]
++                PAD_STATE["timestamp"] = int(pad.get("timestamp", 0))
++            logger.info("Loaded persisted pad (%d chars)", len(pad["content"]))
++
++
+ class ConfigError(Exception):
+     """Base for all config-related errors."""
+ 
+@@ -24449,17 +24603,37 @@ def _maybe_bootstrap_admin(server_name: str) -> None:
+     logger.info("Seeded bootstrap admin '%s' for server '%s'", client_id, server_name)
+ 
+ 
++_TRUTHY_ENV = frozenset(("1", "true", "yes", "on"))
++_FALSY_ENV = frozenset(("0", "false", "no", "off"))
++
++
++def _resolve_persist_setting(env_var: str, server_config: Optional[dict], key: str) -> bool:
++    """Env var overrides the server's config key; default off."""
++    env = os.environ.get(env_var)
++    if env is not None:
++        v = env.strip().lower()
++        if v in _TRUTHY_ENV:
++            return True
++        if v in _FALSY_ENV:
++            return False
++        logger.warning("%s must be one of 1/0/true/false/yes/no/on/off — ignoring %r", env_var, env)
++    if server_config and key in server_config:
++        return bool(server_config[key])
++    return False
++
++
+ def resolve_server_config(args) -> int:
+     """Resolve the listen port for server mode and load the client database.
+ 
+-    Sets _ACTIVE_SERVER_NAME and ACTIVE_SERVER_CLIENTS. Config is optional:
+-    with no config file the server runs under the "default" server name and
+-    reads its clients from the state dir (seedable via COMPANION_BOOTSTRAP_ADMIN).
++    Sets _ACTIVE_SERVER_NAME, ACTIVE_SERVER_CLIENTS and the PERSIST_* flags.
++    Config is optional: with no config file the server runs under the "default"
++    server name and reads its clients from the state dir (seedable via
++    COMPANION_BOOTSTRAP_ADMIN).
+ 
+     Port precedence:        --port > port in server's config URL > COMPANION_PORT > 8080
+     Server-name precedence: --server > COMPANION_DEFAULT_SERVER > config default-server > "default"
+     """
+-    global _ACTIVE_SERVER_NAME, ACTIVE_SERVER_CLIENTS
++    global _ACTIVE_SERVER_NAME, ACTIVE_SERVER_CLIENTS, PERSIST_FILES, PERSIST_PAD
+     config = load_config()
+     port = getattr(args, "port", None)
+     servers = config.get("servers", {}) if config else {}
+@@ -24482,6 +24656,10 @@ def resolve_server_config(args) -> int:
+         server_name = "default"
+     _ACTIVE_SERVER_NAME = server_name
+ 
++    # Optional persistence (see PERSIST_FILES/PERSIST_PAD)
++    PERSIST_FILES = _resolve_persist_setting("COMPANION_PERSIST_FILES", server_config, "persist-files")
++    PERSIST_PAD = _resolve_persist_setting("COMPANION_PERSIST_PAD", server_config, "persist-pad")
++
+     # Port resolution
+     if port is None and server_config:
+         parsed = urllib.parse.urlparse(server_config.get("url", ""))
+@@ -24623,15 +24801,23 @@ class FileShareHandler(http.server.BaseHTTPRequestHandler):
+ 
+     def _send_file(self, entry):
+         """Send a file response with appropriate headers."""
++        content = entry.content
++        if content is None:  # persisted file — blob lives on disk
++            try:
++                content = _read_file_blob(entry.file_id)
++            except OSError as exc:
++                logger.error("Failed to read persisted blob %s: %s", entry.file_id, exc)
++                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "File content unavailable"})
++                return
+         safe_name = sanitize_filename(entry.filename)
+         utf8_name = urllib.parse.quote(entry.filename)
+         self.send_response(HTTPStatus.OK)
+         self.send_header("Content-Type", entry.mimetype)
+         self.send_header("Content-Disposition", f"inline; filename=\"{safe_name}\"; filename*=UTF-8''{utf8_name}")
+-        self.send_header("Content-Length", str(len(entry.content)))
++        self.send_header("Content-Length", str(len(content)))
+         self.send_header("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)
+         self.end_headers()
+-        self.wfile.write(entry.content)
++        self.wfile.write(content)
+ 
+     # Allowed charset for client_id: alphanumeric + hyphens (matches registration validation).
+     _VALID_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+@@ -24823,12 +25009,29 @@ class FileShareHandler(http.server.BaseHTTPRequestHandler):
+ 
+                     # Check per-client storage limit and insert atomically
+                     with WORKSPACE_LOCK:
+-                        current_usage = sum(len(f.content) for f in FILES.values() if f.client_id == client_id)
++                        current_usage = sum(f.size for f in FILES.values() if f.client_id == client_id)
+                         if current_usage + len(content) > MAX_STORAGE_PER_CLIENT:
+                             return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
+                                 "error": "Storage limit exceeded for this client"
+                             }
+-                        FILES[file_id] = FileEntry(filename, content, mimetype, upload_time, client_id)
++                        if PERSIST_FILES:
++                            # Blob to disk, metadata to the index; content stays out of memory.
++                            try:
++                                _write_file_blob(file_id, content)
++                                FILES[file_id] = FileEntry(
++                                    filename, None, mimetype, upload_time, client_id, len(content), file_id
++                                )
++                                _save_files_index()
++                            except OSError as exc:
++                                logger.error("Failed to persist upload %s: %s", file_id, exc)
++                                FILES.pop(file_id, None)
++                                with contextlib.suppress(OSError):
++                                    (_files_blobs_dir() / file_id).unlink()
++                                return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Failed to persist file"}
++                        else:
++                            FILES[file_id] = FileEntry(
++                                filename, content, mimetype, upload_time, client_id, len(content), file_id
++                            )
+ 
+                     return HTTPStatus.OK, {
+                         "success": True,
+@@ -24854,7 +25057,7 @@ class FileShareHandler(http.server.BaseHTTPRequestHandler):
+                     "id": file_id,
+                     "name": entry.filename,
+                     "normalized_name": sanitize_filename(entry.filename),
+-                    "size": len(entry.content),
++                    "size": entry.size,
+                     "mimetype": entry.mimetype,
+                     "uploaded": entry.upload_time,
+                     "uploaded_by": entry.client_id,
+@@ -24943,6 +25146,13 @@ class FileShareHandler(http.server.BaseHTTPRequestHandler):
+                 PAD_STATE["content"] = content
+                 PAD_STATE["timestamp"] = _next_timestamp(PAD_STATE["timestamp"])
+                 timestamp = PAD_STATE["timestamp"]
++                if PERSIST_PAD:
++                    # Best effort: the in-memory pad is already updated, so log
++                    # instead of failing the request if the mirror write breaks.
++                    try:
++                        _save_pad()
++                    except OSError as exc:
++                        logger.error("Failed to persist pad: %s", exc)
+ 
+             return HTTPStatus.OK, {"success": True, "timestamp": timestamp, "size": len(content)}
+ 
+@@ -25208,6 +25418,8 @@ def run_server(port: int):
+     logger.debug("Creating HTTPServer instance...")
+     httpd = FastHTTPServer(server_address, FileShareHandler)
+ 
++    load_persisted_state()
++
+     client_count = len(ACTIVE_SERVER_CLIENTS)
+     logger.debug("Server bound successfully")
+     logger.info(f"File sharing server running on port {port} ({stack_label})")
+@@ -25215,6 +25427,9 @@ def run_server(port: int):
+ 
+     print(f"🚀 File sharing server running on port {port} ({stack_label})")
+     print(f"👥 Registered clients: {client_count}")
++    if PERSIST_FILES or PERSIST_PAD:
++        persisted = "+".join(p for p, on in (("files", PERSIST_FILES), ("pad", PERSIST_PAD)) if on)
++        print(f"💾 Persistence enabled ({persisted}) — state dir: {_server_state_dir()}")
+     print(f"📝 Open http://localhost:{port} in your browser")
+     print("Press Ctrl+C to stop\n")
+ 
+diff --git a/src/companion.py b/src/companion.py
+index d4d7c25..4a9fc4b 100644
+--- a/src/companion.py
++++ b/src/companion.py
+@@ -44,6 +44,8 @@ Example config.json (annotated; '#' marks role, strip for valid JSON):
+       "servers": {
+         "main": {
+           "url": "https://companion.example",    # both — server reads :port, client dials it
++          "persist-files": false,                # server — keep uploads on disk across restarts
++          "persist-pad": false,                  # server — keep the shared pad across restarts
+           "client-id": "admin-id",               # client — CLI's outgoing identity
+           "client-secrets": ["admin-secret"],    # client — list (newest last) for rotation
+           "cert-sha256": "ab12...<64 hex>",      # client — pin server cert (defense in depth)
+@@ -65,6 +67,8 @@ Example environment (works alongside config.json, or fully replaces it):
+     COMPANION_DEFAULT_SERVER=main                   # named server to run as
+     COMPANION_BOOTSTRAP_ADMIN=admin-id:admin-secret # seed on first boot only
+     COMPANION_CORS_ORIGIN=*                         # CORS Access-Control-Allow-Origin
++    COMPANION_PERSIST_FILES=1                       # keep uploads on disk across restarts
++    COMPANION_PERSIST_PAD=1                         # keep the shared pad across restarts
+     COMPANION_RATE_LIMIT_MAX=30                     # requests / 60s window / client
+     COMPANION_MAX_REQUEST_BODY=4294967296           # bytes; default = per-client limit
+     (TLS knobs above are per-server, so they live in config or as CLI flags:
+@@ -183,10 +187,12 @@ def _load_assets():
+ @dataclass
+ class FileEntry:
+     filename: str
+-    content: bytes
++    content: Optional[bytes]  # None when the blob lives on disk (see PERSIST_FILES)
+     mimetype: str
+     upload_time: str
+     client_id: str
++    size: int
++    file_id: str
+ 
+ 
+ # In-memory file storage: {file_id (UUID): FileEntry}
+@@ -208,6 +214,16 @@ PREVIEW_STATE = {"file_id": None, "timestamp": 0}
+ PAD_STATE = {"content": "", "timestamp": 0}
+ PAD_MAX_SIZE = 10 * 1024 * 1024  # 10MB character limit
+ 
++# Optional persistence (opt-in — ephemerality is a feature, so default off).
++# When PERSIST_FILES is on, uploaded blobs live on disk under the state dir
++# (servers/<name>/files/blobs/<file_id>) with a files/index.json metadata
++# index, and file content is NOT kept in memory. When PERSIST_PAD is on, the
++# pad is mirrored to servers/<name>/pad.json. Both are reloaded at startup.
++# Resolved in resolve_server_config from config keys persist-files/persist-pad
++# (server entry) with env overrides COMPANION_PERSIST_FILES/COMPANION_PERSIST_PAD.
++PERSIST_FILES = False
++PERSIST_PAD = False
++
+ # Per-client storage limit
+ MAX_STORAGE_PER_CLIENT = 4 * 1024 * 1024 * 1024  # 4GB
+ 
+@@ -297,6 +313,144 @@ def load_clients(server_name: str) -> dict:
+     return {}
+ 
+ 
++# ─────────────────────────────────────────────────────────────────────────────
++# Optional persistence (files + pad). All writes happen under WORKSPACE_LOCK
++# (single writer: the server process), so plain tempfile + os.replace atomic
++# writes are enough — no cross-process file lock like the client database.
++# ─────────────────────────────────────────────────────────────────────────────
++
++
++def _server_state_dir() -> Path:
++    """State dir for the active server (servers/<name>/)."""
++    return get_state_dir() / "servers" / (_ACTIVE_SERVER_NAME or "default")
++
++
++def _files_blobs_dir() -> Path:
++    return _server_state_dir() / "files" / "blobs"
++
++
++def _files_index_path() -> Path:
++    return _server_state_dir() / "files" / "index.json"
++
++
++def _pad_path() -> Path:
++    return _server_state_dir() / "pad.json"
++
++
++def _atomic_write_json(path: Path, data) -> None:
++    """Write JSON via tempfile + os.replace so readers never see a partial file."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), prefix=path.stem + ".", suffix=".tmp")
++    try:
++        with os.fdopen(fd, "w") as f:
++            json.dump(data, f)
++        os.replace(tmp_path, str(path))
++    except OSError:
++        with contextlib.suppress(OSError):
++            os.unlink(tmp_path)
++        raise
++
++
++def _read_json_or_none(path: Path):
++    if not path.exists():
++        return None
++    try:
++        with open(path) as f:
++            return json.load(f)
++    except (json.JSONDecodeError, OSError) as e:
++        logger.warning("Failed to load %s: %s", path, e)
++        return None
++
++
++def _write_file_blob(file_id: str, content: bytes) -> None:
++    """Persist a file blob atomically as files/blobs/<file_id> (file_id is a UUID)."""
++    blobs = _files_blobs_dir()
++    blobs.mkdir(parents=True, exist_ok=True)
++    fd, tmp_path = tempfile.mkstemp(dir=str(blobs), prefix=file_id + ".", suffix=".tmp")
++    try:
++        with os.fdopen(fd, "wb") as f:
++            f.write(content)
++        os.replace(tmp_path, str(blobs / file_id))
++    except OSError:
++        with contextlib.suppress(OSError):
++            os.unlink(tmp_path)
++        raise
++
++
++def _read_file_blob(file_id: str) -> bytes:
++    with open(_files_blobs_dir() / file_id, "rb") as f:
++        return f.read()
++
++
++def _save_files_index() -> None:
++    """Write the metadata index for all persisted files. Call under WORKSPACE_LOCK."""
++    index = {
++        file_id: {
++            "filename": entry.filename,
++            "mimetype": entry.mimetype,
++            "uploaded": entry.upload_time,
++            "client_id": entry.client_id,
++            "size": entry.size,
++        }
++        for file_id, entry in FILES.items()
++    }
++    _atomic_write_json(_files_index_path(), index)
++
++
++def _save_pad() -> None:
++    """Mirror PAD_STATE to disk. Call under WORKSPACE_LOCK."""
++    _atomic_write_json(_pad_path(), {"content": PAD_STATE["content"], "timestamp": PAD_STATE["timestamp"]})
++
++
++def load_persisted_state() -> None:
++    """Reload persisted files/pad into memory at startup, per PERSIST_FILES/PERSIST_PAD.
++
++    Files: index entries whose blob is missing are dropped (with a warning);
++    blobs not in the index — including stale .tmp files from interrupted
++    writes — are deleted (orphan sweep).
++    """
++    if PERSIST_FILES:
++        index = _read_json_or_none(_files_index_path()) or {}
++        blobs_dir = _files_blobs_dir()
++        loaded = {}
++        dropped = []
++        for file_id, meta in index.items():
++            if not (blobs_dir / file_id).exists():
++                dropped.append(file_id)
++                continue
++            loaded[file_id] = FileEntry(
++                filename=meta["filename"],
++                content=None,
++                mimetype=meta["mimetype"],
++                upload_time=meta["uploaded"],
++                client_id=meta["client_id"],
++                size=meta["size"],
++                file_id=file_id,
++            )
++        with WORKSPACE_LOCK:
++            FILES.clear()
++            FILES.update(loaded)
++            if dropped:
++                logger.warning(
++                    "Dropped %d index entr%s with missing blobs", len(dropped), "y" if len(dropped) == 1 else "ies"
++                )
++                _save_files_index()
++        if blobs_dir.is_dir():
++            for stray in blobs_dir.iterdir():
++                if stray.name not in loaded:
++                    logger.warning("Removing orphan blob %s", stray)
++                    with contextlib.suppress(OSError):
++                        stray.unlink()
++        logger.info("Loaded %d persisted file(s) from %s", len(loaded), blobs_dir.parent)
++    if PERSIST_PAD:
++        pad = _read_json_or_none(_pad_path())
++        if pad is not None and isinstance(pad.get("content"), str):
++            with WORKSPACE_LOCK:
++                PAD_STATE["content"] = pad["content"]
++                PAD_STATE["timestamp"] = int(pad.get("timestamp", 0))
++            logger.info("Loaded persisted pad (%d chars)", len(pad["content"]))
++
++
+ class ConfigError(Exception):
+     """Base for all config-related errors."""
+ 
+@@ -697,17 +851,37 @@ def _maybe_bootstrap_admin(server_name: str) -> None:
+     logger.info("Seeded bootstrap admin '%s' for server '%s'", client_id, server_name)
+ 
+ 
++_TRUTHY_ENV = frozenset(("1", "true", "yes", "on"))
++_FALSY_ENV = frozenset(("0", "false", "no", "off"))
++
++
++def _resolve_persist_setting(env_var: str, server_config: Optional[dict], key: str) -> bool:
++    """Env var overrides the server's config key; default off."""
++    env = os.environ.get(env_var)
++    if env is not None:
++        v = env.strip().lower()
++        if v in _TRUTHY_ENV:
++            return True
++        if v in _FALSY_ENV:
++            return False
++        logger.warning("%s must be one of 1/0/true/false/yes/no/on/off — ignoring %r", env_var, env)
++    if server_config and key in server_config:
++        return bool(server_config[key])
++    return False
++
++
+ def resolve_server_config(args) -> int:
+     """Resolve the listen port for server mode and load the client database.
+ 
+-    Sets _ACTIVE_SERVER_NAME and ACTIVE_SERVER_CLIENTS. Config is optional:
+-    with no config file the server runs under the "default" server name and
+-    reads its clients from the state dir (seedable via COMPANION_BOOTSTRAP_ADMIN).
++    Sets _ACTIVE_SERVER_NAME, ACTIVE_SERVER_CLIENTS and the PERSIST_* flags.
++    Config is optional: with no config file the server runs under the "default"
++    server name and reads its clients from the state dir (seedable via
++    COMPANION_BOOTSTRAP_ADMIN).
+ 
+     Port precedence:        --port > port in server's config URL > COMPANION_PORT > 8080
+     Server-name precedence: --server > COMPANION_DEFAULT_SERVER > config default-server > "default"
+     """
+-    global _ACTIVE_SERVER_NAME, ACTIVE_SERVER_CLIENTS
++    global _ACTIVE_SERVER_NAME, ACTIVE_SERVER_CLIENTS, PERSIST_FILES, PERSIST_PAD
+     config = load_config()
+     port = getattr(args, "port", None)
+     servers = config.get("servers", {}) if config else {}
+@@ -730,6 +904,10 @@ def resolve_server_config(args) -> int:
+         server_name = "default"
+     _ACTIVE_SERVER_NAME = server_name
+ 
++    # Optional persistence (see PERSIST_FILES/PERSIST_PAD)
++    PERSIST_FILES = _resolve_persist_setting("COMPANION_PERSIST_FILES", server_config, "persist-files")
++    PERSIST_PAD = _resolve_persist_setting("COMPANION_PERSIST_PAD", server_config, "persist-pad")
++
+     # Port resolution
+     if port is None and server_config:
+         parsed = urllib.parse.urlparse(server_config.get("url", ""))
+@@ -871,15 +1049,23 @@ class FileShareHandler(http.server.BaseHTTPRequestHandler):
+ 
+     def _send_file(self, entry):
+         """Send a file response with appropriate headers."""
++        content = entry.content
++        if content is None:  # persisted file — blob lives on disk
++            try:
++                content = _read_file_blob(entry.file_id)
++            except OSError as exc:
++                logger.error("Failed to read persisted blob %s: %s", entry.file_id, exc)
++                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "File content unavailable"})
++                return
+         safe_name = sanitize_filename(entry.filename)
+         utf8_name = urllib.parse.quote(entry.filename)
+         self.send_response(HTTPStatus.OK)
+         self.send_header("Content-Type", entry.mimetype)
+         self.send_header("Content-Disposition", f"inline; filename=\"{safe_name}\"; filename*=UTF-8''{utf8_name}")
+-        self.send_header("Content-Length", str(len(entry.content)))
++        self.send_header("Content-Length", str(len(content)))
+         self.send_header("Access-Control-Allow-Origin", CORS_ALLOW_ORIGIN)
+         self.end_headers()
+-        self.wfile.write(entry.content)
++        self.wfile.write(content)
+ 
+     # Allowed charset for client_id: alphanumeric + hyphens (matches registration validation).
+     _VALID_ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+@@ -1073,12 +1259,29 @@ class FileShareHandler(http.server.BaseHTTPRequestHandler):
+ 
+                     # Check per-client storage limit and insert atomically
+                     with WORKSPACE_LOCK:
+-                        current_usage = sum(len(f.content) for f in FILES.values() if f.client_id == client_id)
++                        current_usage = sum(f.size for f in FILES.values() if f.client_id == client_id)
+                         if current_usage + len(content) > MAX_STORAGE_PER_CLIENT:
+                             return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
+                                 "error": "Storage limit exceeded for this client"
+                             }
+-                        FILES[file_id] = FileEntry(filename, content, mimetype, upload_time, client_id)
++                        if PERSIST_FILES:
++                            # Blob to disk, metadata to the index; content stays out of memory.
++                            try:
++                                _write_file_blob(file_id, content)
++                                FILES[file_id] = FileEntry(
++                                    filename, None, mimetype, upload_time, client_id, len(content), file_id
++                                )
++                                _save_files_index()
++                            except OSError as exc:
++                                logger.error("Failed to persist upload %s: %s", file_id, exc)
++                                FILES.pop(file_id, None)
++                                with contextlib.suppress(OSError):
++                                    (_files_blobs_dir() / file_id).unlink()
++                                return HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Failed to persist file"}
++                        else:
++                            FILES[file_id] = FileEntry(
++                                filename, content, mimetype, upload_time, client_id, len(content), file_id
++                            )
+ 
+                     return HTTPStatus.OK, {
+                         "success": True,
+@@ -1104,7 +1307,7 @@ class FileShareHandler(http.server.BaseHTTPRequestHandler):
+                     "id": file_id,
+                     "name": entry.filename,
+                     "normalized_name": sanitize_filename(entry.filename),
+-                    "size": len(entry.content),
++                    "size": entry.size,
+                     "mimetype": entry.mimetype,
+                     "uploaded": entry.upload_time,
+                     "uploaded_by": entry.client_id,
+@@ -1193,6 +1396,13 @@ class FileShareHandler(http.server.BaseHTTPRequestHandler):
+                 PAD_STATE["content"] = content
+                 PAD_STATE["timestamp"] = _next_timestamp(PAD_STATE["timestamp"])
+                 timestamp = PAD_STATE["timestamp"]
++                if PERSIST_PAD:
++                    # Best effort: the in-memory pad is already updated, so log
++                    # instead of failing the request if the mirror write breaks.
++                    try:
++                        _save_pad()
++                    except OSError as exc:
++                        logger.error("Failed to persist pad: %s", exc)
+ 
+             return HTTPStatus.OK, {"success": True, "timestamp": timestamp, "size": len(content)}
+ 
+@@ -1458,6 +1668,8 @@ def run_server(port: int):
+     logger.debug("Creating HTTPServer instance...")
+     httpd = FastHTTPServer(server_address, FileShareHandler)
+ 
++    load_persisted_state()
++
+     client_count = len(ACTIVE_SERVER_CLIENTS)
+     logger.debug("Server bound successfully")
+     logger.info(f"File sharing server running on port {port} ({stack_label})")
+@@ -1465,6 +1677,9 @@ def run_server(port: int):
+ 
+     print(f"🚀 File sharing server running on port {port} ({stack_label})")
+     print(f"👥 Registered clients: {client_count}")
++    if PERSIST_FILES or PERSIST_PAD:
++        persisted = "+".join(p for p, on in (("files", PERSIST_FILES), ("pad", PERSIST_PAD)) if on)
++        print(f"💾 Persistence enabled ({persisted}) — state dir: {_server_state_dir()}")
+     print(f"📝 Open http://localhost:{port} in your browser")
+     print("Press Ctrl+C to stop\n")
+ 
+diff --git a/tests/test_persistence.py b/tests/test_persistence.py
+new file mode 100644
+index 0000000..8b88462
+--- /dev/null
++++ b/tests/test_persistence.py
+@@ -0,0 +1,290 @@
++#!/usr/bin/env python3
++"""
++Unit tests for optional persistence (files + pad)
++"""
++
++import hashlib
++import json
++import secrets
++import shutil
++import sys
++import tempfile
++import threading
++import time
++import unittest
++import urllib.request
++from pathlib import Path
++from unittest.mock import patch
++
++# Import the companion module
++sys.path.insert(0, "src")
++import companion
++
++
++def _make_client_entry(client_secret, admin=True, name="test"):
++    """Create a properly hashed client entry for CLIENTS."""
++    salt = secrets.token_hex(16)
++    secret_hash = hashlib.sha256((salt + client_secret).encode()).hexdigest()
++    return {
++        "tokens": [{"salt": salt, "secret_hash": secret_hash}],
++        "admin": admin,
++        "name": name,
++        "registered": "2026-01-01T00:00:00",
++    }
++
++
++class PersistenceTestBase(unittest.TestCase):
++    """Server in a background thread with a temp state dir and persistence on."""
++
++    port = 8897
++    persist_files = True
++    persist_pad = True
++
++    @classmethod
++    def setUpClass(cls):
++        cls.client_id = "test-persist-id"
++        cls.client_secret = secrets.token_hex(32)
++        cls.auth_token = f"{cls.client_id}:{cls.client_secret}"
++        cls.base_url = f"http://localhost:{cls.port}"
++
++        # Isolated state dir + active server name for persistence paths
++        cls._tmp_dir = tempfile.mkdtemp(prefix="companion-persist-test-")
++        cls._orig_state_dir = companion.STATE_DIR
++        cls._orig_server_name = companion._ACTIVE_SERVER_NAME
++        cls._orig_persist_files = companion.PERSIST_FILES
++        cls._orig_persist_pad = companion.PERSIST_PAD
++        companion.STATE_DIR = Path(cls._tmp_dir)
++        companion._ACTIVE_SERVER_NAME = "persisttest"
++        companion.PERSIST_FILES = cls.persist_files
++        companion.PERSIST_PAD = cls.persist_pad
++
++        # Reset global state
++        companion.FILES.clear()
++        companion.PREVIEW_STATE = {"file_id": None, "timestamp": 0}
++        companion.PAD_STATE = {"content": "", "timestamp": 0}
++        companion.RATE_LIMIT_STORE.clear()
++
++        companion.ACTIVE_SERVER_CLIENTS.clear()
++        companion.ACTIVE_SERVER_CLIENTS[cls.client_id] = _make_client_entry(
++            cls.client_secret, admin=True, name="test-persist"
++        )
++
++        def run_server():
++            server_address = ("127.0.0.1", cls.port)
++            httpd = companion.http.server.HTTPServer(server_address, companion.FileShareHandler)
++            httpd.allow_reuse_address = True
++            cls.httpd = httpd
++            httpd.serve_forever()
++
++        cls.server_thread = threading.Thread(target=run_server, daemon=True)
++        cls.server_thread.start()
++        time.sleep(0.5)
++
++    @classmethod
++    def tearDownClass(cls):
++        if hasattr(cls, "httpd"):
++            cls.httpd.shutdown()
++            cls.httpd.server_close()
++        companion.STATE_DIR = cls._orig_state_dir
++        companion._ACTIVE_SERVER_NAME = cls._orig_server_name
++        companion.PERSIST_FILES = cls._orig_persist_files
++        companion.PERSIST_PAD = cls._orig_persist_pad
++        companion.FILES.clear()
++        companion.PAD_STATE = {"content": "", "timestamp": 0}
++        shutil.rmtree(cls._tmp_dir, ignore_errors=True)
++
++    def setUp(self):
++        with companion.WORKSPACE_LOCK:
++            companion.FILES.clear()
++            companion.PAD_STATE["content"] = ""
++            companion.PAD_STATE["timestamp"] = 0
++        with companion.RATE_LIMIT_LOCK:
++            companion.RATE_LIMIT_STORE.clear()
++        files_dir = companion._server_state_dir() / "files"
++        shutil.rmtree(files_dir, ignore_errors=True)
++        pad_path = companion._pad_path()
++        if pad_path.exists():
++            pad_path.unlink()
++        self.request_log = []
++        patcher = patch.object(
++            companion.FileShareHandler, "log_message", lambda self_, fmt, *a: self.request_log.append(fmt % a)
++        )
++        patcher.start()
++        self.addCleanup(patcher.stop)
++
++    def _upload(self, filename, content):
++        """Helper to upload a file via multipart"""
++        boundary = "----TestBoundary123"
++        body = (
++            (
++                f"--{boundary}\r\n"
++                f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
++                f"Content-Type: application/octet-stream\r\n\r\n"
++            ).encode()
++            + content
++            + f"\r\n--{boundary}--\r\n".encode()
++        )
++        req = urllib.request.Request(
++            f"{self.base_url}/api/upload",
++            data=body,
++            headers={
++                "Authorization": f"Bearer {self.auth_token}",
++                "Content-Type": f"multipart/form-data; boundary={boundary}",
++            },
++        )
++        return urllib.request.urlopen(req)
++
++    def _download(self, file_id):
++        req = urllib.request.Request(
++            f"{self.base_url}/download/{file_id}",
++            headers={"Authorization": f"Bearer {self.auth_token}"},
++        )
++        with urllib.request.urlopen(req) as response:
++            return response.read()
++
++    def _set_pad(self, content):
++        data = json.dumps({"content": content}).encode()
++        req = urllib.request.Request(
++            f"{self.base_url}/api/pad",
++            data=data,
++            headers={"Authorization": f"Bearer {self.auth_token}", "Content-Type": "application/json"},
++            method="POST",
++        )
++        return urllib.request.urlopen(req)
++
++    def _simulate_restart(self):
++        """Wipe in-memory state and reload from disk, as a fresh server would."""
++        with companion.WORKSPACE_LOCK:
++            companion.FILES.clear()
++            companion.PAD_STATE["content"] = ""
++            companion.PAD_STATE["timestamp"] = 0
++        companion.load_persisted_state()
++
++
++class TestFilesPersistence(PersistenceTestBase):
++    port = 8897
++
++    def test_upload_writes_blob_and_keeps_content_out_of_memory(self):
++        content = b"persist me" * 100
++        response = self._upload("keep.bin", content)
++        result = json.loads(response.read().decode())
++        file_id = result["id"]
++
++        blob = companion._files_blobs_dir() / file_id
++        self.assertTrue(blob.exists())
++        self.assertEqual(blob.read_bytes(), content)
++        self.assertIsNone(companion.FILES[file_id].content)
++        self.assertEqual(companion.FILES[file_id].size, len(content))
++        index = json.loads(companion._files_index_path().read_text())
++        self.assertEqual(index[file_id]["size"], len(content))
++
++    def test_files_survive_restart(self):
++        content = b"still here after restart"
++        response = self._upload("survivor.bin", content)
++        file_id = json.loads(response.read().decode())["id"]
++
++        self._simulate_restart()
++
++        self.assertIn(file_id, companion.FILES)
++        entry = companion.FILES[file_id]
++        self.assertEqual(entry.filename, "survivor.bin")
++        self.assertEqual(entry.size, len(content))
++        self.assertIsNone(entry.content)
++        self.assertEqual(self._download(file_id), content)
++
++    def test_storage_limit_counts_persisted_files_after_restart(self):
++        response = self._upload("counted.bin", b"z" * 700)
++        file_id = json.loads(response.read().decode())["id"]
++        self._simulate_restart()
++        with companion.WORKSPACE_LOCK:
++            usage = sum(f.size for f in companion.FILES.values() if f.client_id == self.client_id)
++        self.assertEqual(usage, 700)
++        self.assertIn(file_id, companion.FILES)
++
++    def test_orphan_blob_swept_on_restart(self):
++        response = self._upload("real.bin", b"real")
++        file_id = json.loads(response.read().decode())["id"]
++
++        blobs_dir = companion._files_blobs_dir()
++        orphan = blobs_dir / ("0" * 32)
++        orphan.write_bytes(b"orphan")
++        stale_tmp = blobs_dir / "stale.1234.tmp"
++        stale_tmp.write_bytes(b"stale")
++
++        self._simulate_restart()
++
++        self.assertFalse(orphan.exists())
++        self.assertFalse(stale_tmp.exists())
++        self.assertTrue((blobs_dir / file_id).exists())
++
++    def test_index_entry_with_missing_blob_dropped_on_restart(self):
++        response = self._upload("gone.bin", b"gone")
++        file_id = json.loads(response.read().decode())["id"]
++        (companion._files_blobs_dir() / file_id).unlink()
++
++        self._simulate_restart()
++
++        self.assertNotIn(file_id, companion.FILES)
++        index = json.loads(companion._files_index_path().read_text())
++        self.assertNotIn(file_id, index)
++
++
++class TestPadPersistence(PersistenceTestBase):
++    port = 8898
++
++    def test_pad_written_to_disk_and_survives_restart(self):
++        content = "notes to keep 📝"
++        result = json.loads(self._set_pad(content).read().decode())
++        timestamp = result["timestamp"]
++
++        pad = json.loads(companion._pad_path().read_text())
++        self.assertEqual(pad["content"], content)
++
++        self._simulate_restart()
++
++        self.assertEqual(companion.PAD_STATE["content"], content)
++        self.assertEqual(companion.PAD_STATE["timestamp"], timestamp)
++
++
++class TestPersistenceOff(PersistenceTestBase):
++    port = 8899
++    persist_files = False
++    persist_pad = False
++
++    def test_default_stays_ephemeral(self):
++        content = b"ephemeral"
++        response = self._upload("temp.bin", content)
++        file_id = json.loads(response.read().decode())["id"]
++        self._set_pad("temp pad")
++
++        # Content is in memory, nothing on disk
++        self.assertEqual(companion.FILES[file_id].content, content)
++        self.assertFalse((companion._server_state_dir() / "files").exists())
++        self.assertFalse(companion._pad_path().exists())
++
++        self._simulate_restart()
++        self.assertEqual(companion.FILES, {})
++        self.assertEqual(companion.PAD_STATE["content"], "")
++
++
++class TestPersistSettingResolution(unittest.TestCase):
++    """Env var overrides config key; default off."""
++
++    def test_resolution_precedence(self):
++        resolve = companion._resolve_persist_setting
++        with patch.dict(companion.os.environ, {}, clear=False):
++            companion.os.environ.pop("X_PERSIST", None)
++            self.assertFalse(resolve("X_PERSIST", None, "persist-files"))
++            self.assertFalse(resolve("X_PERSIST", {}, "persist-files"))
++            self.assertTrue(resolve("X_PERSIST", {"persist-files": True}, "persist-files"))
++        with patch.dict(companion.os.environ, {"X_PERSIST": "1"}):
++            self.assertTrue(resolve("X_PERSIST", None, "persist-files"))
++        with patch.dict(companion.os.environ, {"X_PERSIST": "off"}):
++            self.assertFalse(resolve("X_PERSIST", {"persist-files": True}, "persist-files"))
++        with patch.dict(companion.os.environ, {"X_PERSIST": "banana"}):
++            # Invalid env value is ignored; config still applies
++            self.assertTrue(resolve("X_PERSIST", {"persist-files": True}, "persist-files"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+

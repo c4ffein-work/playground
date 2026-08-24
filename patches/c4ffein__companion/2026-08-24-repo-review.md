@@ -109,6 +109,17 @@ success flows elsewhere), or reword the message.
 
 ## Files persistence (roadmap item) — design sketch
 
+> **Update (same day)**: prototyped as requested — files *and* pad — in the
+> `2026-08-24-persistence/` series, which stacks on top of
+> `2026-08-24-review-fixes/` (apply that first; the manifest records the
+> base). Implementation follows this sketch: opt-in `persist-files` /
+> `persist-pad` config keys with `COMPANION_PERSIST_FILES` /
+> `COMPANION_PERSIST_PAD` env overrides, UUID-named blobs +
+> `files/index.json` under the state dir, atomic writes, orphan-blob sweep
+> at startup, persisted content no longer held in RAM, pad mirrored to
+> `pad.json`, preview state deliberately ephemeral. 8 new tests; both dev
+> and built suites pass (223 tests).
+
 Asked as a follow-up: "what about the files persistence?" Assessment:
 
 Ephemerality is currently a *feature* ("ephemeral by design", files gone on
