@@ -86,7 +86,9 @@ were installed first. Verification steps:
 
 1. **Build**: configured with CMake (`BUILD_PTSCOTCH=ON`, Release) and built
    `libptscotch`; the modified file compiles with no new warnings.
-2. **Behavioral test**: wrote a small MPI program that builds a distributed
+2. **Behavioral test**: wrote a small MPI program
+   (`test_treedist.c`, in this directory, with build/run instructions in
+   its header comment) that builds a distributed
    ring graph of 16 vertices with `SCOTCH_dgraphBuild`, computes an ordering
    with the default strategy, then calls `SCOTCH_dgraphOrderCblkDist()` and
    `SCOTCH_dgraphOrderTreeDist()` and checks the invariants: every value of
