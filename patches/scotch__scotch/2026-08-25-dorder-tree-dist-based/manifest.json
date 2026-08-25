@@ -1,0 +1,9 @@
+{
+  "repo": "scotch/scotch",
+  "remote": "https://gitlab.inria.fr/scotch/scotch.git",
+  "base_branch": "master",
+  "base_sha": "92599392424321a6c5875c4f643987afa8c3c005",
+  "created": "2026-08-25",
+  "patches": 1,
+  "title": "Base the tree array returned by dorderTreeDist(), as documented"
+}
