@@ -1,0 +1,173 @@
+From 15848f8b4ca10dbc1c008204c8b6428559585e99 Mon Sep 17 00:00:00 2001
+From: c4ffein-work <c4ffein.work@gmail.com>
+Date: Mon, 21 Sep 2026 11:39:54 +0000
+Subject: [PATCH 1/4] Raise MissingOpError from the loud stubs:
+ NotImplementedError + AttributeError
+
+Keras master (3.16-dev) chooses between a backend op and its own
+backend-agnostic fallback with `hasattr(backend.ops.numpy, "copysign")`,
+`hasattr(backend.ops.math, "lgamma")`, `hasattr(backend.ops.nn,
+"rms_normalization")`, ... (#23643 and friends). `hasattr` only swallows
+AttributeError, so the PEP 562 stubs' plain NotImplementedError escaped
+the probe and would fail even the ops keras can compute without us.
+
+`core.MissingOpError` subclasses both: a direct call stays loud (no
+silent fallback, ever), a probe sees absence. The five stub modules raise
+it; nothing else changes on keras 3.15.x, where no probe exists.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C81VdRop6BGDx986cZKWmo
+---
+ src/keras_tinygrad/_backend/core.py   | 16 ++++++++++++++++
+ src/keras_tinygrad/_backend/image.py  |  6 ++++--
+ src/keras_tinygrad/_backend/linalg.py |  5 ++++-
+ src/keras_tinygrad/_backend/math.py   |  5 ++++-
+ src/keras_tinygrad/_backend/nn.py     |  5 ++++-
+ src/keras_tinygrad/_backend/numpy.py  |  7 +++++--
+ 6 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/src/keras_tinygrad/_backend/core.py b/src/keras_tinygrad/_backend/core.py
+index 1f4f76b..1731fb9 100644
+--- a/src/keras_tinygrad/_backend/core.py
++++ b/src/keras_tinygrad/_backend/core.py
+@@ -19,6 +19,22 @@ from keras.src.backend.common.stateless_scope import StatelessScope
+ from keras.src.backend.common.symbolic_scope import SymbolicScope
+ 
+ SUPPORTS_SPARSE_TENSORS = False
++
++
++class MissingOpError(NotImplementedError, AttributeError):
++    """Raised by the backend modules' PEP 562 ``__getattr__`` for an op that
++    is not implemented.
++
++    It IS a ``NotImplementedError``, so a direct call stays loud (no silent
++    fallback, ever). It is ALSO an ``AttributeError``, so ``hasattr(module,
++    name)`` / ``getattr(module, name, default)`` report absence instead of
++    crashing the probe: keras master (3.16-dev) checks
++    ``hasattr(backend.ops.numpy, "copysign")`` and friends before choosing
++    between the backend's op and its own backend-agnostic fallback, and a
++    plain ``NotImplementedError`` escaping that probe would fail even the
++    ops keras could have computed without us.
++    """
++
+ SUPPORTS_RAGGED_TENSORS = False
+ SUPPORTS_COMPLEX_DTYPES = False
+ IS_THREAD_SAFE = True
+diff --git a/src/keras_tinygrad/_backend/image.py b/src/keras_tinygrad/_backend/image.py
+index 65f128e..7764564 100644
+--- a/src/keras_tinygrad/_backend/image.py
++++ b/src/keras_tinygrad/_backend/image.py
+@@ -23,8 +23,8 @@ from tinygrad import Tensor
+ from tinygrad import dtypes as tg_dtypes
+ 
+ from keras.src import backend
++from keras.src.backend.tinygrad.core import MissingOpError
+ from keras.src.backend.tinygrad.core import convert_to_numpy
+-from keras.src.random.seed_generator import draw_seed
+ from keras.src.backend.tinygrad.core import convert_to_tensor
+ from keras.src.backend.tinygrad.core import to_keras_dtype
+ from keras.src.backend.tinygrad.core import to_tinygrad_dtype
+@@ -1236,6 +1236,8 @@ def sobel_edges(images, data_format=None):
+ def __getattr__(name):
+     if name.startswith("__") and name.endswith("__"):
+         raise AttributeError(name)
+-    raise NotImplementedError(
++    # NotImplementedError AND AttributeError: loud when called, absent when
++    # probed with hasattr (see core.MissingOpError).
++    raise MissingOpError(
+         f"tinygrad backend: `keras.ops.image.{name}` is not implemented yet"
+     )
+diff --git a/src/keras_tinygrad/_backend/linalg.py b/src/keras_tinygrad/_backend/linalg.py
+index 6e17dbe..7bb74fb 100644
+--- a/src/keras_tinygrad/_backend/linalg.py
++++ b/src/keras_tinygrad/_backend/linalg.py
+@@ -21,6 +21,7 @@ import warnings
+ from tinygrad import Tensor
+ from tinygrad import dtypes
+ 
++from keras.src.backend.tinygrad.core import MissingOpError
+ from keras.src.backend.tinygrad.core import convert_to_tensor
+ from keras.src.backend.tinygrad.core import to_keras_dtype
+ from keras.src.backend.tinygrad.numpy import _float
+@@ -784,6 +785,8 @@ def jvp(fun, primals, tangents, has_aux=False):
+ def __getattr__(name):
+     if name.startswith("__") and name.endswith("__"):
+         raise AttributeError(name)
+-    raise NotImplementedError(
++    # NotImplementedError AND AttributeError: loud when called, absent when
++    # probed with hasattr (see core.MissingOpError).
++    raise MissingOpError(
+         f"tinygrad backend: `keras.ops.linalg.{name}` is not implemented yet"
+     )
+diff --git a/src/keras_tinygrad/_backend/math.py b/src/keras_tinygrad/_backend/math.py
+index 464211b..b36aa27 100644
+--- a/src/keras_tinygrad/_backend/math.py
++++ b/src/keras_tinygrad/_backend/math.py
+@@ -11,6 +11,7 @@ from tinygrad import dtypes as _tg_dtypes
+ 
+ from keras.src.backend import standardize_dtype
+ from keras.src.backend.common.dtypes import result_type
++from keras.src.backend.tinygrad.core import MissingOpError
+ from keras.src.backend.tinygrad.core import convert_to_tensor
+ from keras.src.backend.tinygrad.core import to_keras_dtype
+ from keras.src.backend.tinygrad.core import to_tinygrad_dtype
+@@ -523,6 +524,8 @@ def istft(
+ def __getattr__(name):
+     if name.startswith("__") and name.endswith("__"):
+         raise AttributeError(name)
+-    raise NotImplementedError(
++    # NotImplementedError AND AttributeError: loud when called, absent when
++    # probed with hasattr (see core.MissingOpError).
++    raise MissingOpError(
+         f"tinygrad backend: `keras.ops.{name}` is not implemented yet"
+     )
+diff --git a/src/keras_tinygrad/_backend/nn.py b/src/keras_tinygrad/_backend/nn.py
+index ad9deef..053fa6d 100644
+--- a/src/keras_tinygrad/_backend/nn.py
++++ b/src/keras_tinygrad/_backend/nn.py
+@@ -17,6 +17,7 @@ from keras.src.backend.common.backend_utils import (
+     compute_conv_transpose_output_crops_for_torch,
+ )
+ from keras.src.backend.common.dtypes import result_type
++from keras.src.backend.tinygrad.core import MissingOpError
+ from keras.src.backend.tinygrad.core import convert_to_tensor
+ from keras.src.backend.tinygrad.core import to_keras_dtype
+ from keras.src.backend.tinygrad.core import to_tinygrad_dtype
+@@ -1307,6 +1308,8 @@ def ctc_decode(
+ def __getattr__(name):
+     if name.startswith("__") and name.endswith("__"):
+         raise AttributeError(name)
+-    raise NotImplementedError(
++    # NotImplementedError AND AttributeError: loud when called, absent when
++    # probed with hasattr (see core.MissingOpError).
++    raise MissingOpError(
+         f"tinygrad backend: `keras.ops.{name}` is not implemented yet"
+     )
+diff --git a/src/keras_tinygrad/_backend/numpy.py b/src/keras_tinygrad/_backend/numpy.py
+index 80ddb2d..5b4e014 100644
+--- a/src/keras_tinygrad/_backend/numpy.py
++++ b/src/keras_tinygrad/_backend/numpy.py
+@@ -18,8 +18,9 @@ from keras.src import tree
+ from keras.src.backend.common import standardize_dtype
+ from keras.src.backend.common.dtypes import result_type
+ from keras.src.backend.config import floatx
+-from keras.src.backend.tinygrad.core import _COMPLEX_INTEROP_MSG
+ from keras.src.backend.tinygrad.core import ComplexTensor
++from keras.src.backend.tinygrad.core import MissingOpError
++from keras.src.backend.tinygrad.core import _COMPLEX_INTEROP_MSG
+ from keras.src.backend.tinygrad.core import convert_to_tensor
+ from keras.src.backend.tinygrad.core import to_keras_dtype
+ from keras.src.backend.tinygrad.core import to_tinygrad_dtype
+@@ -3099,6 +3100,8 @@ def isreal(x):
+ def __getattr__(name):
+     if name.startswith("__") and name.endswith("__"):
+         raise AttributeError(name)
+-    raise NotImplementedError(
++    # NotImplementedError AND AttributeError: loud when called, absent when
++    # probed with hasattr (see core.MissingOpError).
++    raise MissingOpError(
+         f"tinygrad backend: `keras.ops.{name}` is not implemented yet"
+     )
+-- 
+2.43.0
+

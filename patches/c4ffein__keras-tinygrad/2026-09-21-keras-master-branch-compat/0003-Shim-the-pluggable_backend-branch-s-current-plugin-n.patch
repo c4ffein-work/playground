@@ -1,0 +1,56 @@
+From 8a526bc4eaaa4d2319ce68496314aebe5d467d20 Mon Sep 17 00:00:00 2001
+From: c4ffein-work <c4ffein.work@gmail.com>
+Date: Mon, 21 Sep 2026 11:39:54 +0000
+Subject: [PATCH 3/4] Shim: the pluggable_backend branch's current plugin names
+
+keras@pluggable_backend (head 60be5d35, 2026-09-17) resolves a plugin's
+layer / export modules with `find_spec` and reads fixed attribute names:
+`getattr(keras_<name>.src.layer, "BackendLayer")` and
+`getattr(keras_<name>.src.export, "SavedModelExportArchive")`; a missing
+module falls back to an empty BackendLayer / the
+BaseSavedModelExportArchive. The shim exported `Layer` / `TinygradLayer`
+and `ExportArchive` / `TinygradExportArchive`, so both getattrs failed
+at `import keras` on the branch.
+
+`BackendLayer` is added next to the older names. `src/export.py` is
+removed instead of renamed: keras-openvino and keras-mlx (the split-out
+reference packages) ship no export module either, and the base fallback
+raises the same loud NotImplementedError for both backend hooks that the
+tinygrad archive did. The stock (hook) path is untouched: it serves
+`_backend/export.py`, not the shim.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01C81VdRop6BGDx986cZKWmo
+---
+ src/keras_tinygrad/src/export.py | 6 ------
+ src/keras_tinygrad/src/layer.py  | 4 ++++
+ 2 files changed, 4 insertions(+), 6 deletions(-)
+ delete mode 100644 src/keras_tinygrad/src/export.py
+
+diff --git a/src/keras_tinygrad/src/export.py b/src/keras_tinygrad/src/export.py
+deleted file mode 100644
+index ff2e66b..0000000
+--- a/src/keras_tinygrad/src/export.py
++++ /dev/null
+@@ -1,6 +0,0 @@
+-import keras_tinygrad.src  # noqa: F401 -- registers the backend alias
+-
+-from keras.src.backend.tinygrad.export import (  # noqa: F401
+-    ExportArchive,  # noqa: F401
+-    TinygradExportArchive,
+-)
+diff --git a/src/keras_tinygrad/src/layer.py b/src/keras_tinygrad/src/layer.py
+index e195b28..f17258e 100644
+--- a/src/keras_tinygrad/src/layer.py
++++ b/src/keras_tinygrad/src/layer.py
+@@ -4,3 +4,7 @@ from keras.src.backend.tinygrad.layer import (
+     Layer,  # noqa: F401
+     TinygradLayer,  # noqa: F401
+ )
++
++# Current pluggable_backend protocol (keras/src/layers/layer.py on the branch
++# does `getattr(keras_<name>.src.layer, "BackendLayer")`).
++BackendLayer = TinygradLayer
+-- 
+2.43.0
+
