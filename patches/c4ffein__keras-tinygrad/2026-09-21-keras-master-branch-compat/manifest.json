@@ -4,6 +4,6 @@
   "base_branch": "main",
   "base_sha": "cf75be85ecc2847289ae2fd55a7a0c5df3042c52",
   "created": "2026-09-21",
-  "patches": 4,
+  "patches": 5,
   "title": "Raise MissingOpError from the loud stubs: NotImplementedError + AttributeError"
 }

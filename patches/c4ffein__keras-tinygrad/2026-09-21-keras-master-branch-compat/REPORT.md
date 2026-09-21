@@ -73,9 +73,9 @@ trees (no pilot re-run on the branch). The v3.15.1 tag was fetched for the
    present the attribute names are **`BackendLayer`** and
    **`SavedModelExportArchive`**. The shim exported `Layer`/`TinygradLayer`
    and `ExportArchive`/`TinygradExportArchive` → both `getattr`s would fail
-   at `import keras`. **Fixed** (patch 3): `BackendLayer` added,
-   `src/export.py` removed (neither reference package ships one; the base
-   fallback raises the same loud error).
+   at `import keras`. **Fixed** (patch 3 removed the shim's export module;
+   patch 5 then makes the real `export.py` carry a guarded
+   `SavedModelExportArchive`, and `layer.py` a `BackendLayer`).
 4. Test exclusions: per-package `excluded_tests.txt` of exact pytest node
    ids at the repo root, read by keras' conftest only for a checked-out
    backend (#23671). Same idea as `scripts/referee-baseline.txt`, opposite
@@ -99,6 +99,7 @@ trees (no pilot re-run on the branch). The v3.15.1 tag was fetched for the
 | 2 | `0002-Add-copysign-float_power-cov-lgamma-gammainc…` | The five master ops + `tests/test_ops_beyond_pin.py` (keras master's own test cases, gradient receipts, the MissingOpError contract). |
 | 3 | `0003-Shim-the-pluggable_backend-branch-s-current-plugin-names` | `BackendLayer`; `src/export.py` deleted. |
 | 4 | `0004-docs-keras-master-3.16-dev-and-pluggable_backend-status…` | `docs/upstream/keras-master-and-branch-status-2026-09-21.md`, HANDOFF remainder 9, a pointer in the pilot report. |
+| 5 | `0005-Restructure-into-the-pluggable-backend-package-shape…` | Backend sources moved to `keras_tinygrad/src/` with an `ops/` subpackage; shim deleted; loader reduced to its six patches, which now import `keras_tinygrad.src` directly (no alias); packaging, CI, tests, docs follow. |
 
 Implementation notes worth knowing before touching the ops again (all in
 the commit messages and code comments too):
@@ -126,13 +127,68 @@ the commit messages and code comments too):
 - numpy float64 inputs compute in float32 per the backend's documented
   promotion policy (`docs/float64-promotion.md`); the new ops follow it.
 
+### Patch 5: the restructure (why and how)
+
+Asked after the first four: "keras-openvino already has the shape the
+branch expects — why don't we?" No reason not to. The layout work is
+independent of the 3.15 pin, and it removes a layer:
+
+- `src/keras_tinygrad/src/` is now the backend, in the reference layout:
+  `ops/{core,image,linalg,math,nn,numpy}.py`, `random.py`, `rnn.py`,
+  `trainer.py`, `layer.py`, `export.py`. `Variable` stays in `ops/core.py`
+  (that is where keras' in-tree backends keep it; keras-openvino's separate
+  `variable.py` is that package's choice, not protocol).
+- The package `__init__` exports BOTH spellings: the `ops` subpackage
+  (`backend.ops.numpy.x`, keras ≥ 3.16) and the flat module names
+  (`backend.numpy.x`, keras 3.15.x). One package serves both.
+- The aliasing shim (`keras_tinygrad/src/__init__.py` registering
+  `_backend` under `keras.src.backend.tinygrad`) is gone, and so is the
+  loader's alias-serving branch. The six patches import
+  `keras_tinygrad.src` directly — exactly what the branch resolves for
+  `keras_<name>.src`. Verified premise: keras 3.15.1 never builds a backend
+  module name dynamically (no `f"keras.src.backend.{backend()}"` anywhere
+  in `keras/src`), so the six patched import sites are the only places the
+  backend is named. `keras.src.backend.tinygrad` no longer exists; the
+  loader test asserts it and asserts module identity for all six ops
+  modules under both spellings.
+- `src/export.py` is back (it is the real module now) and carries a
+  guarded `SavedModelExportArchive` for the branch protocol: subclass of
+  `BaseSavedModelExportArchive` when that base is importable (branch),
+  absent on 3.15.x where keras subclasses `TinygradExportArchive` itself.
+- Entry point → `keras_tinygrad.src`; `package-data` for `_backend` gone
+  (the wheel now ships 18 modules, checked); ruff exclusion moved to
+  `src/keras_tinygrad/src` (backend sources stay unformatted, 80 cols).
+- One trap worth knowing: `ops/__init__.py` must star-import `core` FIRST
+  and then bind the submodules with plain `import keras_tinygrad.src.ops.x`
+  statements. `core` has a bare `import math`, the star import re-exports
+  it as `ops.math`, and a later `from keras_tinygrad.src.ops import math`
+  returns that stdlib attribute WITHOUT loading the submodule. The plain
+  import form loads it and rebinds the attribute. (keras' in-tree `core`
+  has no such import, which is why their order is the other way round.)
+- Docs updated in the same diff, per the architecture maintenance rule:
+  README, CLAUDE.md, CONTRIBUTING, HANDOFF, how-it-works (hook now does
+  one thing), architecture, the status note (§2.1 is done; only the
+  `DynamicBackend` anchor is left for 3.16), path mentions elsewhere.
+  `FABLE_ANALYSIS/` is left as the historical snapshot it is.
+
 ## Verification (2026-09-21, python 3.11.15, clang, `uv sync` in the clone)
 
-- `make verify`: ruff check + format clean; **48 passed in 74 s** (was 22
-  in 37 s — the new module is ~48 s, dominated by the gammainc gradient
-  compile).
+After all five patches:
+
+- `make verify`: ruff check + format clean; **48 passed in ~75 s** (was 22
+  in 37 s — the new ops module is ~48 s, dominated by the gammainc
+  gradient compile).
 - `make smoke`: SMOKE OK. `make vendor-check`: all six anchors match the
-  installed keras 3.15.1 exactly once.
+  installed keras 3.15.1 exactly once. `make readme-check`, `make tutorial`
+  (the executable TUTORIAL.md, training included) and the CI byte-compile
+  step: green — see the chat log / re-run them.
+- Branch-style import without the hook (`KERAS_BACKEND=numpy
+  KERAS_TINYGRAD_NO_HOOK=1 python -c "import keras, keras_tinygrad.src"`):
+  the protocol surface loads and exposes `ops`, `Variable`,
+  `trainer.Trainer`, `layer.BackendLayer`. A real branch run still needs
+  `tinygrad` in the branch's `_PLUGGABLE_BACKENDS` (the pilot's patch).
+- `uv build --wheel`: 18 modules under `keras_tinygrad/`, entry point
+  `tinygrad = keras_tinygrad.src`.
 - Not run: `make referee` (~25 min, needs tensorflow for collection),
   `make tutorial`, `make fuzz`. The new ops are not on any layer's path,
   and the MissingOpError change only alters the exception type of a
@@ -141,9 +197,9 @@ the commit messages and code comments too):
 
 ## Not done, deliberately
 
-- The 3.16 hook work (`ops/` layout + the `backend_utils` anchor): wait for
-  the release; it is the same restructure `keras_tinygrad/src/__init__.py`
-  calls "the planned full restructure".
+- The drifted `DynamicBackend` anchor in `utils/backend_utils.py`: a
+  one-line replacement once 3.16 is released and the pin moves. The `ops/`
+  layout half of the 3.16 work is done (patch 5).
 - Anything keras-side on the branch (`_PLUGGABLE_BACKENDS`,
   `standardize_dtype`): issue material, not package patches.
 - `unique` / `vectorize`: still the owner's decision items; master calls

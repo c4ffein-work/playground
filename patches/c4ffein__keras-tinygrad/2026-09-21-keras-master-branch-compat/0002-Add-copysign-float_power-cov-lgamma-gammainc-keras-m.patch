@@ -1,7 +1,7 @@
 From 9a7500ebaac245b1c67eb3b05c6f3faf8fc9bc52 Mon Sep 17 00:00:00 2001
 From: c4ffein-work <c4ffein.work@gmail.com>
 Date: Mon, 21 Sep 2026 11:39:54 +0000
-Subject: [PATCH 2/4] Add copysign, float_power, cov, lgamma, gammainc (keras
+Subject: [PATCH 2/5] Add copysign, float_power, cov, lgamma, gammainc (keras
  master ops)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

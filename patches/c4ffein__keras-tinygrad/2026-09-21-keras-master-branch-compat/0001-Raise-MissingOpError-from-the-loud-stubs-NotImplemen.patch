@@ -1,7 +1,7 @@
 From 15848f8b4ca10dbc1c008204c8b6428559585e99 Mon Sep 17 00:00:00 2001
 From: c4ffein-work <c4ffein.work@gmail.com>
 Date: Mon, 21 Sep 2026 11:39:54 +0000
-Subject: [PATCH 1/4] Raise MissingOpError from the loud stubs:
+Subject: [PATCH 1/5] Raise MissingOpError from the loud stubs:
  NotImplementedError + AttributeError
 
 Keras master (3.16-dev) chooses between a backend op and its own

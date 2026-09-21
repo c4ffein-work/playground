@@ -1,7 +1,7 @@
 From 9e3925e5e1832389773fe8c86dfa5d2e90a0ce33 Mon Sep 17 00:00:00 2001
 From: c4ffein-work <c4ffein.work@gmail.com>
 Date: Mon, 21 Sep 2026 11:39:54 +0000
-Subject: [PATCH 4/4] docs: keras master (3.16-dev) and pluggable_backend
+Subject: [PATCH 4/5] docs: keras master (3.16-dev) and pluggable_backend
  status, 2026-09-21
 
 Static comparison of keras master c6a3b948, the pluggable_backend branch
