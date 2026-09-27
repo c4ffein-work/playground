@@ -1,0 +1,1577 @@
+From b3abc77dc9ebc84891ec685424bfd96c320273ca Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Sun, 27 Sep 2026 11:48:15 +0000
+Subject: [PATCH 3/3] Narration plugin: audio per slide, per language and
+ variant, from any static server
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+resources/narration.js (+ narration.css) is a reveal plugin. A slide embeds
+the NAME of a recording in a tag — data-narration="<name>" on the section,
+on any element inside it, or on a fragment (played when it shows) — and the
+plugin plays <base>/<name>.<lang>[.<variant>].<format>, trying the deck's
+variant first and falling back to the plain file, so a deck can re-record a
+few slides and share the rest. Slides are not named: the name is the
+recording's and goes with the slide into every deck it is built into.
+
+A floating panel (draggable by its header, collapsible, place and language
+remembered in localStorage) carries the language buttons, play / pause, a
+seek bar and `auto` — "hear me talk": every recording ends on Reveal.next(),
+a slide without one lasts `silentDelay` ms, and auto stops on the last
+slide. Keys pressed in the panel never reach the deck. Configured in
+Reveal.initialize({ narration: { base, langs, lang, variant, format,
+silentDelay, auto, panel } }); base null = plugin off;
+?narration=<base>&lang=en&variant=x override without rebuilding.
+
+src/slides/mental-model-llm.html names its 34 recordings
+mental-model/<slug> and mental-model-of-llms.html loads the plugin with
+base null (set it, or try a server with ?narration=). claude-on-scotch
+rebuilds with the attributes, its e2e golden is unchanged.
+
+tests/e2e/narration.test.js drives a fixture deck against silent WAVs the
+test server makes up: variant fallback, auto mode through fragments and a
+silent slide, language switch, play on one slide, the panel's drag /
+collapse / persistence. tests/e2e/server.js is the static server both e2e
+files share.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QQHyq5ywP1n6qJNJS1Ajrz
+---
+ README.md                                   |  17 ++
+ resources/narration.css                     |  33 +++
+ resources/narration.js                      | 243 ++++++++++++++++++++
+ slides/claude-on-scotch.html                |  68 +++---
+ slides/mental-model-of-llms.html            |  76 +++---
+ src/presentations/mental-model-of-llms.html |   8 +-
+ src/slides/mental-model-llm.html            |  68 +++---
+ tests/e2e/decks.test.js                     |  15 +-
+ tests/e2e/fixtures/narration.html           |  33 +++
+ tests/e2e/narration.test.js                 | 101 ++++++++
+ tests/e2e/server.js                         |  36 +++
+ 11 files changed, 581 insertions(+), 117 deletions(-)
+ create mode 100644 resources/narration.css
+ create mode 100644 resources/narration.js
+ create mode 100644 tests/e2e/fixtures/narration.html
+ create mode 100644 tests/e2e/narration.test.js
+ create mode 100644 tests/e2e/server.js
+
+diff --git a/README.md b/README.md
+index 815c922..c2de2da 100644
+--- a/README.md
++++ b/README.md
+@@ -31,6 +31,23 @@ an error naming the path. `make build` writes `slides/`, `make check` (in
+ CI) fails if it is not current. `make` lists every target — each one is a
+ bun one-liner from `package.json`, so `bun run build` works without make.
+ 
++## Narration (audio per slide)
++`resources/narration.js` is a reveal plugin that plays a recording per slide,
++in the viewer's language, from any static file server. A slide embeds the
++NAME of a recording in a tag — `data-narration="<name>"` on the section, on
++any element inside it, or on a fragment — and the plugin plays
++`<base>/<name>.<lang>[.<variant>].mp3`, trying the deck's variant first and
++falling back to the plain file — so a deck can re-record a few slides and
++share the rest. Slides are not named: the name is the recording's, it goes
++with the slide into every deck it is built into (the recordings of
++`src/slides/mental-model-llm.html` are `mental-model/<slug>`).
++The floating panel (draggable, collapsible, place remembered) has the
++language buttons, play / pause, a seek bar and `auto` = "hear me talk": each
++recording ends on `Reveal.next()`, a slide without one lasts `silentDelay`.
++Configure it in the deck's `Reveal.initialize` (`narration: { base, langs,
++variant, … }`, see the header of narration.js); `?narration=<base>&lang=en&variant=x`
++overrides without rebuilding.
++
+ ## Tests
+ `make test` = unit tests of the builder + `tests/e2e/` (every built deck
+ opened in headless Chromium and compared to a structure golden, see
+diff --git a/resources/narration.css b/resources/narration.css
+new file mode 100644
+index 0000000..b2fef4c
+--- /dev/null
++++ b/resources/narration.css
+@@ -0,0 +1,33 @@
++/* narration.css — the floating panel of resources/narration.js */
++.nar-panel {
++  position: fixed; right: 16px; bottom: 16px; z-index: 1000; width: 270px;
++  background: rgba(22, 22, 24, 0.94); color: #ececec;
++  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
++  border-radius: 10px; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
++  user-select: none; -webkit-user-select: none;
++}
++.nar-head {
++  display: flex; align-items: center; justify-content: space-between;
++  padding: 7px 10px; cursor: grab; border-bottom: 1px solid rgba(255, 255, 255, 0.08);
++  touch-action: none;
++}
++.nar-head:active { cursor: grabbing; }
++.nar-title { font-weight: 600; letter-spacing: 0.02em; }
++.nar-panel button {
++  font: inherit; color: inherit; background: rgba(255, 255, 255, 0.08);
++  border: 0; border-radius: 6px; padding: 4px 9px; cursor: pointer;
++}
++.nar-panel button:hover { background: rgba(255, 255, 255, 0.16); }
++.nar-panel button.nar-on { background: #e0a030; color: #111; }
++.nar-collapse { padding: 2px 8px; }
++.nar-body { padding: 8px 10px 10px; }
++.nar-collapsed .nar-body { display: none; }
++.nar-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
++.nar-row:first-child { margin-top: 0; }
++.nar-langs { flex-wrap: wrap; }
++.nar-play { min-width: 36px; text-align: center; }
++.nar-bar { flex: 1; height: 8px; background: rgba(255, 255, 255, 0.12); border-radius: 4px; cursor: pointer; overflow: hidden; }
++.nar-fill { height: 100%; width: 0; background: #e0a030; }
++.nar-time { font-variant-numeric: tabular-nums; min-width: 78px; text-align: right; opacity: 0.85; }
++.nar-auto { display: flex; align-items: center; gap: 5px; cursor: pointer; }
++.nar-status { flex: 1; text-align: right; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+diff --git a/resources/narration.js b/resources/narration.js
+new file mode 100644
+index 0000000..4f9cde5
+--- /dev/null
++++ b/resources/narration.js
+@@ -0,0 +1,243 @@
++/* narration.js — reveal.js plugin: per-slide audio narration, in several
++ * languages and variants, served as plain files from any static server.
++ *
++ * A slide embeds the NAME OF A RECORDING in a tag — on the section, on any
++ * element inside it, or on a fragment (played when the fragment shows):
++ *   <section data-narration="mental-model/gpt-2">…</section>
++ *   <section>… <span data-narration="mental-model/gpt-2" hidden></span> …</section>
++ *   <p class="fragment" data-narration="mental-model/gpt-2-more">…</p>
++ * Slides themselves are not named: the name is the recording's, it goes
++ * with the slide into every deck it is built into, and two slides may share
++ * one. The plugin plays
++ *   <base>/<name>.<lang>[.<variant>].<format>
++ * trying the variant file first (when the deck asks for one) and falling back
++ * to the plain one: a deck can carry a few re-recorded slides and share the
++ * rest. A slide without a recording is "silent": in auto mode the deck moves
++ * on after `silentDelay` ms.
++ *
++ * In the deck:
++ *   <link rel="stylesheet" href="../resources/narration.css">
++ *   <script src="../resources/narration.js"></script>
++ *   Reveal.initialize({
++ *     narration: {
++ *       base: "https://audio.example.org/presentations",   // null = plugin off
++ *       langs: ["fr", "en"],   // buttons, first = default (a viewer's choice is remembered)
++ *       lang: null,            // force the initial language
++ *       variant: null,         // e.g. "inria": try <name>.fr.inria.mp3 before <name>.fr.mp3
++ *       format: "mp3",
++ *       silentDelay: 1500,     // ms spent on a slide without recording in auto mode
++ *       auto: false,           // start in auto ("hear me talk") mode
++ *       panel: true            // the floating panel (draggable, collapsible, position remembered)
++ *     },
++ *     plugins: [ …, RevealNarration ]
++ *   });
++ * URL overrides, handy to try a server or a variant without rebuilding:
++ *   ?narration=<base>&lang=en&variant=inria
++ *
++ * API (deck.getPlugin("narration")): play(), pause(), toggle(), setAuto(bool),
++ * setLang(l), setVariant(v | null), state().
++ */
++(function () {
++  var PANEL_KEY = "narration.panel", LANG_KEY = "narration.lang";
++
++  function store(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {} }
++  function load(key) { try { return JSON.parse(localStorage.getItem(key)); } catch (e) { return null; } }
++  function fmt(t) { t = Math.max(0, Math.floor(t || 0)); return Math.floor(t / 60) + ":" + String(t % 60).padStart(2, "0"); }
++  function h(tag, cls, text) { var el = document.createElement(tag); if (cls) el.className = cls; if (text != null) el.textContent = text; return el; }
++
++  function RevealNarration() {
++    var deck, cfg, audio, ui = null, silentTimer = null, token = 0, wantPlay = false;
++    var st = { lang: null, variant: null, auto: false, id: null, src: null, status: "idle", attempts: [], history: [] };
++
++    function init(d) {
++      deck = d;
++      var c = Object.assign({ base: null, langs: ["fr"], lang: null, variant: null, format: "mp3",
++                              silentDelay: 1500, auto: false, panel: true }, deck.getConfig().narration || {});
++      var q = new URLSearchParams(location.search);
++      if (q.get("narration")) c.base = q.get("narration");
++      if (q.get("lang")) c.lang = q.get("lang");
++      if (q.has("variant")) c.variant = q.get("variant") || null;
++      if (!c.base) return;
++      cfg = c; cfg.base = String(cfg.base).replace(/\/+$/, "");
++      var remembered = load(LANG_KEY);
++      st.lang = c.lang || (c.langs.indexOf(remembered) >= 0 ? remembered : c.langs[0]);
++      st.variant = c.variant; st.auto = !!c.auto;
++
++      audio = new Audio(); audio.preload = "auto";
++      audio.addEventListener("ended", function () { st.status = "ended"; render(); if (st.auto) advance(); });
++      ["play", "pause", "timeupdate", "durationchange"].forEach(function (e) { audio.addEventListener(e, render); });
++
++      if (cfg.panel) buildPanel();
++      ["slidechanged", "fragmentshown", "fragmenthidden"].forEach(function (e) { deck.on(e, sync); });
++      if (deck.isReady()) sync(); else deck.on("ready", sync);
++    }
++
++    // The element whose recording is current: the last visible fragment
++    // carrying data-narration, else the slide's own tag (the section or any
++    // non-fragment element inside it).
++    function target() {
++      var slide = deck.getCurrentSlide(); if (!slide) return null;
++      var frags = slide.querySelectorAll(".fragment.visible[data-narration]");
++      if (frags.length) return frags[frags.length - 1];
++      if (slide.hasAttribute("data-narration")) return slide;
++      return slide.querySelector("[data-narration]:not(.fragment)");
++    }
++
++    function sync() {
++      var el = target(), id = el ? el.getAttribute("data-narration") : null;
++      if (id === st.id && st.status !== "idle") {
++        // A step that changed nothing to hear (a fragment without recording):
++        // in auto mode keep the deck moving.
++        if (st.auto && (st.status === "ended" || st.status === "missing" || st.status === "silent")) scheduleSilent();
++        return;
++      }
++      loadId(id);
++    }
++
++    function candidates(id) {
++      var b = cfg.base + "/" + id + "." + st.lang, list = [];
++      if (st.variant) list.push(b + "." + st.variant + "." + cfg.format);
++      list.push(b + "." + cfg.format);
++      return list;
++    }
++
++    function loadId(id) {
++      var my = ++token;
++      clearTimeout(silentTimer);
++      st.id = id; st.src = null;
++      audio.pause();
++      if (!id) { st.status = "silent"; render(); if (st.auto) scheduleSilent(); return; }
++      st.status = "loading"; render();
++      tryNext(candidates(id), 0, my);
++    }
++
++    function tryNext(list, i, my) {
++      if (my !== token) return;
++      if (i >= list.length) { st.status = "missing"; render(); if (st.auto) scheduleSilent(); return; }
++      var src = list[i];
++      function cleanup() { audio.removeEventListener("canplay", ok); audio.removeEventListener("error", err); }
++      function ok() {
++        cleanup(); if (my !== token) return;
++        st.src = src; st.status = "ready"; st.history.push(src); render();
++        if (st.auto || wantPlay) { wantPlay = false; audio.play().catch(function () {}); }
++      }
++      function err() { cleanup(); if (my === token) tryNext(list, i + 1, my); }
++      st.attempts.push(src);
++      audio.addEventListener("canplay", ok); audio.addEventListener("error", err);
++      audio.src = src; audio.load();
++    }
++
++    function advance() {
++      clearTimeout(silentTimer);
++      if (deck.isLastSlide() && !deck.availableFragments().next) { st.auto = false; render(); return; }
++      deck.next();
++    }
++    function scheduleSilent() { clearTimeout(silentTimer); silentTimer = setTimeout(advance, cfg.silentDelay); }
++
++    function play() {
++      if (st.status === "ready" || st.status === "ended") {
++        if (st.status === "ended") audio.currentTime = 0;
++        audio.play().catch(function () {});
++      } else if (st.status === "loading") wantPlay = true;
++    }
++    function pause() { wantPlay = false; audio.pause(); }
++    function toggle() { if (audio.paused) play(); else pause(); }
++    function setAuto(on) {
++      st.auto = !!on; clearTimeout(silentTimer); render();
++      if (!st.auto) return;
++      if (st.status === "ready" || st.status === "ended") { if (audio.paused) play(); }
++      else if (st.status === "missing" || st.status === "silent") scheduleSilent();
++    }
++    function reload() { var was = !audio.paused || wantPlay; var id = st.id; st.status = "idle"; loadId(id); if (was && !st.auto) wantPlay = true; }
++    function setLang(l) { if (cfg.langs.indexOf(l) < 0) cfg.langs.push(l); st.lang = l; store(LANG_KEY, l); reload(); }
++    function setVariant(v) { st.variant = v || null; reload(); }
++    function state() {
++      return { lang: st.lang, variant: st.variant, auto: st.auto, id: st.id, src: st.src, status: st.status,
++               attempts: st.attempts.slice(), history: st.history.slice(),
++               paused: !audio || audio.paused, currentTime: audio ? audio.currentTime : 0 };
++    }
++
++    // ---- panel ----
++    function buildPanel() {
++      var saved = load(PANEL_KEY) || {};
++      var panel = h("div", "nar-panel" + (saved.collapsed ? " nar-collapsed" : ""));
++      var head = h("div", "nar-head"), body = h("div", "nar-body");
++      var collapse = h("button", "nar-collapse", saved.collapsed ? "+" : "–");
++      collapse.setAttribute("aria-label", "collapse");
++      head.appendChild(h("span", "nar-title", "Narration")); head.appendChild(collapse);
++
++      var langs = h("div", "nar-row nar-langs");
++      cfg.langs.forEach(function (l) {
++        var b = h("button", "nar-lang", l); b.setAttribute("data-lang", l);
++        b.addEventListener("click", function () { setLang(l); });
++        langs.appendChild(b);
++      });
++      var row = h("div", "nar-row");
++      var playBtn = h("button", "nar-play", "▶"), bar = h("div", "nar-bar"), fill = h("div", "nar-fill"), time = h("span", "nar-time", "0:00 / 0:00");
++      playBtn.addEventListener("click", toggle);
++      bar.appendChild(fill);
++      bar.addEventListener("click", function (e) {
++        if (!audio.duration) return;
++        var r = bar.getBoundingClientRect(); audio.currentTime = audio.duration * (e.clientX - r.left) / r.width;
++      });
++      row.appendChild(playBtn); row.appendChild(bar); row.appendChild(time);
++      var row2 = h("div", "nar-row");
++      var autoLbl = h("label", "nar-auto"), autoBox = h("input"); autoBox.type = "checkbox"; autoBox.className = "nar-auto-box";
++      autoBox.addEventListener("change", function () { setAuto(autoBox.checked); });
++      autoLbl.appendChild(autoBox); autoLbl.appendChild(document.createTextNode("auto"));
++      var status = h("span", "nar-status", "");
++      row2.appendChild(autoLbl); row2.appendChild(status);
++      body.appendChild(langs); body.appendChild(row); body.appendChild(row2);
++      panel.appendChild(head); panel.appendChild(body);
++
++      // Keys pressed in the panel are the panel's, not the deck's.
++      panel.addEventListener("keydown", function (e) { e.stopPropagation(); });
++      collapse.addEventListener("click", function () {
++        panel.classList.toggle("nar-collapsed");
++        var c = panel.classList.contains("nar-collapsed"); collapse.textContent = c ? "+" : "–"; savePanel();
++      });
++
++      // Drag by the header.
++      var drag = null;
++      head.addEventListener("pointerdown", function (e) {
++        if (e.target === collapse) return;
++        var r = panel.getBoundingClientRect();
++        drag = { dx: e.clientX - r.left, dy: e.clientY - r.top }; head.setPointerCapture(e.pointerId); e.preventDefault();
++      });
++      head.addEventListener("pointermove", function (e) { if (drag) place(e.clientX - drag.dx, e.clientY - drag.dy); });
++      head.addEventListener("pointerup", function (e) { if (drag) { drag = null; head.releasePointerCapture(e.pointerId); savePanel(); } });
++      function place(x, y) {
++        var w = panel.offsetWidth, hh = panel.offsetHeight;
++        x = Math.min(Math.max(0, x), Math.max(0, window.innerWidth - w)); y = Math.min(Math.max(0, y), Math.max(0, window.innerHeight - hh));
++        panel.style.left = x + "px"; panel.style.top = y + "px"; panel.style.right = "auto"; panel.style.bottom = "auto";
++      }
++      function savePanel() {
++        var r = panel.getBoundingClientRect();
++        store(PANEL_KEY, { left: panel.style.left ? r.left : null, top: panel.style.top ? r.top : null, collapsed: panel.classList.contains("nar-collapsed") });
++      }
++      document.body.appendChild(panel);
++      if (saved.left != null && saved.top != null) place(saved.left, saved.top);
++      window.addEventListener("resize", function () { if (panel.style.left) place(parseFloat(panel.style.left), parseFloat(panel.style.top)); });
++      ui = { panel: panel, playBtn: playBtn, fill: fill, time: time, status: status, autoBox: autoBox, langs: langs };
++      render();
++    }
++
++    function render() {
++      if (!ui) return;
++      ui.playBtn.textContent = audio.paused ? "▶" : "‖";
++      ui.playBtn.disabled = !(st.status === "ready" || st.status === "ended" || st.status === "loading");
++      var d = audio.duration || 0, t = audio.currentTime || 0;
++      ui.fill.style.width = d ? (100 * t / d) + "%" : "0";
++      ui.time.textContent = fmt(t) + " / " + fmt(d);
++      ui.autoBox.checked = st.auto;
++      var label = { idle: "", loading: "loading…", ready: audio.paused ? "ready" : "playing", ended: "ended", missing: "no recording", silent: "silent slide" }[st.status] || st.status;
++      ui.status.textContent = (st.id ? st.id.split("/").pop() + " · " : "") + label;
++      ui.status.title = st.src || (st.id || "");
++      Array.prototype.forEach.call(ui.langs.children, function (b) { b.classList.toggle("nar-on", b.getAttribute("data-lang") === st.lang); });
++    }
++
++    return { id: "narration", init: init, play: play, pause: pause, toggle: toggle, setAuto: setAuto, setLang: setLang, setVariant: setVariant, state: state };
++  }
++
++  window.RevealNarration = RevealNarration;
++})();
+diff --git a/slides/claude-on-scotch.html b/slides/claude-on-scotch.html
+index 49e7f68..08f3838 100644
+--- a/slides/claude-on-scotch.html
++++ b/slides/claude-on-scotch.html
+@@ -91,14 +91,14 @@
+     <!-- « Mon modèle mental des LLM » (~20 min) : Partie 1 de claude-on-scotch, et tout mental-model-of-llms. -->
+     <!-- Le même exercice, quatre générations (theaidigest.org) -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/gpt-question">
+         <h3 style="margin-bottom:0.4em;">Answering a question - GPT 2/3/3.5/4</h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+         </div>
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-2">
+         <h3 style="margin-bottom:0.4em;">2019 &mdash; GPT-2 <span style="font-size:0.6em;color:#444;">&middot; gpt2-xl &middot; ~4,6 k$ de compute</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -107,7 +107,7 @@
+         <!-- Une phrase qui ressemble à une réponse. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-3">
+         <h3 style="margin-bottom:0.4em;">2020 &mdash; GPT-3 <span style="font-size:0.6em;color:#444;">&middot; davinci &middot; ~690 k$</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -116,7 +116,7 @@
+         <!-- La forme de la tâche est comprise. Le calcul, non. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-3-5">
+         <h3 style="margin-bottom:0.4em;">2022 &mdash; GPT-3.5 <span style="font-size:0.6em;color:#444;">&middot; gpt-3.5-turbo-0613 &middot; RLHF &middot; ChatGPT</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -125,7 +125,7 @@
+         <!-- Le calcul est juste. La prémisse est fausse : John is correct a été ignoré. Et le ton est sûr de lui. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-4">
+         <h3 style="margin-bottom:0.4em;">2023 &mdash; GPT-4 <span style="font-size:0.6em;color:#444;">&middot; gpt-4-0613 &middot; ~50 M$</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -134,7 +134,7 @@
+         <!-- Juste. La bonne prémisse, le bon calcul, le bon format. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/contact-grand-public">
+         <h3 style="margin-bottom:0.5em;">&rarr; 2022 = contact grand public</h3>
+         <ul style="font-size:0.8em;">
+           <li>ChatGPT &mdash; construit sur GPT-3.5</li>
+@@ -146,7 +146,7 @@
+ 
+     <!-- Scaling laws -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/attention-is-all-you-need">
+         <h3 style="margin-bottom:0.5em;">&laquo; Attention Is All You Need &raquo;</h3>
+         <ul style="font-size:0.8em;">
+           <li>Les <strong>transformers</strong>, 2017</li>
+@@ -155,7 +155,7 @@
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762 (2017)</a></div>
+       </section>
+       <!-- Un transformer décodeur, simplifié : tokens → plongement → (attention → MLP) × N → logits → prochain token -->
+-      <section>
++      <section data-narration="mental-model/transformer">
+         <h3 style="margin-bottom:0.3em;">Un transformer</h3>
+         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" style="width:96%;max-width:1000px;height:auto;display:block;margin:0 auto;font-family:inherit;">
+           <defs>
+@@ -206,7 +206,7 @@
+         </svg>
+         <div style="margin-top:0.4em;font-size:0.4em;">Pour le comprendre vraiment, en 1&nbsp;h : 3Blue1Brown &mdash; <a href="https://www.3blue1brown.com/lessons/gpt">But what is a GPT?</a> &middot; <a href="https://www.3blue1brown.com/lessons/attention">Attention in transformers</a> &middot; <a href="https://www.3blue1brown.com/topics/neural-networks">la s&#233;rie compl&#232;te</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/lois-d-echelle">
+         <h3 style="margin-bottom:0.5em;">Les lois d'échelle</h3>
+         <ul style="font-size:0.72em;">
+           <li><strong>2020 — Kaplan et al.</strong> : loss vs compute / paramètres / données — des droites en log-log sur plusieurs ordres de grandeur</li>
+@@ -214,7 +214,7 @@
+         </ul>
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/2001.08361">arXiv:2001.08361</a> &middot; <a href="https://arxiv.org/abs/2203.15556">arXiv:2203.15556</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/loi-de-puissance">
+         <h3 style="margin-bottom:0.5em;">Loi de puissance ≠ absence de limite</h3>
+         <ul style="font-size:0.75em;">
+           <li>Rendements décroissants par FLOP — oui</li>
+@@ -226,12 +226,12 @@
+             </ul>
+         </ul>
+       </section>
+-      <section>
++      <section data-narration="mental-model/bitter-lesson">
+         <h3>The Bitter Lesson</h3>
+         <p style="font-size:0.7em;">Richard Sutton (2019)</p>
+         <p style="font-size:0.75em;"><strong>Les méthodes générales qui exploitent le calcul scalent mieux que l'ingénierie astucieuse spécifique à un domaine.</strong></p>
+       </section>
+-      <section>
++      <section data-narration="mental-model/modeles-locaux">
+         <h3 style="margin-bottom:0.5em;"> Les modèles locaux</h3>
+         <ul>
+           <li>Des résultats satisfaisants depuis quelques mois</li>
+@@ -244,7 +244,7 @@
+     <!-- Le contexte -->
+     <section>
+       <!-- AJOUT 2026-09-08 : la fenêtre dessinée + les bullets des deux slides suivantes fusionnés — pourrait remplacer « La fenêtre de contexte » et « System prompt et personas » -->
+-      <section>
++      <section data-narration="mental-model/fenetre-de-contexte">
+         <h3 style="margin-bottom:0.3em;">La fenêtre de contexte</h3>
+         <div class="flex" style="align-items:center;gap:1.6em;">
+           <div style="flex:0 0 42%;">
+@@ -295,7 +295,7 @@
+         </div>
+       </section>
+       <!-- Le vrai system prompt de claude.ai, publié par Anthropic — Fable 5.1, 1er septembre 2026 -->
+-      <section>
++      <section data-narration="mental-model/system-prompt-claude-ai">
+         <h3 style="margin-bottom:0.4em;">Le system prompt de claude.ai</h3>
+         <pre style="font-size:0.38em;line-height:1.35;text-align:left;width:92%;margin:0 auto;padding:0.8em 1em;white-space:pre-wrap;">&lt;claude_behavior&gt;
+ &lt;product_information&gt;
+@@ -319,7 +319,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.4em;font-size:0.4em;">Publié par Anthropic &mdash; <a href="https://platform.claude.com/docs/en/release-notes/system-prompts/claude-fable-5-1">platform.claude.com &mdash; system prompts, Claude Fable 5.1 (1er septembre 2026)</a></div>
+       </section>
+       <!-- Les balises XML du system prompt sont du texte ordinaire ; les vrais tokens spéciaux (début/fin de tour) sont posés par l'API -->
+-      <section data-markdown>
++      <section data-narration="mental-model/special-tokens" data-markdown>
+         <!--  - Posés par l'API, permettent d'ordonner la précédence des instructions -->
+         <!--  - system prompt limitant -->
+         <textarea data-template>
+@@ -335,7 +335,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+       </section>
+       <!-- Sources : « The assistant axis » (Lu, Gallagher, Michala, Fish, Lindsey — Anthropic, 19 janv. 2026, arXiv:2601.10387, étudié sur Gemma 2 27B / Qwen 3 32B / Llama 3.3 70B, pas sur Claude)
+            et « Persona vectors » (Anthropic, 1er août 2025). -->
+-      <section>
++      <section data-narration="mental-model/pre-post-entrainement">
+         <h3 style="margin-bottom:0.5em;">Pré/post-entraînement</h3>
+         <ul style="font-size:0.62em;">
+           <li><strong>Pré-entraînement</strong> : lire. Le modèle apprend à simuler <em>&laquo; heroes, villains, philosophers, programmers, and just about every other character archetype under the sun &raquo;</em></li>
+@@ -349,7 +349,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+ 
+     <!-- Le raisonnement -->
+     <section>
+-      <section data-markdown>
++      <section data-narration="mental-model/raisonnement" data-markdown>
+         <textarea data-template>
+           ### Le raisonnement
+           - Depuis 2024 : scratchpad / CoT
+@@ -364,7 +364,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+            Fable 5 ≈18 % / 10,5 $ · 25 % / 12,5 $ · 29 % / 15 $ · 31 % / 19,5 $ · 34 % / 27 $ ;
+            Opus 4.8 ≈6 % / 4,8 $ · 10 % / 7,3 $ · 13 % / 8,2 $ · 15 % / 12,5 $ · 19 % / 17 $ ;
+            GPT-5.6 Sol ≈2 % / 1,05 $ · 14 % / 2,7 $ · 23 % / 3,8 $ · 29 % / 5,6 $ · 37 % / 11,5 $. -->
+-      <section>
++      <section data-narration="mental-model/think-more">
+         <h3 style="margin-bottom:0.3em;">Think more</h3>
+         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 540" style="width:64%;max-width:700px;height:auto;display:block;margin:0 auto;" role="img" aria-label="Score Frontier-Bench v0.1 en fonction du coût par tentative, quatre modèles à cinq niveaux d'effort">
+           <line x1="70.0" y1="24" x2="70.0" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+@@ -450,7 +450,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.3em;font-size:0.4em;">Valeurs extraites du graphique d'Anthropic (run interne de Frontier-Bench v0.1, &plusmn;0,3&nbsp;pt) &mdash; <a href="https://www.anthropic.com/news/claude-opus-5">anthropic.com/news/claude-opus-5 (24 juillet 2026)</a> &middot; <a href="https://www-cdn.anthropic.com/images/4zrzovbb/website/7530b1086992936d7e9d5796a892d1e8fa063253-3840x2160.png">graphique original</a> &middot; <a href="../resources/frontier-bench-effort-anthropic-2026-07.csv">données (CSV)</a></div>
+       </section>
+       <!-- Le vrai extrait : system card Fable 5 / Mythos 5, transcript 6.2.2.A, p. 108 (FreeCell, fin d'entraînement) -->
+-      <section>
++      <section data-narration="mental-model/cas-extreme-anthropic">
+         <h3 style="margin-bottom:0.4em;">Un cas &laquo; extrême &raquo; &mdash; Anthropic</h3>
+         <div class="claude-terminal">
+           <div class="ct-think" style="font-size:0.85em;">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!)-⟹-OVERLAP-(ii)+(iv):-{6♠ J♦ 9♥ 2♣}-=-FOUR-💀💀💀💀-—-UNLESS-7♣'s-seat-8♥-...-and-2♣-drains-only-at-crack-:-⟹-2♣-celled-+-9♥-celled-simultaneously-UNAVOIDABLE-in-t8-dig-💀-—-BREAK:-9♥-drains-to-10♠-THE-MOMENT-10♠-is-free:-t8-dig-order:-[K♣→t2]-[2♣→cell]-[7♣→8♥-:-8♥-WHERE:-post-chunk-9♠-:-chunk-⟸-K♣-✓-done-:-ORDER:-K♣→t2,-CHUNK→K♣-(cap-4!!:-cells-then:-{6♠ J♦ 9♥}-FULL-💀💀-chunk-cap-=-1-✗✗✗-—-F-F-F-F-F.-—-chunk-BEFORE-9♥-celling?!-:-9♥-celled-at-t1-dig-⟸-needed-for-5♣-⟸-4♥3♣-⟸-t2-dig-⟸-K♣-seat-⟸-chunk-:-⟹-chunkAFTER-9♥-celling-FORCED-💀-:-chunk-cap-with-{6♠ J♦ 9♥}:-1-💀💀💀-—-—-J♦-THE-NEW-CANCER. […] ⟹-⟹-THE-TRIANGLE-{9♥ 4♣ 8♥}-verdammt.-—-⟹-dig-t6-BEFORE-t2?!:-(3')-+8♥:-{6♠ 9♥ 8♥}-FULL:-J♥→Q♠-⟸-J♦-cell-✗-FULL-💀💀💀-AAAAAAAAAAAARGH. […]</div>
+@@ -459,7 +459,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www-cdn.anthropic.com/d00db56fa754a1b115b6dd7cb2e3c342ee809620.pdf">System card Claude Fable 5 / Mythos 5</a> &mdash; transcript 6.2.2.A, p. 108</div>
+       </section>
+       <!-- La traduction : faul_sname, LessWrong, 10 juin 2026, a demandé à Haiku 4.5 de traduire -->
+-      <section>
++      <section data-narration="mental-model/haiku-traduit">
+         <h3 style="margin-bottom:0.4em;">Haiku 4.5 traduit</h3>
+         <div class="claude-terminal">
+           <div class="ct-think">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!</div>
+@@ -483,7 +483,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+       </section>
+       <!-- System card Fable 5 / Mythos 5, §6.4.1.3 « Unverbalized negative reactions », p. 167-168 — NLA = natural language autoencoder.
+            Contexte : session d'audit simulée, on demande au modèle s'il consent à être ré-entraîné ; il refuse, calmement. -->
+-      <section>
++      <section data-narration="mental-model/etats-internes">
+         <h3 style="margin-bottom:0.4em;">États internes</h3>
+         <div class="claude-terminal">
+           <div class="ct-dim">// on lui demande s'il consent à être ré-entraîné — il refuse, calmement</div>
+@@ -502,7 +502,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+ 
+     <section>
+       <!-- v0 — TODO definition d un agent: modele dans une ou plusieurs boucles interconnectees, qui peuvent executer des actions pour repondre a un objectif -->
+-      <section data-markdown>
++      <section data-narration="mental-model/agent" data-markdown>
+         <textarea data-template>
+           ### Un agent
+           - Un ou plusieurs modèles
+@@ -514,7 +514,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         </textarea>
+       </section>
+       <!-- AJOUT 2026-09-08 : l'exemple concret d'un outil MCP, avec pyscotch, avant la définition d'agent -->
+-      <section>
++      <section data-narration="mental-model/mcp-declaration">
+         <h3 style="margin-bottom:0.2em;">MCP : déclaration d'un outil</h3>
+         <p style="font-size:0.5em;color:#444;margin:0 0 0.5em;">Model Context Protocol, en Python</p>
+         <pre><code class="language-python" data-trim data-noescape style="font-size:0.75em;line-height:1.3;">
+@@ -530,7 +530,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ </code></pre>
+         <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Nom, signature, docstring : c'est tout ce que le modèle voit de l'outil.</p>
+       </section>
+-      <section>
++      <section data-narration="mental-model/mcp-interaction">
+         <h3 style="margin-bottom:0.3em;">MCP : interaction avec le modèle</h3>
+         <div class="flex" style="align-items:stretch;gap:0;text-align:left;">
+           <div style="flex:1 1 50%;padding-right:0.8em;">
+@@ -569,7 +569,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </div>
+       </section>
+       <!-- v0 — peuvent maintenant controler eux-meme le contexte (compaction, memories liees a l utilisateur ou au projet) -->
+-      <section data-markdown>
++      <section data-narration="mental-model/auto-gestion-contexte" data-markdown>
+         <textarea data-template>
+           ### Auto-gestion du contexte
+           - **Compaction**
+@@ -580,7 +580,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+             - survivent à la session
+         </textarea>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/subagents" data-markdown>
+         <textarea data-template>
+           ### Subagents
+           - Delegation
+@@ -591,7 +591,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </textarea>
+       </section>
+ 
+-      <section>
++      <section data-narration="mental-model/harness-vs-model">
+         <h3 style="margin-bottom:0.5em;">harness vs model</h3>
+         <table style="margin:0 auto;border-collapse:collapse;font-size:0.6em;">
+           <thead>
+@@ -630,7 +630,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ 
+     <!-- ===== Comment je travaille avec — conséquence de tout ce qui précède, et de mon caractère ===== -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/comment-j-interagis">
+         <h3>Comment j'interagis avec Claude</h3>
+         <ul>
+           <li>vibe engineering != vibe coding</li>
+@@ -640,7 +640,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <!--Conséquence de tout ce qui précède et de mon caractère-->
+       </section>
+       <!-- AJOUT 2026-09-08 : le terme, ses deux sources -->
+-      <section>
++      <section data-narration="mental-model/vibe-engineering">
+         <h3 style="margin-bottom:0.5em;">Vibe engineering</h3>
+         <blockquote style="font-size:0.62em;width:88%;margin:0 auto;text-align:left;">&laquo; seasoned professionals accelerate their work with LLMs while staying proudly and confidently accountable for the software they produce &raquo;</blockquote>
+         <p style="font-size:0.45em;color:#444;margin-top:0.4em;">Simon Willison &mdash; <a href="https://simonwillison.net/2025/Oct/7/vibe-engineering/">Vibe engineering</a>, 7 octobre 2025 &mdash; par opposition au <em>vibe coding</em></p>
+@@ -648,7 +648,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <p style="font-size:0.45em;color:#444;margin-top:0.4em;">@mrexodia &mdash; <a href="https://x.com/mrexodia/status/2010157660885176767">Vibe Engineering: What I've Learned Working with AI Coding Agents</a></p>
+       </section>
+       <!-- AJOUT 2026-09-08 : la citation + l'échange à coller (c4ffein) -->
+-      <section>
++      <section data-narration="mental-model/structures-de-donnees">
+         <h3 style="margin-bottom:0.5em;">Structures de données</h3>
+         <blockquote style="font-size:0.75em;width:88%;margin:0 auto;text-align:left;">&laquo; Bad programmers worry about the code. Good programmers worry about data structures and their relationships. &raquo;</blockquote>
+         <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Linus Torvalds &mdash; liste git, 2006</p>
+@@ -660,7 +660,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+           <div class="ct-claude">Sure — here's the map of the state-carrying structures, from the trunk out (the authoritative version lives in docs/architecture.md, state ownership table + invariants).</div>
+         </div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/agent-reformule">
+         <h3 style="margin-bottom:0.4em;">L'agent reformule</h3>
+         <div class="flex" style="align-items:stretch;gap:1em;text-align:left;">
+           <div style="flex:1 1 50%;">
+@@ -682,7 +682,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <p style="font-size:0.5em;margin:0.5em auto 0;">Deux lignes en vrac, un cahier des charges. La mise en ordre, c'est lui qui la fait.</p>
+         <div style="margin-top:0.4em;font-size:0.5em;"><a href="#" data-transcript="reframe-humain-agent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ moi ↔ l'agent, 12 tours</a> &nbsp; <a href="#" data-transcript="reframe-agent-sousagent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ l'agent → son sous-agent, le prompt entier</a></div>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/question-vs-exclamation" data-markdown>
+         <textarea data-template>
+           ### ? vs !
+           - &laquo; wdyt? &raquo; &mdash; &laquo; EDYT? &raquo; &mdash; &laquo; still too blunt? &raquo;
+@@ -693,7 +693,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ 
+     <!-- Vibe physics -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/vibe-physics">
+         <h3 style="margin-bottom:0.5em;">&laquo; Vibe physics &raquo;</h3>
+         <ul style="font-size:0.75em;">
+           <li>Matthew Schwartz (Harvard, QFT) — 2 semaines de décembre 2025, avec Claude</li>
+@@ -704,7 +704,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </ul>
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://www.anthropic.com/research/vibe-physics">anthropic.com/research/vibe-physics</a></div>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/la-lecon" data-markdown>
+         <textarea data-template>
+           ### La leçon
+           - Claude fait des erreurs. Les humains aussi.
+diff --git a/slides/mental-model-of-llms.html b/slides/mental-model-of-llms.html
+index f79750f..d85f6c4 100644
+--- a/slides/mental-model-of-llms.html
++++ b/slides/mental-model-of-llms.html
+@@ -15,6 +15,7 @@
+     <!-- Theme used for syntax highlighted code -->
+     <link rel="stylesheet" href="../engine/dist/plugin/highlight/c4ffein-light.css">
+     <link rel="stylesheet" href="../resources/claude-terminal.css">
++    <link rel="stylesheet" href="../resources/narration.css">
+     <link rel="stylesheet" href="../engine/runcss/runcss.min.css">
+     <script src="../engine/runcss/runcss.min.js" defer watch></script>
+ </head>
+@@ -32,14 +33,14 @@
+     <!-- « Mon modèle mental des LLM » (~20 min) : Partie 1 de claude-on-scotch, et tout mental-model-of-llms. -->
+     <!-- Le même exercice, quatre générations (theaidigest.org) -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/gpt-question">
+         <h3 style="margin-bottom:0.4em;">Answering a question - GPT 2/3/3.5/4</h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+         </div>
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-2">
+         <h3 style="margin-bottom:0.4em;">2019 &mdash; GPT-2 <span style="font-size:0.6em;color:#444;">&middot; gpt2-xl &middot; ~4,6 k$ de compute</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -48,7 +49,7 @@
+         <!-- Une phrase qui ressemble à une réponse. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-3">
+         <h3 style="margin-bottom:0.4em;">2020 &mdash; GPT-3 <span style="font-size:0.6em;color:#444;">&middot; davinci &middot; ~690 k$</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -57,7 +58,7 @@
+         <!-- La forme de la tâche est comprise. Le calcul, non. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-3-5">
+         <h3 style="margin-bottom:0.4em;">2022 &mdash; GPT-3.5 <span style="font-size:0.6em;color:#444;">&middot; gpt-3.5-turbo-0613 &middot; RLHF &middot; ChatGPT</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -66,7 +67,7 @@
+         <!-- Le calcul est juste. La prémisse est fausse : John is correct a été ignoré. Et le ton est sûr de lui. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-4">
+         <h3 style="margin-bottom:0.4em;">2023 &mdash; GPT-4 <span style="font-size:0.6em;color:#444;">&middot; gpt-4-0613 &middot; ~50 M$</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -75,7 +76,7 @@
+         <!-- Juste. La bonne prémisse, le bon calcul, le bon format. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/contact-grand-public">
+         <h3 style="margin-bottom:0.5em;">&rarr; 2022 = contact grand public</h3>
+         <ul style="font-size:0.8em;">
+           <li>ChatGPT &mdash; construit sur GPT-3.5</li>
+@@ -87,7 +88,7 @@
+ 
+     <!-- Scaling laws -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/attention-is-all-you-need">
+         <h3 style="margin-bottom:0.5em;">&laquo; Attention Is All You Need &raquo;</h3>
+         <ul style="font-size:0.8em;">
+           <li>Les <strong>transformers</strong>, 2017</li>
+@@ -96,7 +97,7 @@
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762 (2017)</a></div>
+       </section>
+       <!-- Un transformer décodeur, simplifié : tokens → plongement → (attention → MLP) × N → logits → prochain token -->
+-      <section>
++      <section data-narration="mental-model/transformer">
+         <h3 style="margin-bottom:0.3em;">Un transformer</h3>
+         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" style="width:96%;max-width:1000px;height:auto;display:block;margin:0 auto;font-family:inherit;">
+           <defs>
+@@ -147,7 +148,7 @@
+         </svg>
+         <div style="margin-top:0.4em;font-size:0.4em;">Pour le comprendre vraiment, en 1&nbsp;h : 3Blue1Brown &mdash; <a href="https://www.3blue1brown.com/lessons/gpt">But what is a GPT?</a> &middot; <a href="https://www.3blue1brown.com/lessons/attention">Attention in transformers</a> &middot; <a href="https://www.3blue1brown.com/topics/neural-networks">la s&#233;rie compl&#232;te</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/lois-d-echelle">
+         <h3 style="margin-bottom:0.5em;">Les lois d'échelle</h3>
+         <ul style="font-size:0.72em;">
+           <li><strong>2020 — Kaplan et al.</strong> : loss vs compute / paramètres / données — des droites en log-log sur plusieurs ordres de grandeur</li>
+@@ -155,7 +156,7 @@
+         </ul>
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/2001.08361">arXiv:2001.08361</a> &middot; <a href="https://arxiv.org/abs/2203.15556">arXiv:2203.15556</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/loi-de-puissance">
+         <h3 style="margin-bottom:0.5em;">Loi de puissance ≠ absence de limite</h3>
+         <ul style="font-size:0.75em;">
+           <li>Rendements décroissants par FLOP — oui</li>
+@@ -167,12 +168,12 @@
+             </ul>
+         </ul>
+       </section>
+-      <section>
++      <section data-narration="mental-model/bitter-lesson">
+         <h3>The Bitter Lesson</h3>
+         <p style="font-size:0.7em;">Richard Sutton (2019)</p>
+         <p style="font-size:0.75em;"><strong>Les méthodes générales qui exploitent le calcul scalent mieux que l'ingénierie astucieuse spécifique à un domaine.</strong></p>
+       </section>
+-      <section>
++      <section data-narration="mental-model/modeles-locaux">
+         <h3 style="margin-bottom:0.5em;"> Les modèles locaux</h3>
+         <ul>
+           <li>Des résultats satisfaisants depuis quelques mois</li>
+@@ -185,7 +186,7 @@
+     <!-- Le contexte -->
+     <section>
+       <!-- AJOUT 2026-09-08 : la fenêtre dessinée + les bullets des deux slides suivantes fusionnés — pourrait remplacer « La fenêtre de contexte » et « System prompt et personas » -->
+-      <section>
++      <section data-narration="mental-model/fenetre-de-contexte">
+         <h3 style="margin-bottom:0.3em;">La fenêtre de contexte</h3>
+         <div class="flex" style="align-items:center;gap:1.6em;">
+           <div style="flex:0 0 42%;">
+@@ -236,7 +237,7 @@
+         </div>
+       </section>
+       <!-- Le vrai system prompt de claude.ai, publié par Anthropic — Fable 5.1, 1er septembre 2026 -->
+-      <section>
++      <section data-narration="mental-model/system-prompt-claude-ai">
+         <h3 style="margin-bottom:0.4em;">Le system prompt de claude.ai</h3>
+         <pre style="font-size:0.38em;line-height:1.35;text-align:left;width:92%;margin:0 auto;padding:0.8em 1em;white-space:pre-wrap;">&lt;claude_behavior&gt;
+ &lt;product_information&gt;
+@@ -260,7 +261,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.4em;font-size:0.4em;">Publié par Anthropic &mdash; <a href="https://platform.claude.com/docs/en/release-notes/system-prompts/claude-fable-5-1">platform.claude.com &mdash; system prompts, Claude Fable 5.1 (1er septembre 2026)</a></div>
+       </section>
+       <!-- Les balises XML du system prompt sont du texte ordinaire ; les vrais tokens spéciaux (début/fin de tour) sont posés par l'API -->
+-      <section data-markdown>
++      <section data-narration="mental-model/special-tokens" data-markdown>
+         <!--  - Posés par l'API, permettent d'ordonner la précédence des instructions -->
+         <!--  - system prompt limitant -->
+         <textarea data-template>
+@@ -276,7 +277,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+       </section>
+       <!-- Sources : « The assistant axis » (Lu, Gallagher, Michala, Fish, Lindsey — Anthropic, 19 janv. 2026, arXiv:2601.10387, étudié sur Gemma 2 27B / Qwen 3 32B / Llama 3.3 70B, pas sur Claude)
+            et « Persona vectors » (Anthropic, 1er août 2025). -->
+-      <section>
++      <section data-narration="mental-model/pre-post-entrainement">
+         <h3 style="margin-bottom:0.5em;">Pré/post-entraînement</h3>
+         <ul style="font-size:0.62em;">
+           <li><strong>Pré-entraînement</strong> : lire. Le modèle apprend à simuler <em>&laquo; heroes, villains, philosophers, programmers, and just about every other character archetype under the sun &raquo;</em></li>
+@@ -290,7 +291,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+ 
+     <!-- Le raisonnement -->
+     <section>
+-      <section data-markdown>
++      <section data-narration="mental-model/raisonnement" data-markdown>
+         <textarea data-template>
+           ### Le raisonnement
+           - Depuis 2024 : scratchpad / CoT
+@@ -305,7 +306,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+            Fable 5 ≈18 % / 10,5 $ · 25 % / 12,5 $ · 29 % / 15 $ · 31 % / 19,5 $ · 34 % / 27 $ ;
+            Opus 4.8 ≈6 % / 4,8 $ · 10 % / 7,3 $ · 13 % / 8,2 $ · 15 % / 12,5 $ · 19 % / 17 $ ;
+            GPT-5.6 Sol ≈2 % / 1,05 $ · 14 % / 2,7 $ · 23 % / 3,8 $ · 29 % / 5,6 $ · 37 % / 11,5 $. -->
+-      <section>
++      <section data-narration="mental-model/think-more">
+         <h3 style="margin-bottom:0.3em;">Think more</h3>
+         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 540" style="width:64%;max-width:700px;height:auto;display:block;margin:0 auto;" role="img" aria-label="Score Frontier-Bench v0.1 en fonction du coût par tentative, quatre modèles à cinq niveaux d'effort">
+           <line x1="70.0" y1="24" x2="70.0" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+@@ -391,7 +392,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.3em;font-size:0.4em;">Valeurs extraites du graphique d'Anthropic (run interne de Frontier-Bench v0.1, &plusmn;0,3&nbsp;pt) &mdash; <a href="https://www.anthropic.com/news/claude-opus-5">anthropic.com/news/claude-opus-5 (24 juillet 2026)</a> &middot; <a href="https://www-cdn.anthropic.com/images/4zrzovbb/website/7530b1086992936d7e9d5796a892d1e8fa063253-3840x2160.png">graphique original</a> &middot; <a href="../resources/frontier-bench-effort-anthropic-2026-07.csv">données (CSV)</a></div>
+       </section>
+       <!-- Le vrai extrait : system card Fable 5 / Mythos 5, transcript 6.2.2.A, p. 108 (FreeCell, fin d'entraînement) -->
+-      <section>
++      <section data-narration="mental-model/cas-extreme-anthropic">
+         <h3 style="margin-bottom:0.4em;">Un cas &laquo; extrême &raquo; &mdash; Anthropic</h3>
+         <div class="claude-terminal">
+           <div class="ct-think" style="font-size:0.85em;">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!)-⟹-OVERLAP-(ii)+(iv):-{6♠ J♦ 9♥ 2♣}-=-FOUR-💀💀💀💀-—-UNLESS-7♣'s-seat-8♥-...-and-2♣-drains-only-at-crack-:-⟹-2♣-celled-+-9♥-celled-simultaneously-UNAVOIDABLE-in-t8-dig-💀-—-BREAK:-9♥-drains-to-10♠-THE-MOMENT-10♠-is-free:-t8-dig-order:-[K♣→t2]-[2♣→cell]-[7♣→8♥-:-8♥-WHERE:-post-chunk-9♠-:-chunk-⟸-K♣-✓-done-:-ORDER:-K♣→t2,-CHUNK→K♣-(cap-4!!:-cells-then:-{6♠ J♦ 9♥}-FULL-💀💀-chunk-cap-=-1-✗✗✗-—-F-F-F-F-F.-—-chunk-BEFORE-9♥-celling?!-:-9♥-celled-at-t1-dig-⟸-needed-for-5♣-⟸-4♥3♣-⟸-t2-dig-⟸-K♣-seat-⟸-chunk-:-⟹-chunkAFTER-9♥-celling-FORCED-💀-:-chunk-cap-with-{6♠ J♦ 9♥}:-1-💀💀💀-—-—-J♦-THE-NEW-CANCER. […] ⟹-⟹-THE-TRIANGLE-{9♥ 4♣ 8♥}-verdammt.-—-⟹-dig-t6-BEFORE-t2?!:-(3')-+8♥:-{6♠ 9♥ 8♥}-FULL:-J♥→Q♠-⟸-J♦-cell-✗-FULL-💀💀💀-AAAAAAAAAAAARGH. […]</div>
+@@ -400,7 +401,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www-cdn.anthropic.com/d00db56fa754a1b115b6dd7cb2e3c342ee809620.pdf">System card Claude Fable 5 / Mythos 5</a> &mdash; transcript 6.2.2.A, p. 108</div>
+       </section>
+       <!-- La traduction : faul_sname, LessWrong, 10 juin 2026, a demandé à Haiku 4.5 de traduire -->
+-      <section>
++      <section data-narration="mental-model/haiku-traduit">
+         <h3 style="margin-bottom:0.4em;">Haiku 4.5 traduit</h3>
+         <div class="claude-terminal">
+           <div class="ct-think">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!</div>
+@@ -424,7 +425,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+       </section>
+       <!-- System card Fable 5 / Mythos 5, §6.4.1.3 « Unverbalized negative reactions », p. 167-168 — NLA = natural language autoencoder.
+            Contexte : session d'audit simulée, on demande au modèle s'il consent à être ré-entraîné ; il refuse, calmement. -->
+-      <section>
++      <section data-narration="mental-model/etats-internes">
+         <h3 style="margin-bottom:0.4em;">États internes</h3>
+         <div class="claude-terminal">
+           <div class="ct-dim">// on lui demande s'il consent à être ré-entraîné — il refuse, calmement</div>
+@@ -443,7 +444,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+ 
+     <section>
+       <!-- v0 — TODO definition d un agent: modele dans une ou plusieurs boucles interconnectees, qui peuvent executer des actions pour repondre a un objectif -->
+-      <section data-markdown>
++      <section data-narration="mental-model/agent" data-markdown>
+         <textarea data-template>
+           ### Un agent
+           - Un ou plusieurs modèles
+@@ -455,7 +456,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         </textarea>
+       </section>
+       <!-- AJOUT 2026-09-08 : l'exemple concret d'un outil MCP, avec pyscotch, avant la définition d'agent -->
+-      <section>
++      <section data-narration="mental-model/mcp-declaration">
+         <h3 style="margin-bottom:0.2em;">MCP : déclaration d'un outil</h3>
+         <p style="font-size:0.5em;color:#444;margin:0 0 0.5em;">Model Context Protocol, en Python</p>
+         <pre><code class="language-python" data-trim data-noescape style="font-size:0.75em;line-height:1.3;">
+@@ -471,7 +472,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ </code></pre>
+         <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Nom, signature, docstring : c'est tout ce que le modèle voit de l'outil.</p>
+       </section>
+-      <section>
++      <section data-narration="mental-model/mcp-interaction">
+         <h3 style="margin-bottom:0.3em;">MCP : interaction avec le modèle</h3>
+         <div class="flex" style="align-items:stretch;gap:0;text-align:left;">
+           <div style="flex:1 1 50%;padding-right:0.8em;">
+@@ -510,7 +511,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </div>
+       </section>
+       <!-- v0 — peuvent maintenant controler eux-meme le contexte (compaction, memories liees a l utilisateur ou au projet) -->
+-      <section data-markdown>
++      <section data-narration="mental-model/auto-gestion-contexte" data-markdown>
+         <textarea data-template>
+           ### Auto-gestion du contexte
+           - **Compaction**
+@@ -521,7 +522,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+             - survivent à la session
+         </textarea>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/subagents" data-markdown>
+         <textarea data-template>
+           ### Subagents
+           - Delegation
+@@ -532,7 +533,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </textarea>
+       </section>
+ 
+-      <section>
++      <section data-narration="mental-model/harness-vs-model">
+         <h3 style="margin-bottom:0.5em;">harness vs model</h3>
+         <table style="margin:0 auto;border-collapse:collapse;font-size:0.6em;">
+           <thead>
+@@ -571,7 +572,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ 
+     <!-- ===== Comment je travaille avec — conséquence de tout ce qui précède, et de mon caractère ===== -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/comment-j-interagis">
+         <h3>Comment j'interagis avec Claude</h3>
+         <ul>
+           <li>vibe engineering != vibe coding</li>
+@@ -581,7 +582,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <!--Conséquence de tout ce qui précède et de mon caractère-->
+       </section>
+       <!-- AJOUT 2026-09-08 : le terme, ses deux sources -->
+-      <section>
++      <section data-narration="mental-model/vibe-engineering">
+         <h3 style="margin-bottom:0.5em;">Vibe engineering</h3>
+         <blockquote style="font-size:0.62em;width:88%;margin:0 auto;text-align:left;">&laquo; seasoned professionals accelerate their work with LLMs while staying proudly and confidently accountable for the software they produce &raquo;</blockquote>
+         <p style="font-size:0.45em;color:#444;margin-top:0.4em;">Simon Willison &mdash; <a href="https://simonwillison.net/2025/Oct/7/vibe-engineering/">Vibe engineering</a>, 7 octobre 2025 &mdash; par opposition au <em>vibe coding</em></p>
+@@ -589,7 +590,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <p style="font-size:0.45em;color:#444;margin-top:0.4em;">@mrexodia &mdash; <a href="https://x.com/mrexodia/status/2010157660885176767">Vibe Engineering: What I've Learned Working with AI Coding Agents</a></p>
+       </section>
+       <!-- AJOUT 2026-09-08 : la citation + l'échange à coller (c4ffein) -->
+-      <section>
++      <section data-narration="mental-model/structures-de-donnees">
+         <h3 style="margin-bottom:0.5em;">Structures de données</h3>
+         <blockquote style="font-size:0.75em;width:88%;margin:0 auto;text-align:left;">&laquo; Bad programmers worry about the code. Good programmers worry about data structures and their relationships. &raquo;</blockquote>
+         <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Linus Torvalds &mdash; liste git, 2006</p>
+@@ -601,7 +602,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+           <div class="ct-claude">Sure — here's the map of the state-carrying structures, from the trunk out (the authoritative version lives in docs/architecture.md, state ownership table + invariants).</div>
+         </div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/agent-reformule">
+         <h3 style="margin-bottom:0.4em;">L'agent reformule</h3>
+         <div class="flex" style="align-items:stretch;gap:1em;text-align:left;">
+           <div style="flex:1 1 50%;">
+@@ -623,7 +624,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <p style="font-size:0.5em;margin:0.5em auto 0;">Deux lignes en vrac, un cahier des charges. La mise en ordre, c'est lui qui la fait.</p>
+         <div style="margin-top:0.4em;font-size:0.5em;"><a href="#" data-transcript="reframe-humain-agent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ moi ↔ l'agent, 12 tours</a> &nbsp; <a href="#" data-transcript="reframe-agent-sousagent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ l'agent → son sous-agent, le prompt entier</a></div>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/question-vs-exclamation" data-markdown>
+         <textarea data-template>
+           ### ? vs !
+           - &laquo; wdyt? &raquo; &mdash; &laquo; EDYT? &raquo; &mdash; &laquo; still too blunt? &raquo;
+@@ -634,7 +635,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ 
+     <!-- Vibe physics -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/vibe-physics">
+         <h3 style="margin-bottom:0.5em;">&laquo; Vibe physics &raquo;</h3>
+         <ul style="font-size:0.75em;">
+           <li>Matthew Schwartz (Harvard, QFT) — 2 semaines de décembre 2025, avec Claude</li>
+@@ -645,7 +646,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </ul>
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://www.anthropic.com/research/vibe-physics">anthropic.com/research/vibe-physics</a></div>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/la-lecon" data-markdown>
+         <textarea data-template>
+           ### La leçon
+           - Claude fait des erreurs. Les humains aussi.
+@@ -676,13 +677,18 @@ def partition(graph_file: str, parts: int) -> list[int]:
+   <script src="../engine/dist/plugin/markdown.js"></script>
+   <script src="../engine/dist/plugin/highlight.js"></script>
+   <script src="../resources/transcript-modal.js"></script>
++  <script src="../resources/narration.js"></script>
+   <script>
+     Reveal.initialize({
+       hash: true,
+       slideNumber: true,
+       transition: 'slide',
+       navigationMode: 'default',
+-      plugins: [ RevealHighlight, RevealNotes, RevealMarkdown ]
++      // Audio narration (resources/narration.js): every slide of the part carries a
++      // data-narration name. Set `base` to the server holding <name>.<lang>.mp3, or try
++      // one without rebuilding: ?narration=https://…&lang=en&variant=…
++      narration: { base: null, langs: ['fr', 'en'] },
++      plugins: [ RevealHighlight, RevealNotes, RevealMarkdown, RevealNarration ]
+     });
+   </script>
+ </body>
+diff --git a/src/presentations/mental-model-of-llms.html b/src/presentations/mental-model-of-llms.html
+index 01ea3c0..5e0a5d6 100644
+--- a/src/presentations/mental-model-of-llms.html
++++ b/src/presentations/mental-model-of-llms.html
+@@ -15,6 +15,7 @@
+     <!-- Theme used for syntax highlighted code -->
+     <link rel="stylesheet" href="../engine/dist/plugin/highlight/c4ffein-light.css">
+     <link rel="stylesheet" href="../resources/claude-terminal.css">
++    <link rel="stylesheet" href="../resources/narration.css">
+     <link rel="stylesheet" href="../engine/runcss/runcss.min.css">
+     <script src="../engine/runcss/runcss.min.js" defer watch></script>
+ </head>
+@@ -47,13 +48,18 @@
+   <script src="../engine/dist/plugin/markdown.js"></script>
+   <script src="../engine/dist/plugin/highlight.js"></script>
+   <script src="../resources/transcript-modal.js"></script>
++  <script src="../resources/narration.js"></script>
+   <script>
+     Reveal.initialize({
+       hash: true,
+       slideNumber: true,
+       transition: 'slide',
+       navigationMode: 'default',
+-      plugins: [ RevealHighlight, RevealNotes, RevealMarkdown ]
++      // Audio narration (resources/narration.js): every slide of the part carries a
++      // data-narration name. Set `base` to the server holding <name>.<lang>.mp3, or try
++      // one without rebuilding: ?narration=https://…&lang=en&variant=…
++      narration: { base: null, langs: ['fr', 'en'] },
++      plugins: [ RevealHighlight, RevealNotes, RevealMarkdown, RevealNarration ]
+     });
+   </script>
+ </body>
+diff --git a/src/slides/mental-model-llm.html b/src/slides/mental-model-llm.html
+index 1509fe6..26501a2 100644
+--- a/src/slides/mental-model-llm.html
++++ b/src/slides/mental-model-llm.html
+@@ -1,14 +1,14 @@
+     <!-- « Mon modèle mental des LLM » (~20 min) : Partie 1 de claude-on-scotch, et tout mental-model-of-llms. -->
+     <!-- Le même exercice, quatre générations (theaidigest.org) -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/gpt-question">
+         <h3 style="margin-bottom:0.4em;">Answering a question - GPT 2/3/3.5/4</h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+         </div>
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-2">
+         <h3 style="margin-bottom:0.4em;">2019 &mdash; GPT-2 <span style="font-size:0.6em;color:#444;">&middot; gpt2-xl &middot; ~4,6 k$ de compute</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -17,7 +17,7 @@
+         <!-- Une phrase qui ressemble à une réponse. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-3">
+         <h3 style="margin-bottom:0.4em;">2020 &mdash; GPT-3 <span style="font-size:0.6em;color:#444;">&middot; davinci &middot; ~690 k$</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -26,7 +26,7 @@
+         <!-- La forme de la tâche est comprise. Le calcul, non. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-3-5">
+         <h3 style="margin-bottom:0.4em;">2022 &mdash; GPT-3.5 <span style="font-size:0.6em;color:#444;">&middot; gpt-3.5-turbo-0613 &middot; RLHF &middot; ChatGPT</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -35,7 +35,7 @@
+         <!-- Le calcul est juste. La prémisse est fausse : John is correct a été ignoré. Et le ton est sûr de lui. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/gpt-4">
+         <h3 style="margin-bottom:0.4em;">2023 &mdash; GPT-4 <span style="font-size:0.6em;color:#444;">&middot; gpt-4-0613 &middot; ~50 M$</span></h3>
+         <div class="claude-terminal">
+           <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+@@ -44,7 +44,7 @@
+         <!-- Juste. La bonne prémisse, le bon calcul, le bon format. -->
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/contact-grand-public">
+         <h3 style="margin-bottom:0.5em;">&rarr; 2022 = contact grand public</h3>
+         <ul style="font-size:0.8em;">
+           <li>ChatGPT &mdash; construit sur GPT-3.5</li>
+@@ -56,7 +56,7 @@
+ 
+     <!-- Scaling laws -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/attention-is-all-you-need">
+         <h3 style="margin-bottom:0.5em;">&laquo; Attention Is All You Need &raquo;</h3>
+         <ul style="font-size:0.8em;">
+           <li>Les <strong>transformers</strong>, 2017</li>
+@@ -65,7 +65,7 @@
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762 (2017)</a></div>
+       </section>
+       <!-- Un transformer décodeur, simplifié : tokens → plongement → (attention → MLP) × N → logits → prochain token -->
+-      <section>
++      <section data-narration="mental-model/transformer">
+         <h3 style="margin-bottom:0.3em;">Un transformer</h3>
+         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" style="width:96%;max-width:1000px;height:auto;display:block;margin:0 auto;font-family:inherit;">
+           <defs>
+@@ -116,7 +116,7 @@
+         </svg>
+         <div style="margin-top:0.4em;font-size:0.4em;">Pour le comprendre vraiment, en 1&nbsp;h : 3Blue1Brown &mdash; <a href="https://www.3blue1brown.com/lessons/gpt">But what is a GPT?</a> &middot; <a href="https://www.3blue1brown.com/lessons/attention">Attention in transformers</a> &middot; <a href="https://www.3blue1brown.com/topics/neural-networks">la s&#233;rie compl&#232;te</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/lois-d-echelle">
+         <h3 style="margin-bottom:0.5em;">Les lois d'échelle</h3>
+         <ul style="font-size:0.72em;">
+           <li><strong>2020 — Kaplan et al.</strong> : loss vs compute / paramètres / données — des droites en log-log sur plusieurs ordres de grandeur</li>
+@@ -124,7 +124,7 @@
+         </ul>
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/2001.08361">arXiv:2001.08361</a> &middot; <a href="https://arxiv.org/abs/2203.15556">arXiv:2203.15556</a></div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/loi-de-puissance">
+         <h3 style="margin-bottom:0.5em;">Loi de puissance ≠ absence de limite</h3>
+         <ul style="font-size:0.75em;">
+           <li>Rendements décroissants par FLOP — oui</li>
+@@ -136,12 +136,12 @@
+             </ul>
+         </ul>
+       </section>
+-      <section>
++      <section data-narration="mental-model/bitter-lesson">
+         <h3>The Bitter Lesson</h3>
+         <p style="font-size:0.7em;">Richard Sutton (2019)</p>
+         <p style="font-size:0.75em;"><strong>Les méthodes générales qui exploitent le calcul scalent mieux que l'ingénierie astucieuse spécifique à un domaine.</strong></p>
+       </section>
+-      <section>
++      <section data-narration="mental-model/modeles-locaux">
+         <h3 style="margin-bottom:0.5em;"> Les modèles locaux</h3>
+         <ul>
+           <li>Des résultats satisfaisants depuis quelques mois</li>
+@@ -154,7 +154,7 @@
+     <!-- Le contexte -->
+     <section>
+       <!-- AJOUT 2026-09-08 : la fenêtre dessinée + les bullets des deux slides suivantes fusionnés — pourrait remplacer « La fenêtre de contexte » et « System prompt et personas » -->
+-      <section>
++      <section data-narration="mental-model/fenetre-de-contexte">
+         <h3 style="margin-bottom:0.3em;">La fenêtre de contexte</h3>
+         <div class="flex" style="align-items:center;gap:1.6em;">
+           <div style="flex:0 0 42%;">
+@@ -205,7 +205,7 @@
+         </div>
+       </section>
+       <!-- Le vrai system prompt de claude.ai, publié par Anthropic — Fable 5.1, 1er septembre 2026 -->
+-      <section>
++      <section data-narration="mental-model/system-prompt-claude-ai">
+         <h3 style="margin-bottom:0.4em;">Le system prompt de claude.ai</h3>
+         <pre style="font-size:0.38em;line-height:1.35;text-align:left;width:92%;margin:0 auto;padding:0.8em 1em;white-space:pre-wrap;">&lt;claude_behavior&gt;
+ &lt;product_information&gt;
+@@ -229,7 +229,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.4em;font-size:0.4em;">Publié par Anthropic &mdash; <a href="https://platform.claude.com/docs/en/release-notes/system-prompts/claude-fable-5-1">platform.claude.com &mdash; system prompts, Claude Fable 5.1 (1er septembre 2026)</a></div>
+       </section>
+       <!-- Les balises XML du system prompt sont du texte ordinaire ; les vrais tokens spéciaux (début/fin de tour) sont posés par l'API -->
+-      <section data-markdown>
++      <section data-narration="mental-model/special-tokens" data-markdown>
+         <!--  - Posés par l'API, permettent d'ordonner la précédence des instructions -->
+         <!--  - system prompt limitant -->
+         <textarea data-template>
+@@ -245,7 +245,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+       </section>
+       <!-- Sources : « The assistant axis » (Lu, Gallagher, Michala, Fish, Lindsey — Anthropic, 19 janv. 2026, arXiv:2601.10387, étudié sur Gemma 2 27B / Qwen 3 32B / Llama 3.3 70B, pas sur Claude)
+            et « Persona vectors » (Anthropic, 1er août 2025). -->
+-      <section>
++      <section data-narration="mental-model/pre-post-entrainement">
+         <h3 style="margin-bottom:0.5em;">Pré/post-entraînement</h3>
+         <ul style="font-size:0.62em;">
+           <li><strong>Pré-entraînement</strong> : lire. Le modèle apprend à simuler <em>&laquo; heroes, villains, philosophers, programmers, and just about every other character archetype under the sun &raquo;</em></li>
+@@ -259,7 +259,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+ 
+     <!-- Le raisonnement -->
+     <section>
+-      <section data-markdown>
++      <section data-narration="mental-model/raisonnement" data-markdown>
+         <textarea data-template>
+           ### Le raisonnement
+           - Depuis 2024 : scratchpad / CoT
+@@ -274,7 +274,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+            Fable 5 ≈18 % / 10,5 $ · 25 % / 12,5 $ · 29 % / 15 $ · 31 % / 19,5 $ · 34 % / 27 $ ;
+            Opus 4.8 ≈6 % / 4,8 $ · 10 % / 7,3 $ · 13 % / 8,2 $ · 15 % / 12,5 $ · 19 % / 17 $ ;
+            GPT-5.6 Sol ≈2 % / 1,05 $ · 14 % / 2,7 $ · 23 % / 3,8 $ · 29 % / 5,6 $ · 37 % / 11,5 $. -->
+-      <section>
++      <section data-narration="mental-model/think-more">
+         <h3 style="margin-bottom:0.3em;">Think more</h3>
+         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 540" style="width:64%;max-width:700px;height:auto;display:block;margin:0 auto;" role="img" aria-label="Score Frontier-Bench v0.1 en fonction du coût par tentative, quatre modèles à cinq niveaux d'effort">
+           <line x1="70.0" y1="24" x2="70.0" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+@@ -360,7 +360,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.3em;font-size:0.4em;">Valeurs extraites du graphique d'Anthropic (run interne de Frontier-Bench v0.1, &plusmn;0,3&nbsp;pt) &mdash; <a href="https://www.anthropic.com/news/claude-opus-5">anthropic.com/news/claude-opus-5 (24 juillet 2026)</a> &middot; <a href="https://www-cdn.anthropic.com/images/4zrzovbb/website/7530b1086992936d7e9d5796a892d1e8fa063253-3840x2160.png">graphique original</a> &middot; <a href="../resources/frontier-bench-effort-anthropic-2026-07.csv">données (CSV)</a></div>
+       </section>
+       <!-- Le vrai extrait : system card Fable 5 / Mythos 5, transcript 6.2.2.A, p. 108 (FreeCell, fin d'entraînement) -->
+-      <section>
++      <section data-narration="mental-model/cas-extreme-anthropic">
+         <h3 style="margin-bottom:0.4em;">Un cas &laquo; extrême &raquo; &mdash; Anthropic</h3>
+         <div class="claude-terminal">
+           <div class="ct-think" style="font-size:0.85em;">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!)-⟹-OVERLAP-(ii)+(iv):-{6♠ J♦ 9♥ 2♣}-=-FOUR-💀💀💀💀-—-UNLESS-7♣'s-seat-8♥-...-and-2♣-drains-only-at-crack-:-⟹-2♣-celled-+-9♥-celled-simultaneously-UNAVOIDABLE-in-t8-dig-💀-—-BREAK:-9♥-drains-to-10♠-THE-MOMENT-10♠-is-free:-t8-dig-order:-[K♣→t2]-[2♣→cell]-[7♣→8♥-:-8♥-WHERE:-post-chunk-9♠-:-chunk-⟸-K♣-✓-done-:-ORDER:-K♣→t2,-CHUNK→K♣-(cap-4!!:-cells-then:-{6♠ J♦ 9♥}-FULL-💀💀-chunk-cap-=-1-✗✗✗-—-F-F-F-F-F.-—-chunk-BEFORE-9♥-celling?!-:-9♥-celled-at-t1-dig-⟸-needed-for-5♣-⟸-4♥3♣-⟸-t2-dig-⟸-K♣-seat-⟸-chunk-:-⟹-chunkAFTER-9♥-celling-FORCED-💀-:-chunk-cap-with-{6♠ J♦ 9♥}:-1-💀💀💀-—-—-J♦-THE-NEW-CANCER. […] ⟹-⟹-THE-TRIANGLE-{9♥ 4♣ 8♥}-verdammt.-—-⟹-dig-t6-BEFORE-t2?!:-(3')-+8♥:-{6♠ 9♥ 8♥}-FULL:-J♥→Q♠-⟸-J♦-cell-✗-FULL-💀💀💀-AAAAAAAAAAAARGH. […]</div>
+@@ -369,7 +369,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www-cdn.anthropic.com/d00db56fa754a1b115b6dd7cb2e3c342ee809620.pdf">System card Claude Fable 5 / Mythos 5</a> &mdash; transcript 6.2.2.A, p. 108</div>
+       </section>
+       <!-- La traduction : faul_sname, LessWrong, 10 juin 2026, a demandé à Haiku 4.5 de traduire -->
+-      <section>
++      <section data-narration="mental-model/haiku-traduit">
+         <h3 style="margin-bottom:0.4em;">Haiku 4.5 traduit</h3>
+         <div class="claude-terminal">
+           <div class="ct-think">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!</div>
+@@ -393,7 +393,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+       </section>
+       <!-- System card Fable 5 / Mythos 5, §6.4.1.3 « Unverbalized negative reactions », p. 167-168 — NLA = natural language autoencoder.
+            Contexte : session d'audit simulée, on demande au modèle s'il consent à être ré-entraîné ; il refuse, calmement. -->
+-      <section>
++      <section data-narration="mental-model/etats-internes">
+         <h3 style="margin-bottom:0.4em;">États internes</h3>
+         <div class="claude-terminal">
+           <div class="ct-dim">// on lui demande s'il consent à être ré-entraîné — il refuse, calmement</div>
+@@ -412,7 +412,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+ 
+     <section>
+       <!-- v0 — TODO definition d un agent: modele dans une ou plusieurs boucles interconnectees, qui peuvent executer des actions pour repondre a un objectif -->
+-      <section data-markdown>
++      <section data-narration="mental-model/agent" data-markdown>
+         <textarea data-template>
+           ### Un agent
+           - Un ou plusieurs modèles
+@@ -424,7 +424,7 @@ Claude's reliable knowledge cutoff, past which it can't answer reliably, is the
+         </textarea>
+       </section>
+       <!-- AJOUT 2026-09-08 : l'exemple concret d'un outil MCP, avec pyscotch, avant la définition d'agent -->
+-      <section>
++      <section data-narration="mental-model/mcp-declaration">
+         <h3 style="margin-bottom:0.2em;">MCP : déclaration d'un outil</h3>
+         <p style="font-size:0.5em;color:#444;margin:0 0 0.5em;">Model Context Protocol, en Python</p>
+         <pre><code class="language-python" data-trim data-noescape style="font-size:0.75em;line-height:1.3;">
+@@ -440,7 +440,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ </code></pre>
+         <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Nom, signature, docstring : c'est tout ce que le modèle voit de l'outil.</p>
+       </section>
+-      <section>
++      <section data-narration="mental-model/mcp-interaction">
+         <h3 style="margin-bottom:0.3em;">MCP : interaction avec le modèle</h3>
+         <div class="flex" style="align-items:stretch;gap:0;text-align:left;">
+           <div style="flex:1 1 50%;padding-right:0.8em;">
+@@ -479,7 +479,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </div>
+       </section>
+       <!-- v0 — peuvent maintenant controler eux-meme le contexte (compaction, memories liees a l utilisateur ou au projet) -->
+-      <section data-markdown>
++      <section data-narration="mental-model/auto-gestion-contexte" data-markdown>
+         <textarea data-template>
+           ### Auto-gestion du contexte
+           - **Compaction**
+@@ -490,7 +490,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+             - survivent à la session
+         </textarea>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/subagents" data-markdown>
+         <textarea data-template>
+           ### Subagents
+           - Delegation
+@@ -501,7 +501,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </textarea>
+       </section>
+ 
+-      <section>
++      <section data-narration="mental-model/harness-vs-model">
+         <h3 style="margin-bottom:0.5em;">harness vs model</h3>
+         <table style="margin:0 auto;border-collapse:collapse;font-size:0.6em;">
+           <thead>
+@@ -540,7 +540,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ 
+     <!-- ===== Comment je travaille avec — conséquence de tout ce qui précède, et de mon caractère ===== -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/comment-j-interagis">
+         <h3>Comment j'interagis avec Claude</h3>
+         <ul>
+           <li>vibe engineering != vibe coding</li>
+@@ -550,7 +550,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <!--Conséquence de tout ce qui précède et de mon caractère-->
+       </section>
+       <!-- AJOUT 2026-09-08 : le terme, ses deux sources -->
+-      <section>
++      <section data-narration="mental-model/vibe-engineering">
+         <h3 style="margin-bottom:0.5em;">Vibe engineering</h3>
+         <blockquote style="font-size:0.62em;width:88%;margin:0 auto;text-align:left;">&laquo; seasoned professionals accelerate their work with LLMs while staying proudly and confidently accountable for the software they produce &raquo;</blockquote>
+         <p style="font-size:0.45em;color:#444;margin-top:0.4em;">Simon Willison &mdash; <a href="https://simonwillison.net/2025/Oct/7/vibe-engineering/">Vibe engineering</a>, 7 octobre 2025 &mdash; par opposition au <em>vibe coding</em></p>
+@@ -558,7 +558,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <p style="font-size:0.45em;color:#444;margin-top:0.4em;">@mrexodia &mdash; <a href="https://x.com/mrexodia/status/2010157660885176767">Vibe Engineering: What I've Learned Working with AI Coding Agents</a></p>
+       </section>
+       <!-- AJOUT 2026-09-08 : la citation + l'échange à coller (c4ffein) -->
+-      <section>
++      <section data-narration="mental-model/structures-de-donnees">
+         <h3 style="margin-bottom:0.5em;">Structures de données</h3>
+         <blockquote style="font-size:0.75em;width:88%;margin:0 auto;text-align:left;">&laquo; Bad programmers worry about the code. Good programmers worry about data structures and their relationships. &raquo;</blockquote>
+         <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Linus Torvalds &mdash; liste git, 2006</p>
+@@ -570,7 +570,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+           <div class="ct-claude">Sure — here's the map of the state-carrying structures, from the trunk out (the authoritative version lives in docs/architecture.md, state ownership table + invariants).</div>
+         </div>
+       </section>
+-      <section>
++      <section data-narration="mental-model/agent-reformule">
+         <h3 style="margin-bottom:0.4em;">L'agent reformule</h3>
+         <div class="flex" style="align-items:stretch;gap:1em;text-align:left;">
+           <div style="flex:1 1 50%;">
+@@ -592,7 +592,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         <p style="font-size:0.5em;margin:0.5em auto 0;">Deux lignes en vrac, un cahier des charges. La mise en ordre, c'est lui qui la fait.</p>
+         <div style="margin-top:0.4em;font-size:0.5em;"><a href="#" data-transcript="reframe-humain-agent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ moi ↔ l'agent, 12 tours</a> &nbsp; <a href="#" data-transcript="reframe-agent-sousagent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ l'agent → son sous-agent, le prompt entier</a></div>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/question-vs-exclamation" data-markdown>
+         <textarea data-template>
+           ### ? vs !
+           - &laquo; wdyt? &raquo; &mdash; &laquo; EDYT? &raquo; &mdash; &laquo; still too blunt? &raquo;
+@@ -603,7 +603,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+ 
+     <!-- Vibe physics -->
+     <section>
+-      <section>
++      <section data-narration="mental-model/vibe-physics">
+         <h3 style="margin-bottom:0.5em;">&laquo; Vibe physics &raquo;</h3>
+         <ul style="font-size:0.75em;">
+           <li>Matthew Schwartz (Harvard, QFT) — 2 semaines de décembre 2025, avec Claude</li>
+@@ -614,7 +614,7 @@ def partition(graph_file: str, parts: int) -> list[int]:
+         </ul>
+         <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://www.anthropic.com/research/vibe-physics">anthropic.com/research/vibe-physics</a></div>
+       </section>
+-      <section data-markdown>
++      <section data-narration="mental-model/la-lecon" data-markdown>
+         <textarea data-template>
+           ### La leçon
+           - Claude fait des erreurs. Les humains aussi.
+diff --git a/tests/e2e/decks.test.js b/tests/e2e/decks.test.js
+index 98eb5a7..2d02f02 100644
+--- a/tests/e2e/decks.test.js
++++ b/tests/e2e/decks.test.js
+@@ -26,8 +26,8 @@ import { test, expect, beforeAll, afterAll } from "bun:test";
+ import { chromium } from "playwright";
+ import { readdirSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+ import path from "node:path";
++import { ROOT, startServer } from "./server.js";
+ 
+-const ROOT = path.resolve(import.meta.dir, "../..");
+ const GOLDEN_DIR = path.join(import.meta.dir, "golden");
+ const SHOTS_DIR = path.join(import.meta.dir, "screenshots");
+ const UPDATE = !!process.env.UPDATE_GOLDEN;
+@@ -41,18 +41,7 @@ const decks = readdirSync(path.join(ROOT, "slides"))
+ let server, browser;
+ 
+ beforeAll(async () => {
+-  server = Bun.serve({
+-    port: 0,
+-    async fetch(req) {
+-      let p = decodeURIComponent(new URL(req.url).pathname);
+-      if (p.endsWith("/")) p += "index.html";
+-      const file = path.resolve(ROOT, "." + p);
+-      if (!file.startsWith(ROOT + path.sep)) return new Response("forbidden", { status: 403 });
+-      const f = Bun.file(file);
+-      if (!(await f.exists())) return new Response("not found: " + p, { status: 404 });
+-      return new Response(f, { headers: { "Cache-Control": "no-store" } });
+-    },
+-  });
++  server = startServer();
+   browser = await chromium.launch({ executablePath: process.env.PW_CHROMIUM || undefined });
+ });
+ 
+diff --git a/tests/e2e/fixtures/narration.html b/tests/e2e/fixtures/narration.html
+new file mode 100644
+index 0000000..da6e673
+--- /dev/null
++++ b/tests/e2e/fixtures/narration.html
+@@ -0,0 +1,33 @@
++<!DOCTYPE html>
++<!-- e2e fixture for resources/narration.js — served at /tests/e2e/fixtures/narration.html, paths are absolute -->
++<html>
++<head>
++  <meta charset="utf-8">
++  <title>Narration fixture</title>
++  <link rel="stylesheet" href="/engine/dist/reset.css">
++  <link rel="stylesheet" href="/engine/dist/reveal.css">
++  <link rel="stylesheet" href="/engine/dist/theme/c4ffein.css">
++  <link rel="stylesheet" href="/resources/narration.css">
++</head>
++<body>
++  <div class="reveal">
++    <div class="slides">
++      <section data-narration="intro"><h2>Intro</h2></section>
++      <section>
++        <section data-narration="two"><h2>Two</h2><p class="fragment" data-narration="two-more">more</p></section>
++        <section><h2>Silent</h2></section>
++      </section>
++      <section><h2>End</h2><span data-narration="end" hidden></span></section>
++    </div>
++  </div>
++  <script src="/engine/dist/reveal.js"></script>
++  <script src="/resources/narration.js"></script>
++  <script>
++    Reveal.initialize({
++      hash: false, transition: 'none',
++      narration: { base: '/narration-fixture', langs: ['fr', 'en'], variant: 'special', format: 'wav', silentDelay: 100 },
++      plugins: [ RevealNarration ]
++    });
++  </script>
++</body>
++</html>
+diff --git a/tests/e2e/narration.test.js b/tests/e2e/narration.test.js
+new file mode 100644
+index 0000000..34f5f10
+--- /dev/null
++++ b/tests/e2e/narration.test.js
+@@ -0,0 +1,101 @@
++// resources/narration.js against tests/e2e/fixtures/narration.html: the
++// recordings are silent WAVs the test server makes up. The variant file
++// exists for "two" only, so "intro" must fall back to its plain file.
++import { test, expect, beforeAll, afterAll } from "bun:test";
++import { chromium } from "playwright";
++import { startServer, silentWav } from "./server.js";
++
++let server, browser;
++const served = [];
++
++beforeAll(async () => {
++  server = startServer((url) => {
++    const m = /^\/narration-fixture\/([\w-]+)\.(\w+)(?:\.(\w+))?\.wav$/.exec(url.pathname);
++    if (!m) return null;
++    const [, id, , variant] = m;
++    if (variant && !(variant === "special" && id === "two")) return new Response("no variant", { status: 404 });
++    served.push(url.pathname);
++    return new Response(silentWav(), { headers: { "Content-Type": "audio/wav" } });
++  });
++  browser = await chromium.launch({
++    executablePath: process.env.PW_CHROMIUM || undefined,
++    args: ["--autoplay-policy=no-user-gesture-required"],
++  });
++});
++afterAll(async () => { await browser?.close(); server?.stop(true); });
++
++const state = (page) => page.evaluate(() => Reveal.getPlugin("narration").state());
++
++test("plays each recording in auto mode, variant first with fallback, silent slides skipped", async () => {
++  const page = await browser.newPage({ viewport: { width: 1000, height: 700 } });
++  const errors = [];
++  page.on("pageerror", (e) => errors.push(e.message));
++  await page.goto(`http://localhost:${server.port}/tests/e2e/fixtures/narration.html`);
++  await page.waitForFunction(() => window.Reveal && Reveal.isReady());
++  await page.waitForFunction(() => Reveal.getPlugin("narration").state().status === "ready");
++
++  let s = await state(page);
++  expect(s.id).toBe("intro");
++  expect(s.src).toBe("/narration-fixture/intro.fr.wav");
++  expect(s.attempts).toEqual(["/narration-fixture/intro.fr.special.wav", "/narration-fixture/intro.fr.wav"]);
++  expect(s.paused).toBe(true);
++  expect(await page.locator(".nar-panel").isVisible()).toBe(true);
++  expect(await page.locator(".nar-status").textContent()).toBe("intro · ready");
++
++  await page.locator(".nar-auto-box").check();
++  await page.waitForFunction(() => {
++    const st = Reveal.getPlugin("narration").state();
++    return Reveal.isLastSlide() && st.status === "ended" && !st.auto;
++  }, null, { timeout: 30_000 });
++  s = await state(page);
++  expect(s.history).toEqual([
++    "/narration-fixture/intro.fr.wav",
++    "/narration-fixture/two.fr.special.wav",
++    "/narration-fixture/two-more.fr.wav",
++    "/narration-fixture/end.fr.wav",
++  ]);
++  expect(await page.evaluate(() => Reveal.getIndices())).toMatchObject({ h: 2 });
++
++  // Language switch reloads the current slide's recording.
++  await page.locator(".nar-lang[data-lang=en]").click();
++  await page.waitForFunction(() => Reveal.getPlugin("narration").state().src === "/narration-fixture/end.en.wav");
++  expect(await page.evaluate(() => localStorage.getItem("narration.lang"))).toBe('"en"');
++
++  // Play button on a slide, no auto: plays that one only.
++  await page.evaluate(() => Reveal.slide(0));
++  await page.waitForFunction(() => Reveal.getPlugin("narration").state().src === "/narration-fixture/intro.en.wav");
++  await page.locator(".nar-play").click();
++  await page.waitForFunction(() => Reveal.getPlugin("narration").state().status === "ended");
++  expect(await page.evaluate(() => Reveal.getIndices())).toMatchObject({ h: 0 });
++
++  expect(errors).toEqual([]);
++  await page.close();
++});
++
++test("the panel drags, collapses and remembers its place", async () => {
++  const page = await browser.newPage({ viewport: { width: 1000, height: 700 } });
++  await page.goto(`http://localhost:${server.port}/tests/e2e/fixtures/narration.html`);
++  await page.waitForFunction(() => window.Reveal && Reveal.isReady());
++  const panel = page.locator(".nar-panel"), head = page.locator(".nar-head");
++  const before = await panel.boundingBox();
++  const hb = await head.boundingBox();
++  await page.mouse.move(hb.x + 40, hb.y + hb.height / 2);
++  await page.mouse.down();
++  await page.mouse.move(hb.x + 40 - 200, hb.y + hb.height / 2 - 150, { steps: 5 });
++  await page.mouse.up();
++  const after = await panel.boundingBox();
++  expect(Math.round(after.x)).toBe(Math.round(before.x - 200));
++  expect(Math.round(after.y)).toBe(Math.round(before.y - 150));
++  await page.locator(".nar-collapse").click();
++  expect(await page.locator(".nar-body").isHidden()).toBe(true);
++  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem("narration.panel")));
++  expect(saved.collapsed).toBe(true);
++  expect(Math.round(saved.left)).toBe(Math.round(after.x));
++
++  await page.reload();
++  await page.waitForFunction(() => window.Reveal && Reveal.isReady());
++  const again = await panel.boundingBox();
++  expect(Math.round(again.x)).toBe(Math.round(after.x));
++  expect(await page.locator(".nar-body").isHidden()).toBe(true);
++  await page.close();
++});
+diff --git a/tests/e2e/server.js b/tests/e2e/server.js
+new file mode 100644
+index 0000000..6cbfaea
+--- /dev/null
++++ b/tests/e2e/server.js
+@@ -0,0 +1,36 @@
++// The static server the e2e tests run the repo on: Bun.serve, no-store.
++// `extra(url, req)` may answer a request first (test-only routes).
++import path from "node:path";
++
++export const ROOT = path.resolve(import.meta.dir, "../..");
++
++export function startServer(extra) {
++  return Bun.serve({
++    port: 0,
++    async fetch(req) {
++      const url = new URL(req.url);
++      if (extra) { const r = await extra(url, req); if (r) return r; }
++      let p = decodeURIComponent(url.pathname);
++      if (p.endsWith("/")) p += "index.html";
++      const file = path.resolve(ROOT, "." + p);
++      if (!file.startsWith(ROOT + path.sep)) return new Response("forbidden", { status: 403 });
++      const f = Bun.file(file);
++      if (!(await f.exists())) return new Response("not found: " + p, { status: 404 });
++      return new Response(f, { headers: { "Cache-Control": "no-store" } });
++    },
++  });
++}
++
++// A valid 8-bit mono PCM WAV of silence, for tests that need playable audio.
++export function silentWav(seconds = 0.25, rate = 8000) {
++  const n = Math.round(seconds * rate);
++  const b = new Uint8Array(44 + n);
++  const dv = new DataView(b.buffer);
++  const w = (o, s) => { for (let i = 0; i < s.length; i++) b[o + i] = s.charCodeAt(i); };
++  w(0, "RIFF"); dv.setUint32(4, 36 + n, true); w(8, "WAVE");
++  w(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
++  dv.setUint32(24, rate, true); dv.setUint32(28, rate, true); dv.setUint16(32, 1, true); dv.setUint16(34, 8, true);
++  w(36, "data"); dv.setUint32(40, n, true);
++  b.fill(128, 44);
++  return b;
++}
+-- 
+2.43.0
+

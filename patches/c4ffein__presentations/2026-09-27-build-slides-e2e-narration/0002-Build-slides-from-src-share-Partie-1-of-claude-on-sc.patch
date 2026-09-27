@@ -1,7 +1,7 @@
 From fafc23f200fcd4d6319502694f14bd58f092976a Mon Sep 17 00:00:00 2001
 From: c4ffein <c4ffein.work@gmail.com>
 Date: Sun, 27 Sep 2026 09:31:08 +0000
-Subject: [PATCH 2/2] Build slides/ from src/, share Partie 1 of
+Subject: [PATCH 2/3] Build slides/ from src/, share Partie 1 of
  claude-on-scotch as its own deck
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
