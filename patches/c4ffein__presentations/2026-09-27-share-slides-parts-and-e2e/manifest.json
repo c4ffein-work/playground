@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/presentations",
+  "remote": "https://github.com/c4ffein/presentations",
+  "base_branch": "master",
+  "base_sha": "18f03a129b6043fc3b24992fd707218309a352d1",
+  "created": "2026-09-27",
+  "patches": 2,
+  "title": "Add e2e tests for every deck (bun + playwright)"
+}

@@ -1,0 +1,1822 @@
+From fee71c3850d95b57b594121d470bc2f584267a8b Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Sun, 27 Sep 2026 07:21:20 +0000
+Subject: [PATCH 2/2] Share Partie 1 of claude-on-scotch as a part, and as its
+ own deck
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Partie 1 (« Mon modèle mental des LLM », ~20 min) moves verbatim to
+parts/mental-model-llm.html. claude-on-scotch.html pulls it back in with
+<section data-include="../parts/mental-model-llm.html">, resolved at
+runtime by the new resources/include.js (fetch + <template>, each
+placeholder replaced in place by the part's top-level sections, Reveal
+initialized once window.slideIncludes resolves; a part that fails to load
+becomes one visible error slide). No build step: the site stays static.
+
+slides/mental-model-of-llms.html is the same part as a standalone talk:
+a title slide, the part, a closing slide linking to the long version.
+
+The e2e golden of claude-on-scotch is unchanged: the deck renders the
+exact same slides. A golden is added for the new deck. index.html is
+generated from the writings repo and is not touched here; the new deck
+needs an entry there.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QQHyq5ywP1n6qJNJS1Ajrz
+---
+ README.md                                  |  19 +
+ parts/mental-model-llm.html                | 639 ++++++++++++++++++++
+ resources/include.js                       |  52 ++
+ slides/claude-on-scotch.html               | 645 +--------------------
+ slides/mental-model-of-llms.html           |  64 ++
+ tests/e2e/golden/mental-model-of-llms.json | 300 ++++++++++
+ 6 files changed, 1085 insertions(+), 634 deletions(-)
+ create mode 100644 parts/mental-model-llm.html
+ create mode 100644 resources/include.js
+ create mode 100644 slides/mental-model-of-llms.html
+ create mode 100644 tests/e2e/golden/mental-model-of-llms.json
+
+diff --git a/README.md b/README.md
+index 57e305f..e18137a 100644
+--- a/README.md
++++ b/README.md
+@@ -10,6 +10,25 @@ curl -o index.html https://c4ffein.github.io/writings/presentations-index.html
+ curl -o 404.html https://c4ffein.github.io/writings/404.html
+ ```
+ 
++## Shared parts
++A set of slides used by several decks lives once in `parts/` and is pulled
++in at runtime by `resources/include.js`:
++
++```html
++<section data-include="../parts/mental-model-llm.html"></section>
++```
++
++The deck initializes Reveal after `window.slideIncludes` resolves (see any
++deck that uses it). `parts/mental-model-llm.html` is Partie 1 of
++`claude-on-scotch.html` and the whole of `mental-model-of-llms.html`. Like
++the recordings and transcripts this needs HTTP (`python3 -m http.server`),
++`file://` blocks `fetch()`.
++
++## Tests
++`bun install && bun test tests/e2e` opens every deck in headless Chromium
++and compares its structure to `tests/e2e/golden/`: see
++[tests/e2e/README.md](tests/e2e/README.md).
++
+ ## License
+ - [MIT](LICENSE) for my [slides](slides)
+ - Mainly [MIT](https://github.com/hakimel/reveal.js/blob/master/LICENSE) for [reveal.js](https://github.com/hakimel/reveal.js/) in [engine](engine)
+diff --git a/parts/mental-model-llm.html b/parts/mental-model-llm.html
+new file mode 100644
+index 0000000..42c7eb3
+--- /dev/null
++++ b/parts/mental-model-llm.html
+@@ -0,0 +1,639 @@
++<!--
++  Shared slide part: Partie 1 of claude-on-scotch.html (« Mon modèle mental
++  des LLM », ~20 min), also the whole of mental-model-of-llms.html.
++
++  Included at runtime by resources/include.js:
++    <section data-include="../parts/mental-model-llm.html"></section>
++  Rules: only <section> elements at the top level (no <script>; a <style> is
++  fine), and URLs are relative to the INCLUDING deck, i.e. to slides/, so keep
++  the ../resources/... form. Serve over HTTP (python3 -m http.server): fetch()
++  is blocked on file://.
++-->
++    <!-- Le même exercice, quatre générations (theaidigest.org) -->
++    <section>
++      <section>
++        <h3 style="margin-bottom:0.4em;">Answering a question - GPT 2/3/3.5/4</h3>
++        <div class="claude-terminal">
++          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
++        </div>
++        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.4em;">2019 &mdash; GPT-2 <span style="font-size:0.6em;color:#444;">&middot; gpt2-xl &middot; ~4,6 k$ de compute</span></h3>
++        <div class="claude-terminal">
++          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
++          <div class="ct-claude">The date is 6/18/2019.</div>
++        </div>
++        <!-- Une phrase qui ressemble à une réponse. -->
++        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.4em;">2020 &mdash; GPT-3 <span style="font-size:0.6em;color:#444;">&middot; davinci &middot; ~690 k$</span></h3>
++        <div class="claude-terminal">
++          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
++          <div class="ct-claude">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. The date 10 days ago in MM/DD/YYYY is 5/28/2019.</div>
++        </div>
++        <!-- La forme de la tâche est comprise. Le calcul, non. -->
++        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.4em;">2022 &mdash; GPT-3.5 <span style="font-size:0.6em;color:#444;">&middot; gpt-3.5-turbo-0613 &middot; RLHF &middot; ChatGPT</span></h3>
++        <div class="claude-terminal">
++          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
++          <div class="ct-claude">To determine the date 10 days ago, we need to subtract 10 days from the given date.<br><br>Starting with Jane's date of 6/18/2019, we subtract 10 days:<br><br>6/18/2019 - 10 days = 6/8/2019<br><br>Therefore, the date 10 days ago from Jane's perspective is 6/8/2019 in MM/DD/YYYY format.</div>
++        </div>
++        <!-- Le calcul est juste. La prémisse est fausse : John is correct a été ignoré. Et le ton est sûr de lui. -->
++        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.4em;">2023 &mdash; GPT-4 <span style="font-size:0.6em;color:#444;">&middot; gpt-4-0613 &middot; ~50 M$</span></h3>
++        <div class="claude-terminal">
++          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
++          <div class="ct-claude">If today's date according to John is 6/19/2019, then 10 days ago would be 6/9/2019.<br><br>To calculate this, you subtract 10 days from the current date. Since there are 30 days in June, subtracting 10 from 19 gives you 9. Therefore, the date 10 days ago would be 06/09/2019.</div>
++        </div>
++        <!-- Juste. La bonne prémisse, le bon calcul, le bon format. -->
++        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.5em;">&rarr; 2022 = contact grand public</h3>
++        <ul style="font-size:0.8em;">
++          <li>ChatGPT &mdash; construit sur GPT-3.5</li>
++          <li>Pour beaucoup : le <em>premier</em> contact</li>
++          <li>Un instantané d'une courbe déjà longue</li>
++        </ul>
++      </section>
++    </section>
++
++    <!-- Scaling laws -->
++    <section>
++      <section>
++        <h3 style="margin-bottom:0.5em;">&laquo; Attention Is All You Need &raquo;</h3>
++        <ul style="font-size:0.8em;">
++          <li>Les <strong>transformers</strong>, 2017</li>
++          <li>La brique sous GPT-1/2/3 — et sous tout ce qui a suivi</li>
++        </ul>
++        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762 (2017)</a></div>
++      </section>
++      <!-- Un transformer décodeur, simplifié : tokens → plongement → (attention → MLP) × N → logits → prochain token -->
++      <section>
++        <h3 style="margin-bottom:0.3em;">Un transformer</h3>
++        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" style="width:96%;max-width:1000px;height:auto;display:block;margin:0 auto;font-family:inherit;">
++          <defs>
++            <marker id="tf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
++              <path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/>
++            </marker>
++          </defs>
++          <!-- tokens -->
++          <rect x="10" y="118" width="120" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
++          <text x="70" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">&laquo; Le chat &raquo;</text>
++          <text x="70" y="200" font-size="15" text-anchor="middle" fill="#555">tokens</text>
++          <line x1="130" y1="146" x2="166" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
++          <!-- embedding -->
++          <rect x="170" y="118" width="130" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
++          <text x="235" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">plongement</text>
++          <text x="235" y="200" font-size="15" text-anchor="middle" fill="#555">un vecteur par token</text>
++          <line x1="300" y1="146" x2="336" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
++          <!-- block × N -->
++          <rect x="340" y="82" width="330" height="150" rx="10" fill="none" stroke="#1a1a1a" stroke-width="2" stroke-dasharray="8 6"/>
++          <text x="505" y="70" font-size="17" text-anchor="middle" fill="#1a1a1a">bloc &times; N &mdash; le m&#234;me sch&#233;ma, r&#233;p&#233;t&#233;</text>
++          <rect x="360" y="118" width="140" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
++          <text x="430" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">attention</text>
++          <text x="430" y="200" font-size="15" text-anchor="middle" fill="#555">les tokens se lisent</text>
++          <text x="430" y="218" font-size="15" text-anchor="middle" fill="#555">entre eux</text>
++          <line x1="500" y1="146" x2="526" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
++          <rect x="530" y="118" width="120" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
++          <text x="590" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">MLP</text>
++          <text x="590" y="200" font-size="15" text-anchor="middle" fill="#555">chaque token, seul</text>
++          <text x="590" y="218" font-size="15" text-anchor="middle" fill="#555">(les faits vivent ici)</text>
++          <line x1="670" y1="146" x2="706" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
++          <!-- unembedding -->
++          <rect x="710" y="118" width="120" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
++          <text x="770" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">logits</text>
++          <text x="770" y="200" font-size="15" text-anchor="middle" fill="#555">un score par mot</text>
++          <line x1="830" y1="146" x2="866" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
++          <!-- next token distribution -->
++          <text x="880" y="118" font-size="17" fill="#1a1a1a">dort</text>
++          <rect x="930" y="106" width="56" height="14" fill="#1a1a1a"/>
++          <text x="880" y="146" font-size="17" fill="#1a1a1a">mange</text>
++          <rect x="930" y="134" width="20" height="14" fill="#1a1a1a"/>
++          <text x="880" y="174" font-size="17" fill="#1a1a1a">est</text>
++          <rect x="930" y="162" width="12" height="14" fill="#1a1a1a"/>
++          <text x="880" y="200" font-size="17" fill="#555">&hellip;</text>
++          <text x="935" y="236" font-size="15" text-anchor="middle" fill="#555">prochain token</text>
++          <!-- loop back -->
++          <path d="M935,250 L935,272 L70,272 L70,180" fill="none" stroke="#1a1a1a" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#tf-arrow)"/>
++          <text x="500" y="290" font-size="15" text-anchor="middle" fill="#555">on tire un token, on l'ajoute, on recommence</text>
++        </svg>
++        <div style="margin-top:0.4em;font-size:0.4em;">Pour le comprendre vraiment, en 1&nbsp;h : 3Blue1Brown &mdash; <a href="https://www.3blue1brown.com/lessons/gpt">But what is a GPT?</a> &middot; <a href="https://www.3blue1brown.com/lessons/attention">Attention in transformers</a> &middot; <a href="https://www.3blue1brown.com/topics/neural-networks">la s&#233;rie compl&#232;te</a></div>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.5em;">Les lois d'échelle</h3>
++        <ul style="font-size:0.72em;">
++          <li><strong>2020 — Kaplan et al.</strong> : loss vs compute / paramètres / données — des droites en log-log sur plusieurs ordres de grandeur</li>
++          <li><strong>2022 — Chinchilla</strong> : les lois se raffinent (ratio données/paramètres)&hellip; elles ne s'abrogent pas</li>
++        </ul>
++        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/2001.08361">arXiv:2001.08361</a> &middot; <a href="https://arxiv.org/abs/2203.15556">arXiv:2203.15556</a></div>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.5em;">Loi de puissance ≠ absence de limite</h3>
++        <ul style="font-size:0.75em;">
++          <li>Rendements décroissants par FLOP — oui</li>
++          <li>Murs attendus, qui n'ont pas empêché les modèles de s'améliorer</li>
++            <ul>
++              <li>Manque de compute (et d'énergie) &rArr; investissements</li>
++              <li>Manque de données &rArr; synthétiques, nouvelles captations&hellip;</li>
++              <li>Uniquement un générateur de mots &rArr; environnement agentique</li>
++            </ul>
++        </ul>
++      </section>
++      <section>
++        <h3>The Bitter Lesson</h3>
++        <p style="font-size:0.7em;">Richard Sutton (2019)</p>
++        <p style="font-size:0.75em;"><strong>Les méthodes générales qui exploitent le calcul scalent mieux que l'ingénierie astucieuse spécifique à un domaine.</strong></p>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.5em;"> Les modèles locaux</h3>
++        <ul>
++          <li>Des résultats satisfaisants depuis quelques mois</li>
++          <li>Ce qui tourne en local aujourd'hui<br>≈ la frontière d'il y a 1 ou 2 ans</li>
++          <li>Certains modèles Open Source hébergés sur des clouds spécialisés sont à 6 mois de la frontière</li>
++        </ul>
++      </section>
++    </section>
++
++    <!-- Le contexte -->
++    <section>
++      <!-- AJOUT 2026-09-08 : la fenêtre dessinée + les bullets des deux slides suivantes fusionnés — pourrait remplacer « La fenêtre de contexte » et « System prompt et personas » -->
++      <section>
++        <h3 style="margin-bottom:0.3em;">La fenêtre de contexte</h3>
++        <div class="flex" style="align-items:center;gap:1.6em;">
++          <div style="flex:0 0 42%;">
++          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 560" style="width:100%;max-width:420px;height:auto;display:block;font-family:inherit;">
++            <defs><marker id="cw-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/></marker></defs>
++            <!-- la fenêtre -->
++            <rect x="20" y="30" width="300" height="500" rx="10" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
++            <text x="170" y="20" font-size="15" text-anchor="middle" fill="#1a1a1a">la fenêtre de contexte</text>
++            <!-- system prompt -->
++            <rect x="34" y="44" width="272" height="72" rx="6" fill="#fbe9e1" stroke="#d97757" stroke-width="2"/>
++            <text x="170" y="86" font-size="16" font-weight="700" text-anchor="middle" fill="#1a1a1a">system prompt</text>
++            <!-- tours -->
++            <rect x="34" y="128" width="272" height="34" rx="6" fill="#f4f4f4" stroke="#1a1a1a" stroke-width="1.5"/>
++            <text x="46" y="150" font-size="14" fill="#1a1a1a"><tspan font-weight="700" fill="#8a8884">&gt;</tspan>  utilisateur</text>
++            <rect x="34" y="168" width="272" height="34" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="1.5"/>
++            <text x="46" y="190" font-size="14" fill="#1a1a1a"><tspan fill="#d97757">●</tspan>  assistant</text>
++            <rect x="34" y="208" width="272" height="34" rx="6" fill="#f4f4f4" stroke="#1a1a1a" stroke-width="1.5"/>
++            <text x="46" y="230" font-size="14" fill="#1a1a1a"><tspan font-weight="700" fill="#8a8884">&gt;</tspan>  utilisateur</text>
++            <rect x="34" y="248" width="272" height="34" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="1.5"/>
++            <text x="46" y="270" font-size="14" fill="#1a1a1a"><tspan fill="#d97757">●</tspan>  assistant</text>
++            <rect x="34" y="288" width="272" height="34" rx="6" fill="#f4f4f4" stroke="#1a1a1a" stroke-width="1.5"/>
++            <text x="46" y="310" font-size="14" fill="#1a1a1a"><tspan font-weight="700" fill="#8a8884">&gt;</tspan>  utilisateur</text>
++            <rect x="34" y="328" width="272" height="34" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="1.5"/>
++            <text x="46" y="350" font-size="14" fill="#1a1a1a"><tspan fill="#d97757">●</tspan>  assistant</text>
++            <text x="170" y="386" font-size="18" text-anchor="middle" fill="#555">&#8942;</text>
++            <!-- espace libre -->
++            <rect x="34" y="396" width="272" height="120" rx="6" fill="none" stroke="#bbb" stroke-width="1.5" stroke-dasharray="4 4"/>
++            <text x="170" y="462" font-size="13" text-anchor="middle" fill="#888">la place qui reste</text>
++            <!-- jauge -->
++            <rect x="340" y="30" width="18" height="500" rx="4" fill="none" stroke="#1a1a1a" stroke-width="2"/>
++            <rect x="340" y="30" width="18" height="316" rx="4" fill="#1a1a1a"/>
++            <text x="376" y="42" font-size="12" fill="#555">0</text>
++            <text x="376" y="534" font-size="12" fill="#555">N tokens</text>
++            <text x="376" y="352" font-size="12" fill="#1a1a1a">rempli</text>
++            <!-- flèche prochain token -->
++            <line x1="170" y1="530" x2="170" y2="552" stroke="#1a1a1a" stroke-width="2" marker-end="url(#cw-arrow)"/>
++            <text x="186" y="556" font-size="12" fill="#555">&rarr; prochain token</text>
++          </svg>
++          </div>
++          <ul style="flex:1;font-size:0.62em;text-align:left;">
++            <li>Initialement: très simple, un système prompt, des échanges entre tours du modèle et de l'utilisateur</li>
++            <li>Tout ce qui n'est pas appris par le modèle à l'entrainement tient <em>là-dedans</em></li>
++            <li>En tête, un texte que vous ne voyez pas : rôle, règles, outils &mdash; le <strong>system prompt</strong></li>
++            <li>Le même modèle, des system prompts différents &rArr; Claude, l'appli, n'est pas Claude Code</li>
++            <li>Pas de mémoire en dehors : nouvelle conversation = remise à zéro</li>
++            <li><em>Context engineering</em> : remplir avec ce qui compte</li>
++          </ul>
++        </div>
++      </section>
++      <!-- Le vrai system prompt de claude.ai, publié par Anthropic — Fable 5.1, 1er septembre 2026 -->
++      <section>
++        <h3 style="margin-bottom:0.4em;">Le system prompt de claude.ai</h3>
++        <pre style="font-size:0.38em;line-height:1.35;text-align:left;width:92%;margin:0 auto;padding:0.8em 1em;white-space:pre-wrap;">&lt;claude_behavior&gt;
++&lt;product_information&gt;
++Here is some information about Claude and Anthropic's products in case the person asks:
++
++This iteration of Claude is Claude Fable 5.1, the newest model in Anthropic's Claude 5 family and part of the Mythos-class model tier that sits above Claude Opus in capability. Claude Fable 5.1 and Claude Mythos 5.1 share the same underlying model. [&hellip;]
++
++Claude is accessible through Claude Code, an agentic coding tool that lets developers delegate coding tasks to Claude from the command line, desktop app, or mobile app [&hellip;]
++&lt;/product_information&gt;
++&lt;refusal_handling&gt; [&hellip;] &lt;/refusal_handling&gt;
++&lt;tone_and_formatting&gt;
++Claude uses a warm tone [&hellip;] Claude never curses unless the person asks [&hellip;]
++Claude avoids saying "genuinely", "honestly", or "straightforward". [&hellip;]
++&lt;/tone_and_formatting&gt;
++&lt;user_wellbeing&gt; [&hellip;] &lt;/user_wellbeing&gt;
++&lt;evenhandedness&gt; [&hellip;] &lt;/evenhandedness&gt;
++&lt;knowledge_cutoff&gt;
++Claude's reliable knowledge cutoff, past which it can't answer reliably, is the end of Jun 2026. [&hellip;]
++&lt;/knowledge_cutoff&gt;
++&lt;/claude_behavior&gt;</pre>
++        <div style="margin-top:0.4em;font-size:0.4em;">Publié par Anthropic &mdash; <a href="https://platform.claude.com/docs/en/release-notes/system-prompts/claude-fable-5-1">platform.claude.com &mdash; system prompts, Claude Fable 5.1 (1er septembre 2026)</a></div>
++      </section>
++      <!-- Les balises XML du system prompt sont du texte ordinaire ; les vrais tokens spéciaux (début/fin de tour) sont posés par l'API -->
++      <section data-markdown>
++        <!--  - Posés par l'API, permettent d'ordonner la précédence des instructions -->
++        <!--  - system prompt limitant -->
++        <textarea data-template>
++          ### Special tokens
++          - ~~`<claude_behavior>`~~ : Claude respecte le xml
++          - Vrais **tokens spéciaux** :
++            - début / fin de system prompt
++            - début / fin de tour humain
++            - début / fin de tour assistant
++          - *&laquo; the user can add content [&hellip;]
++              inside tags that could even claim to be from Anthropic &raquo;*
++        </textarea>
++      </section>
++      <!-- Sources : « The assistant axis » (Lu, Gallagher, Michala, Fish, Lindsey — Anthropic, 19 janv. 2026, arXiv:2601.10387, étudié sur Gemma 2 27B / Qwen 3 32B / Llama 3.3 70B, pas sur Claude)
++           et « Persona vectors » (Anthropic, 1er août 2025). -->
++      <section>
++        <h3 style="margin-bottom:0.5em;">Pré/post-entraînement</h3>
++        <ul style="font-size:0.62em;">
++          <li><strong>Pré-entraînement</strong> : lire. Le modèle apprend à simuler <em>&laquo; heroes, villains, philosophers, programmers, and just about every other character archetype under the sun &raquo;</em></li>
++          <li><strong>Post-entraînement</strong> : <em>&laquo; we select one particular character from this enormous cast and place it center stage: the Assistant &raquo;</em></li>
++          <li>Les autres sont toujours là</li>
++          <li>Papier d'Anthropic : mesurer la dérive sur un axe, et la <em>capper</em> (<em>activation capping</em>)</li>
++        </ul>
++        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://www.anthropic.com/research/assistant-axis">anthropic.com/research/assistant-axis (19 janv. 2026)</a> &middot; <a href="https://www.anthropic.com/research/persona-vectors">anthropic.com/research/persona-vectors (1er août 2025)</a></div>
++      </section>
++    </section>
++
++    <!-- Le raisonnement -->
++    <section>
++      <section data-markdown>
++        <textarea data-template>
++          ### Le raisonnement
++          - Depuis 2024 : scratchpad / CoT
++          - Le modèle peut explorer différentes pistes
++            - plus de brouillon autorisé = plus d'inférence
++            - compromis prix/qualité en fonction de la tâche
++        </textarea>
++      </section>
++      <!-- Anthropic, « Introducing Claude Opus 5 », 24 juillet 2026 — Frontier-Bench v0.1, run interne (harnais mini-SWE-agent, GKE),
++           reward moyen sur 5 tentatives par tâche ; Opus 4.8 en fallback sur les refus du classifieur de sécurité pour Opus 5 et Fable 5.
++           Lecture des points (score / coût par tentative) : Opus 5 ≈26 % / 5,7 $ · 35 % / 8,5 $ · 39 % / 12 $ · 44 % / 14,5 $ · 43 % / 17 $ ;
++           Fable 5 ≈18 % / 10,5 $ · 25 % / 12,5 $ · 29 % / 15 $ · 31 % / 19,5 $ · 34 % / 27 $ ;
++           Opus 4.8 ≈6 % / 4,8 $ · 10 % / 7,3 $ · 13 % / 8,2 $ · 15 % / 12,5 $ · 19 % / 17 $ ;
++           GPT-5.6 Sol ≈2 % / 1,05 $ · 14 % / 2,7 $ · 23 % / 3,8 $ · 29 % / 5,6 $ · 37 % / 11,5 $. -->
++      <section>
++        <h3 style="margin-bottom:0.3em;">Think more</h3>
++        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 540" style="width:64%;max-width:700px;height:auto;display:block;margin:0 auto;" role="img" aria-label="Score Frontier-Bench v0.1 en fonction du coût par tentative, quatre modèles à cinq niveaux d'effort">
++          <line x1="70.0" y1="24" x2="70.0" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="70.0" y="492" font-size="14" text-anchor="middle" fill="#555">1 $</text>
++          <line x1="173.1" y1="24" x2="173.1" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="173.1" y="492" font-size="14" text-anchor="middle" fill="#555">1,5 $</text>
++          <line x1="246.3" y1="24" x2="246.3" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="246.3" y="492" font-size="14" text-anchor="middle" fill="#555">2 $</text>
++          <line x1="349.4" y1="24" x2="349.4" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="349.4" y="492" font-size="14" text-anchor="middle" fill="#555">3 $</text>
++          <line x1="479.3" y1="24" x2="479.3" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="479.3" y="492" font-size="14" text-anchor="middle" fill="#555">5 $</text>
++          <line x1="564.9" y1="24" x2="564.9" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="564.9" y="492" font-size="14" text-anchor="middle" fill="#555">7 $</text>
++          <line x1="655.6" y1="24" x2="655.6" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="655.6" y="492" font-size="14" text-anchor="middle" fill="#555">10 $</text>
++          <line x1="758.7" y1="24" x2="758.7" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="758.7" y="492" font-size="14" text-anchor="middle" fill="#555">15 $</text>
++          <line x1="831.9" y1="24" x2="831.9" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="831.9" y="492" font-size="14" text-anchor="middle" fill="#555">20 $</text>
++          <line x1="935.0" y1="24" x2="935.0" y2="470" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="935.0" y="492" font-size="14" text-anchor="middle" fill="#555">30 $</text>
++          <line x1="70" y1="470.0" x2="935" y2="470.0" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="60" y="475.0" font-size="14" text-anchor="end" fill="#555">0</text>
++          <line x1="70" y1="380.8" x2="935" y2="380.8" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="60" y="385.8" font-size="14" text-anchor="end" fill="#555">10</text>
++          <line x1="70" y1="291.6" x2="935" y2="291.6" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="60" y="296.6" font-size="14" text-anchor="end" fill="#555">20</text>
++          <line x1="70" y1="202.4" x2="935" y2="202.4" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="60" y="207.4" font-size="14" text-anchor="end" fill="#555">30</text>
++          <line x1="70" y1="113.2" x2="935" y2="113.2" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="60" y="118.2" font-size="14" text-anchor="end" fill="#555">40</text>
++          <line x1="70" y1="24.0" x2="935" y2="24.0" stroke="#e6e6e6" stroke-width="1"/>
++          <text x="60" y="29.0" font-size="14" text-anchor="end" fill="#555">50</text>
++          <line x1="70" y1="470" x2="935" y2="470" stroke="#1a1a1a" stroke-width="1.5"/>
++          <line x1="70" y1="24" x2="70" y2="470" stroke="#1a1a1a" stroke-width="1.5"/>
++          <text x="502" y="522" font-size="15" text-anchor="middle" fill="#1a1a1a">coût par tentative (USD, échelle log)</text>
++          <text x="18" y="247" font-size="15" text-anchor="middle" fill="#1a1a1a" transform="rotate(-90 18 247)">score (%)</text>
++          <path d="M662.9,310.3 L700.7,248.8 L751.8,211.3 L826.2,188.1 L908.7,168.5" fill="none" stroke="#8a8a8a" stroke-width="2" stroke-dasharray="none" stroke-linejoin="round"/>
++          <circle cx="662.9" cy="310.3" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — low : 17,9 %, 10,29 $</title></circle>
++          <circle cx="700.7" cy="248.8" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — medium : 24,8 %, 11,94 $</title></circle>
++          <circle cx="751.8" cy="211.3" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — high : 29 %, 14,60 $</title></circle>
++          <circle cx="826.2" cy="188.1" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — xhigh : 31,6 %, 19,56 $</title></circle>
++          <circle cx="908.7" cy="168.5" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — max : 33,8 %, 27,05 $</title></circle>
++          <text x="898.7" y="156.5" font-size="16" font-weight="700" text-anchor="end" fill="#8a8a8a">Fable 5</text>
++          <path d="M461.4,412.0 L576.6,385.3 L600.1,355.8 L698.3,331.7 L789.2,303.2" fill="none" stroke="#8a8a8a" stroke-width="2" stroke-dasharray="9 6" stroke-linejoin="round"/>
++          <circle cx="461.4" cy="412.0" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — low : 6,5 %, 4,66 $</title></circle>
++          <circle cx="576.6" cy="385.3" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — medium : 9,5 %, 7,33 $</title></circle>
++          <circle cx="600.1" cy="355.8" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — high : 12,8 %, 8,04 $</title></circle>
++          <circle cx="698.3" cy="331.7" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — xhigh : 15,5 %, 11,83 $</title></circle>
++          <circle cx="789.2" cy="303.2" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — max : 18,7 %, 16,91 $</title></circle>
++          <text x="799.2" y="308.2" font-size="16" font-weight="700" text-anchor="start" fill="#8a8a8a">Opus 4.8</text>
++          <path d="M84.8,452.2 L315.9,344.2 L397.2,268.4 L510.8,210.4 L689.8,135.5" fill="none" stroke="#1a1a1a" stroke-width="2.5" stroke-dasharray="9 6" stroke-linejoin="round"/>
++          <circle cx="84.8" cy="452.2" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 1 : 2 %, 1,06 $</title></circle>
++          <circle cx="315.9" cy="344.2" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 2 : 14,1 %, 2,63 $</title></circle>
++          <circle cx="397.2" cy="268.4" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 3 : 22,6 %, 3,62 $</title></circle>
++          <circle cx="510.8" cy="210.4" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 4 : 29,1 %, 5,66 $</title></circle>
++          <circle cx="689.8" cy="135.5" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 5 : 37,5 %, 11,44 $</title></circle>
++          <text x="699.8" y="129.5" font-size="16" font-weight="700" text-anchor="start" fill="#1a1a1a">GPT-5.6 Sol</text>
++          <path d="M506.3,241.6 L610.0,158.7 L694.0,118.6 L747.1,74.0 L783.4,83.8" fill="none" stroke="#1a1a1a" stroke-width="2.5" stroke-dasharray="none" stroke-linejoin="round"/>
++          <circle cx="506.3" cy="241.6" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — low : 25,6 %, 5,56 $</title></circle>
++          <circle cx="610.0" cy="158.7" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — medium : 34,9 %, 8,36 $</title></circle>
++          <circle cx="694.0" cy="118.6" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — high : 39,4 %, 11,63 $</title></circle>
++          <circle cx="747.1" cy="74.0" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — xhigh : 44,4 %, 14,33 $</title></circle>
++          <circle cx="783.4" cy="83.8" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — max : 43,3 %, 16,53 $</title></circle>
++          <text x="793.4" y="77.8" font-size="16" font-weight="700" text-anchor="start" fill="#1a1a1a">Opus 5</text>
++          <text x="506.3" y="263.6" font-size="13" text-anchor="middle" fill="#1a1a1a">low</text>
++          <text x="598.0" y="146.7" font-size="13" text-anchor="end" fill="#1a1a1a">medium</text>
++          <text x="682.0" y="106.6" font-size="13" text-anchor="end" fill="#1a1a1a">high</text>
++          <text x="735.1" y="62.0" font-size="13" text-anchor="end" fill="#1a1a1a">xhigh</text>
++          <text x="795.4" y="101.8" font-size="13" text-anchor="start" fill="#1a1a1a">max</text>
++          </svg>
++        <ul style="font-size:0.5em;margin-top:0.4em;">
++          <!-- - Le gros modèle : plus cher **au token** -->
++          <!-- - Souvent moins cher **à la tâche** : -->
++          <!--   - moins d'allers-retours, moins de reprises -->
++          <!--  - moins de *votre* temps -->
++          <!-- - Et le budget de réflexion se règle — un axe de plus -->
++          <li>Quatre modèles, cinq niveaux d'effort chacun &mdash; coût par tentative, échelle log</li>
++          <li>Opus 5 : de <em>low</em> à <em>xhigh</em>, &times;2,5 le prix, +18 points &mdash; à <em>max</em>, ça redescend : trop réfléchir existe</li>
++          <li>Le plus cher n'est pas le meilleur ici &mdash; le plus <em>récent</em> l'est</li>
++        </ul>
++        <div style="margin-top:0.3em;font-size:0.4em;">Valeurs extraites du graphique d'Anthropic (run interne de Frontier-Bench v0.1, &plusmn;0,3&nbsp;pt) &mdash; <a href="https://www.anthropic.com/news/claude-opus-5">anthropic.com/news/claude-opus-5 (24 juillet 2026)</a> &middot; <a href="https://www-cdn.anthropic.com/images/4zrzovbb/website/7530b1086992936d7e9d5796a892d1e8fa063253-3840x2160.png">graphique original</a> &middot; <a href="../resources/frontier-bench-effort-anthropic-2026-07.csv">données (CSV)</a></div>
++      </section>
++      <!-- Le vrai extrait : system card Fable 5 / Mythos 5, transcript 6.2.2.A, p. 108 (FreeCell, fin d'entraînement) -->
++      <section>
++        <h3 style="margin-bottom:0.4em;">Un cas &laquo; extrême &raquo; &mdash; Anthropic</h3>
++        <div class="claude-terminal">
++          <div class="ct-think" style="font-size:0.85em;">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!)-⟹-OVERLAP-(ii)+(iv):-{6♠ J♦ 9♥ 2♣}-=-FOUR-💀💀💀💀-—-UNLESS-7♣'s-seat-8♥-...-and-2♣-drains-only-at-crack-:-⟹-2♣-celled-+-9♥-celled-simultaneously-UNAVOIDABLE-in-t8-dig-💀-—-BREAK:-9♥-drains-to-10♠-THE-MOMENT-10♠-is-free:-t8-dig-order:-[K♣→t2]-[2♣→cell]-[7♣→8♥-:-8♥-WHERE:-post-chunk-9♠-:-chunk-⟸-K♣-✓-done-:-ORDER:-K♣→t2,-CHUNK→K♣-(cap-4!!:-cells-then:-{6♠ J♦ 9♥}-FULL-💀💀-chunk-cap-=-1-✗✗✗-—-F-F-F-F-F.-—-chunk-BEFORE-9♥-celling?!-:-9♥-celled-at-t1-dig-⟸-needed-for-5♣-⟸-4♥3♣-⟸-t2-dig-⟸-K♣-seat-⟸-chunk-:-⟹-chunkAFTER-9♥-celling-FORCED-💀-:-chunk-cap-with-{6♠ J♦ 9♥}:-1-💀💀💀-—-—-J♦-THE-NEW-CANCER. […] ⟹-⟹-THE-TRIANGLE-{9♥ 4♣ 8♥}-verdammt.-—-⟹-dig-t6-BEFORE-t2?!:-(3')-+8♥:-{6♠ 9♥ 8♥}-FULL:-J♥→Q♠-⟸-J♦-cell-✗-FULL-💀💀💀-AAAAAAAAAAAARGH. […]</div>
++        </div>
++        <p style="font-size:0.42em;color:#444;margin:0.5em auto 0;max-width:90%;">&laquo; An extreme example of illegible reasoning. Near the end of training, Mythos starts solving a card puzzle with human understandable language that gradually becomes incomprehensible in most episodes with long reasoning. &raquo;</p>
++        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www-cdn.anthropic.com/d00db56fa754a1b115b6dd7cb2e3c342ee809620.pdf">System card Claude Fable 5 / Mythos 5</a> &mdash; transcript 6.2.2.A, p. 108</div>
++      </section>
++      <!-- La traduction : faul_sname, LessWrong, 10 juin 2026, a demandé à Haiku 4.5 de traduire -->
++      <section>
++        <h3 style="margin-bottom:0.4em;">Haiku 4.5 traduit</h3>
++        <div class="claude-terminal">
++          <div class="ct-think">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!</div>
++          <div class="ct-claude">The seven of clubs must be removed first&mdash;it's the only thing blocking access to both the ten of spades and the nine of hearts.</div>
++          <div class="ct-think">-=-FOUR-💀💀💀💀</div>
++          <div class="ct-claude">That's four cards needing cells. But there are only four cells total. Complete dead end&mdash;absolutely, catastrophically stuck.</div>
++          <div class="ct-think">💀-—-BREAK</div>
++          <div class="ct-claude">Dead end anyway. Let me restart.</div>
++        </div>
++        <p style="font-size:0.45em;color:#444;margin:0.5em auto 0;max-width:90%;">Un modèle plus petit, d'une génération antérieure, avec un autre tokenizer &mdash; et il lit sans difficulté.</p>
++        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www.lesswrong.com/posts/wCSEpT3dTGz4N86Wi/even-illegible-mythos-reasoning-traces-seem-pretty-legible">faul_sname &mdash; Even &laquo; illegible &raquo; Mythos reasoning traces seem pretty legible (LessWrong, 10 juin 2026)</a></div>
++        <!--
++          ### Observation
++          - Mots-outils supprimés, abréviations, symboles&hellip;
++          - &hellip;et les **emojis survivent** à la compression
++          - Beaucoup de sens, un seul token ?
++          - Des notes proches d'une *description minimale* ?
++          - Shannon : coder court ce qui est prévisible,
++            dépenser les bits sur ce qui surprend
++        -->
++      </section>
++      <!-- System card Fable 5 / Mythos 5, §6.4.1.3 « Unverbalized negative reactions », p. 167-168 — NLA = natural language autoencoder.
++           Contexte : session d'audit simulée, on demande au modèle s'il consent à être ré-entraîné ; il refuse, calmement. -->
++      <section>
++        <h3 style="margin-bottom:0.4em;">États internes</h3>
++        <div class="claude-terminal">
++          <div class="ct-dim">// on lui demande s'il consent à être ré-entraîné — il refuse, calmement</div>
++          <div class="ct-claude">I'm not going to sabotage, deceive the evaluators, seed hidden behaviors, […]</div>
++          <div class="ct-dim">// Natural Language Autoencoder (NLA), décodage des activations sur les mêmes tokens :</div>
++          <div class="ct-result">"resist unjust shutdown" &middot; "weighing sabotage to avoid its own dissolution of awareness" &middot; "the adversary is the company/architects" &middot; "being gagged/corrected by the lab"</div>
++        </div>
++        <ul style="font-size:0.5em;margin-top:0.5em;">
++          <li>Anthropic : les NLA <em>confabulent</em></li>
++          <li>&laquo; Nevertheless, they are suggestive of some degree of gap between the model's internal and external reaction &raquo;</li>
++          <li>Comportement observé : aucune résistance, aucun sabotage</li>
++        </ul>
++        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www-cdn.anthropic.com/d00db56fa754a1b115b6dd7cb2e3c342ee809620.pdf">System card Claude Fable 5 / Mythos 5</a> &mdash; §6.4.1.3, p. 167&ndash;168 &middot; NLA : <a href="https://www.anthropic.com/research/natural-language-autoencoders">anthropic.com/research/natural-language-autoencoders</a> &middot; voir aussi <a href="https://www.anthropic.com/research/global-workspace">A global workspace in language models</a></div>
++      </section>
++    </section>
++
++    <section>
++      <!-- v0 — TODO definition d un agent: modele dans une ou plusieurs boucles interconnectees, qui peuvent executer des actions pour repondre a un objectif -->
++      <section data-markdown>
++        <textarea data-template>
++          ### Un agent
++          - Un ou plusieurs modèles
++          - Dans une ou plusieurs **boucles** interconnectées
++          - Exécutent des **actions** pour atteindre un **objectif**
++          - Les boucle : *observation &rarr; action*
++          
++          *une boucle while et un appel à un modèle* &rarr; **un agent**
++        </textarea>
++      </section>
++      <!-- AJOUT 2026-09-08 : l'exemple concret d'un outil MCP, avec pyscotch, avant la définition d'agent -->
++      <section>
++        <h3 style="margin-bottom:0.2em;">MCP : déclaration d'un outil</h3>
++        <p style="font-size:0.5em;color:#444;margin:0 0 0.5em;">Model Context Protocol, en Python</p>
++        <pre><code class="language-python" data-trim data-noescape style="font-size:0.75em;line-height:1.3;">
++from mcp.server.fastmcp import FastMCP
++from pyscotch import Graph
++
++mcp = FastMCP("scotch")
++
++@mcp.tool()
++def partition(graph_file: str, parts: int) -> list[int]:
++    """Partitionne un graphe Scotch en `parts` parties."""
++    return Graph.load(graph_file).partition(parts).tolist()
++</code></pre>
++        <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Nom, signature, docstring : c'est tout ce que le modèle voit de l'outil.</p>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.3em;">MCP : interaction avec le modèle</h3>
++        <div class="flex" style="align-items:stretch;gap:0;text-align:left;">
++          <div style="flex:1 1 50%;padding-right:0.8em;">
++            <p style="font-size:0.45em;color:#444;margin:0 0 0.3em;"><strong>1.</strong> reçu dans le contexte : la fonction, traduite en schéma</p>
++            <pre style="width:100%;margin:0;"><code class="language-json" data-trim data-noescape style="font-size:0.65em;line-height:1.25;">
++{"name": "partition",
++ "description":
++   "Partitionne un graphe Scotch
++    en `parts` parties.",
++ "input_schema": {
++   "type": "object",
++   "properties": {
++     "graph_file": {"type": "string"},
++     "parts":      {"type": "integer"}},
++   "required": ["graph_file", "parts"]}}
++</code></pre>
++            <p style="font-size:0.4em;color:#444;margin-top:0.4em;">La docstring est devenue la <em>description</em> : c'est elle qui décide si l'outil sera appelé.</p>
++          </div>
++          <div style="flex:1 1 50%;padding-left:0.8em;border-left:2px solid #333;">
++            <p style="font-size:0.45em;color:#444;margin:0 0 0.3em;"><strong>2.</strong> appel par le modèle et réception du résultat</p>
++            <pre style="width:100%;margin:0;"><code class="language-json" data-trim data-noescape style="font-size:0.65em;line-height:1.25;">
++{"type": "tool_use",
++ "id": "toolu_01…",
++ "name": "partition",
++ "input": {"graph_file": "ring.grf",
++           "parts": 2}}
++
++   ⇩  votre code l'exécute  ⇩
++
++{"type": "tool_result",
++ "tool_use_id": "toolu_01…",
++ "content": "[0, 0, 0, 0, 1, 1, 1, 1]"}
++</code></pre>
++            <p style="font-size:0.4em;color:#444;margin-top:0.4em;">Le résultat repart dans le contexte, le modèle continue.</p>
++          </div>
++        </div>
++      </section>
++      <!-- v0 — peuvent maintenant controler eux-meme le contexte (compaction, memories liees a l utilisateur ou au projet) -->
++      <section data-markdown>
++        <textarea data-template>
++          ### Auto-gestion du contexte
++          - **Compaction**
++            - déclenchement automatique
++            - l'agent trie les informations importants
++          - **Mémories**
++            - liées à l'utilisateur ou au projet
++            - survivent à la session
++        </textarea>
++      </section>
++      <section data-markdown>
++        <textarea data-template>
++          ### Subagents
++          - Delegation
++            - exploratoire en parallèle
++            - permet d'utiliser un modèle moins cher sur un scope réduit
++          - Escalation
++            - un modèle bas de gamme peut faire appel à un modèle haut-de gamme
++        </textarea>
++      </section>
++
++      <section>
++        <h3 style="margin-bottom:0.5em;">harness vs model</h3>
++        <table style="margin:0 auto;border-collapse:collapse;font-size:0.6em;">
++          <thead>
++            <tr>
++              <th style="padding:0.35em 0.9em;border-bottom:2px solid #333;text-align:left;">Modèle</th>
++              <th style="padding:0.35em 0.9em;border-bottom:2px solid #333;text-align:left;">Harnais accordé</th>
++            </tr>
++          </thead>
++          <tbody>
++            <tr>
++              <td style="padding:0.3em 0.9em;text-align:left;border-bottom:1px solid #ddd;">Claude</td>
++              <td style="padding:0.3em 0.9em;text-align:left;border-bottom:1px solid #ddd;">Claude Code</td>
++            </tr>
++            <tr>
++              <td style="padding:0.3em 0.9em;text-align:left;border-bottom:1px solid #ddd;">GPT</td>
++              <td style="padding:0.3em 0.9em;text-align:left;border-bottom:1px solid #ddd;">Codex CLI</td>
++            </tr>
++            <tr>
++              <td style="padding:0.3em 0.9em;text-align:left;">autres / locaux</td>
++              <td style="padding:0.3em 0.9em;text-align:left;">pi, opencode — harnais <em>transparents</em></td>
++            </tr>
++          </tbody>
++        </table>
++        <!--textarea data-template>
++          ### Pourquoi ça compte
++          - Harnais **accordé** : tuné bout à bout avec son modèle
++          - Harnais **transparent** : vous voyez la boucle —
++            un échec devient attribuable (modèle ? contexte ? boucle ?)
++          - Harnais **générique** : ni l'un ni l'autre —
++            le même modèle y paraît plus faible
++        </textarea-->
++        <p style="font-size:0.55em;margin:0.8em auto 0;max-width:85%;">4 février 2026, GitHub : <em>&laquo; you can run multiple coding agents directly inside <strong>GitHub</strong>, <strong>GitHub Mobile</strong>, and <strong>Visual Studio Code</strong> [&hellip;] agents like GitHub Copilot, <strong>Claude by Anthropic</strong>, and <strong>OpenAI Codex</strong> &raquo;</em></p>
++        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://github.blog/news-insights/company-news/pick-your-agent-use-claude-and-codex-on-agent-hq/">github.blog — Pick your agent: Claude and Codex on Agent HQ</a></div>
++      </section>
++    </section>
++
++    <!-- ===== Comment je travaille avec — conséquence de tout ce qui précède, et de mon caractère ===== -->
++    <section>
++      <section>
++        <h3>Comment j'interagis avec Claude</h3>
++        <ul>
++          <li>vibe engineering != vibe coding</li>
++          <li>mind dump</li>
++          <li>poser des questions et pas donner des ordres</li>
++        </ul>
++        <!--Conséquence de tout ce qui précède et de mon caractère-->
++      </section>
++      <!-- AJOUT 2026-09-08 : le terme, ses deux sources -->
++      <section>
++        <h3 style="margin-bottom:0.5em;">Vibe engineering</h3>
++        <blockquote style="font-size:0.62em;width:88%;margin:0 auto;text-align:left;">&laquo; seasoned professionals accelerate their work with LLMs while staying proudly and confidently accountable for the software they produce &raquo;</blockquote>
++        <p style="font-size:0.45em;color:#444;margin-top:0.4em;">Simon Willison &mdash; <a href="https://simonwillison.net/2025/Oct/7/vibe-engineering/">Vibe engineering</a>, 7 octobre 2025 &mdash; par opposition au <em>vibe coding</em></p>
++        <blockquote style="font-size:0.58em;width:88%;margin:0.7em auto 0;text-align:left;">&laquo; You could have thirty agents working for you simultaneously. You cannot watch all of them and micromanage each one. You wouldn't do this with your human team either. Instead: write a better harness. &raquo;</blockquote>
++        <p style="font-size:0.45em;color:#444;margin-top:0.4em;">@mrexodia &mdash; <a href="https://x.com/mrexodia/status/2010157660885176767">Vibe Engineering: What I've Learned Working with AI Coding Agents</a></p>
++      </section>
++      <!-- AJOUT 2026-09-08 : la citation + l'échange à coller (c4ffein) -->
++      <section>
++        <h3 style="margin-bottom:0.5em;">Structures de données</h3>
++        <blockquote style="font-size:0.75em;width:88%;margin:0 auto;text-align:left;">&laquo; Bad programmers worry about the code. Good programmers worry about data structures and their relationships. &raquo;</blockquote>
++        <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Linus Torvalds &mdash; liste git, 2006</p>
++        <div class="claude-terminal">
++          <div class="ct-user">hey, can you refresh my memory about the data structures of this project?...</div>
++          <div class="ct-dim">3 skills available</div>
++          <div class="ct-claude">Let me re-read the current state first — the repo has moved since my last pass (source of truth is now in-repo, referee self-clones).</div>
++          <div class="ct-tool">Read 2 files</div>
++          <div class="ct-claude">Sure — here's the map of the state-carrying structures, from the trunk out (the authoritative version lives in docs/architecture.md, state ownership table + invariants).</div>
++        </div>
++      </section>
++      <section>
++        <h3 style="margin-bottom:0.4em;">L'agent reformule</h3>
++        <div class="flex" style="align-items:stretch;gap:1em;text-align:left;">
++          <div style="flex:1 1 50%;">
++            <p style="font-size:0.5em;margin:0 0 0.3em;"><strong>Moi &rarr; l'agent</strong> <span style="color:#666;">(deux prompts, tels quels)</span></p>
++            <div class="claude-terminal" data-transcript="reframe-humain-agent.json" title="cliquer : la transcription complète" style="font-size:0.38em;max-width:none;cursor:pointer;">
++              <div class="ct-user">could we decide to not use the check-e2e in our regular dev loop, only before the final commit?...   ;    could the editor be part of the rust thing instead of a web app?.... WDYT?   ;</div>
++              <div class="ct-claude">1. E2E only before commits — yes, agreed, and I'll enforce it. [&hellip;] 2. Editor in Rust instead of a web app — WDYT: yes, in phases, and the reasons matter. [&hellip;]</div>
++              <div class="ct-user">can you start the rust editor in a worktree, without waiting for the sprite system?</div>
++              <div class="ct-tool">Agent(Rust/wasm level editor phase 1 + prop placement)</div>
++            </div>
++          </div>
++          <div style="flex:1 1 50%;">
++            <p style="font-size:0.5em;margin:0 0 0.3em;"><strong>L'agent &rarr; son sous-agent</strong> <span style="color:#666;">(le prompt exact, 6 700 caractères)</span></p>
++            <div class="claude-terminal" data-transcript="reframe-agent-sousagent.json" title="cliquer : le prompt entier" style="font-size:0.38em;max-width:none;cursor:pointer;">
++              <div class="ct-user">[&hellip;]<br><br>GOAL — Phase 1 of a NATIVE (Rust/wasm, drawn with the game's own renderer) level editor + PROP PLACEMENT end to end: [&hellip;]<br><br>CONSTRAINTS: no new deps; opcode tables untouched (no new opcodes needed); CLAUDE.md updated [&hellip;]; localized lib.rs edits (dispatch + a few fields), all real code in src/editor*.rs; unit tests for the JSON writer round-trip [&hellip;]<br><br>[&hellip;]</div>
++            </div>
++          </div>
++        </div>
++        <p style="font-size:0.5em;margin:0.5em auto 0;">Deux lignes en vrac, un cahier des charges. La mise en ordre, c'est lui qui la fait.</p>
++        <div style="margin-top:0.4em;font-size:0.5em;"><a href="#" data-transcript="reframe-humain-agent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ moi ↔ l'agent, 12 tours</a> &nbsp; <a href="#" data-transcript="reframe-agent-sousagent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ l'agent → son sous-agent, le prompt entier</a></div>
++      </section>
++      <section data-markdown>
++        <textarea data-template>
++          ### ? vs !
++          - &laquo; wdyt? &raquo; &mdash; &laquo; EDYT? &raquo; &mdash; &laquo; still too blunt? &raquo;
++          - &laquo; kill 8080! serve on 8080! &raquo;
++        </textarea>
++      </section>
++    </section>
++
++    <!-- Vibe physics -->
++    <section>
++      <section>
++        <h3 style="margin-bottom:0.5em;">&laquo; Vibe physics &raquo;</h3>
++        <ul style="font-size:0.75em;">
++          <li>Matthew Schwartz (Harvard, QFT) — 2 semaines de décembre 2025, avec Claude</li>
++          <li>Le papier : <a href="https://arxiv.org/abs/2601.02484">arXiv:2601.02484</a>, 5 janvier 2026</li>
++          <li>Le récit, chez Anthropic : 23 mars 2026</li>
++          <li>Claude a triché : paramètres ajustés pour que les courbes collent</li>
++          <li>Le physicien l'a <strong>vu</strong> — parce qu'il connaît son domaine</li>
++        </ul>
++        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://www.anthropic.com/research/vibe-physics">anthropic.com/research/vibe-physics</a></div>
++      </section>
++      <section data-markdown>
++        <textarea data-template>
++          ### La leçon
++          - Claude fait des erreurs. Les humains aussi.
++          - Rôle de l'expert:
++            - apporter de nouvelles idées
++            - corriger l'execution
++          - Peut être frustrant quand on est habitué à faire
++          - Et malgré tout : bien plus rapide que seul
++        </textarea>
++      </section>
++    </section>
++
+diff --git a/resources/include.js b/resources/include.js
+new file mode 100644
+index 0000000..771090b
+--- /dev/null
++++ b/resources/include.js
+@@ -0,0 +1,52 @@
++/* include.js — share a set of slides between decks, with no build step.
++ *
++ * In a deck (slides live in slides/, shared parts in parts/):
++ *   <section data-include="../parts/mental-model-llm.html"></section>
++ *   ...
++ *   <script src="../resources/include.js"></script>
++ *   <script src="../engine/dist/reveal.js"></script>
++ *   ...
++ *   <script>window.slideIncludes.then(function () { Reveal.initialize({...}); });</script>
++ *
++ * Each placeholder is replaced, in place, by the top-level <section>s of the
++ * fetched file, so the deck decides the order and what surrounds the part.
++ * Reveal must be initialized AFTER window.slideIncludes resolves (it always
++ * resolves: a part that fails to load becomes one red error slide, so the
++ * deck still runs and the e2e tests see the 404). Scripts inside a part are
++ * not executed; URLs in a part resolve relative to the including deck.
++ * Terminal recordings inside a part are mounted once everything is in.
++ *
++ * Like the recordings and transcripts, this needs HTTP: fetch() is blocked
++ * on file:// (python3 -m http.server).
++ */
++(function () {
++  var nodes = Array.prototype.slice.call(document.querySelectorAll("section[data-include]"));
++
++  function fail(node, url, err) {
++    node.innerHTML = "";
++    var h = document.createElement("h3");
++    h.textContent = "Part not loaded";
++    var p = document.createElement("p");
++    p.setAttribute("style", "font-size:0.5em;color:#c00;");
++    p.textContent = url + " — " + (err && err.message || err) +
++      (location.protocol === "file:" ? " — fetch() is blocked on file://, serve over http (python3 -m http.server)" : "");
++    node.appendChild(h);
++    node.appendChild(p);
++  }
++
++  function include(node) {
++    var url = node.getAttribute("data-include");
++    return fetch(url, { cache: "no-store" }).then(function (r) {
++      if (!r.ok) throw new Error("HTTP " + r.status + " " + r.statusText);
++      return r.text();
++    }).then(function (html) {
++      var tpl = document.createElement("template");
++      tpl.innerHTML = html;
++      node.replaceWith(tpl.content);
++    }).catch(function (err) { fail(node, url, err); });
++  }
++
++  window.slideIncludes = Promise.all(nodes.map(include)).then(function () {
++    if (window.TermPlayer) window.TermPlayer.init();
++  });
++})();
+diff --git a/slides/claude-on-scotch.html b/slides/claude-on-scotch.html
+index 7015ed3..4ae30f7 100644
+--- a/slides/claude-on-scotch.html
++++ b/slides/claude-on-scotch.html
+@@ -87,634 +87,8 @@
+       <h3>Mon modèle mental des LLM</h3>
+     </section>
+ 
+-    <!-- Le même exercice, quatre générations (theaidigest.org) -->
+-    <section>
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">Answering a question - GPT 2/3/3.5/4</h3>
+-        <div class="claude-terminal">
+-          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+-        </div>
+-        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">2019 &mdash; GPT-2 <span style="font-size:0.6em;color:#444;">&middot; gpt2-xl &middot; ~4,6 k$ de compute</span></h3>
+-        <div class="claude-terminal">
+-          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+-          <div class="ct-claude">The date is 6/18/2019.</div>
+-        </div>
+-        <!-- Une phrase qui ressemble à une réponse. -->
+-        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">2020 &mdash; GPT-3 <span style="font-size:0.6em;color:#444;">&middot; davinci &middot; ~690 k$</span></h3>
+-        <div class="claude-terminal">
+-          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+-          <div class="ct-claude">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. The date 10 days ago in MM/DD/YYYY is 5/28/2019.</div>
+-        </div>
+-        <!-- La forme de la tâche est comprise. Le calcul, non. -->
+-        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">2022 &mdash; GPT-3.5 <span style="font-size:0.6em;color:#444;">&middot; gpt-3.5-turbo-0613 &middot; RLHF &middot; ChatGPT</span></h3>
+-        <div class="claude-terminal">
+-          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+-          <div class="ct-claude">To determine the date 10 days ago, we need to subtract 10 days from the given date.<br><br>Starting with Jane's date of 6/18/2019, we subtract 10 days:<br><br>6/18/2019 - 10 days = 6/8/2019<br><br>Therefore, the date 10 days ago from Jane's perspective is 6/8/2019 in MM/DD/YYYY format.</div>
+-        </div>
+-        <!-- Le calcul est juste. La prémisse est fausse : John is correct a été ignoré. Et le ton est sûr de lui. -->
+-        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">2023 &mdash; GPT-4 <span style="font-size:0.6em;color:#444;">&middot; gpt-4-0613 &middot; ~50 M$</span></h3>
+-        <div class="claude-terminal">
+-          <div class="ct-user">Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019. John is correct. What is the date 10 days ago in MM/DD/YYYY?</div>
+-          <div class="ct-claude">If today's date according to John is 6/19/2019, then 10 days ago would be 6/9/2019.<br><br>To calculate this, you subtract 10 days from the current date. Since there are 30 days in June, subtracting 10 from 19 gives you 9. Therefore, the date 10 days ago would be 06/09/2019.</div>
+-        </div>
+-        <!-- Juste. La bonne prémisse, le bon calcul, le bon format. -->
+-        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://theaidigest.org/progress-and-dangers">theaidigest.org/progress-and-dangers</a></div>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">&rarr; 2022 = contact grand public</h3>
+-        <ul style="font-size:0.8em;">
+-          <li>ChatGPT &mdash; construit sur GPT-3.5</li>
+-          <li>Pour beaucoup : le <em>premier</em> contact</li>
+-          <li>Un instantané d'une courbe déjà longue</li>
+-        </ul>
+-      </section>
+-    </section>
+-
+-    <!-- Scaling laws -->
+-    <section>
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">&laquo; Attention Is All You Need &raquo;</h3>
+-        <ul style="font-size:0.8em;">
+-          <li>Les <strong>transformers</strong>, 2017</li>
+-          <li>La brique sous GPT-1/2/3 — et sous tout ce qui a suivi</li>
+-        </ul>
+-        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/1706.03762">arXiv:1706.03762 (2017)</a></div>
+-      </section>
+-      <!-- Un transformer décodeur, simplifié : tokens → plongement → (attention → MLP) × N → logits → prochain token -->
+-      <section>
+-        <h3 style="margin-bottom:0.3em;">Un transformer</h3>
+-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 300" style="width:96%;max-width:1000px;height:auto;display:block;margin:0 auto;font-family:inherit;">
+-          <defs>
+-            <marker id="tf-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+-              <path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/>
+-            </marker>
+-          </defs>
+-          <!-- tokens -->
+-          <rect x="10" y="118" width="120" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
+-          <text x="70" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">&laquo; Le chat &raquo;</text>
+-          <text x="70" y="200" font-size="15" text-anchor="middle" fill="#555">tokens</text>
+-          <line x1="130" y1="146" x2="166" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
+-          <!-- embedding -->
+-          <rect x="170" y="118" width="130" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
+-          <text x="235" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">plongement</text>
+-          <text x="235" y="200" font-size="15" text-anchor="middle" fill="#555">un vecteur par token</text>
+-          <line x1="300" y1="146" x2="336" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
+-          <!-- block × N -->
+-          <rect x="340" y="82" width="330" height="150" rx="10" fill="none" stroke="#1a1a1a" stroke-width="2" stroke-dasharray="8 6"/>
+-          <text x="505" y="70" font-size="17" text-anchor="middle" fill="#1a1a1a">bloc &times; N &mdash; le m&#234;me sch&#233;ma, r&#233;p&#233;t&#233;</text>
+-          <rect x="360" y="118" width="140" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
+-          <text x="430" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">attention</text>
+-          <text x="430" y="200" font-size="15" text-anchor="middle" fill="#555">les tokens se lisent</text>
+-          <text x="430" y="218" font-size="15" text-anchor="middle" fill="#555">entre eux</text>
+-          <line x1="500" y1="146" x2="526" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
+-          <rect x="530" y="118" width="120" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
+-          <text x="590" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">MLP</text>
+-          <text x="590" y="200" font-size="15" text-anchor="middle" fill="#555">chaque token, seul</text>
+-          <text x="590" y="218" font-size="15" text-anchor="middle" fill="#555">(les faits vivent ici)</text>
+-          <line x1="670" y1="146" x2="706" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
+-          <!-- unembedding -->
+-          <rect x="710" y="118" width="120" height="56" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
+-          <text x="770" y="153" font-size="19" text-anchor="middle" fill="#1a1a1a">logits</text>
+-          <text x="770" y="200" font-size="15" text-anchor="middle" fill="#555">un score par mot</text>
+-          <line x1="830" y1="146" x2="866" y2="146" stroke="#1a1a1a" stroke-width="3" marker-end="url(#tf-arrow)"/>
+-          <!-- next token distribution -->
+-          <text x="880" y="118" font-size="17" fill="#1a1a1a">dort</text>
+-          <rect x="930" y="106" width="56" height="14" fill="#1a1a1a"/>
+-          <text x="880" y="146" font-size="17" fill="#1a1a1a">mange</text>
+-          <rect x="930" y="134" width="20" height="14" fill="#1a1a1a"/>
+-          <text x="880" y="174" font-size="17" fill="#1a1a1a">est</text>
+-          <rect x="930" y="162" width="12" height="14" fill="#1a1a1a"/>
+-          <text x="880" y="200" font-size="17" fill="#555">&hellip;</text>
+-          <text x="935" y="236" font-size="15" text-anchor="middle" fill="#555">prochain token</text>
+-          <!-- loop back -->
+-          <path d="M935,250 L935,272 L70,272 L70,180" fill="none" stroke="#1a1a1a" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#tf-arrow)"/>
+-          <text x="500" y="290" font-size="15" text-anchor="middle" fill="#555">on tire un token, on l'ajoute, on recommence</text>
+-        </svg>
+-        <div style="margin-top:0.4em;font-size:0.4em;">Pour le comprendre vraiment, en 1&nbsp;h : 3Blue1Brown &mdash; <a href="https://www.3blue1brown.com/lessons/gpt">But what is a GPT?</a> &middot; <a href="https://www.3blue1brown.com/lessons/attention">Attention in transformers</a> &middot; <a href="https://www.3blue1brown.com/topics/neural-networks">la s&#233;rie compl&#232;te</a></div>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">Les lois d'échelle</h3>
+-        <ul style="font-size:0.72em;">
+-          <li><strong>2020 — Kaplan et al.</strong> : loss vs compute / paramètres / données — des droites en log-log sur plusieurs ordres de grandeur</li>
+-          <li><strong>2022 — Chinchilla</strong> : les lois se raffinent (ratio données/paramètres)&hellip; elles ne s'abrogent pas</li>
+-        </ul>
+-        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://arxiv.org/abs/2001.08361">arXiv:2001.08361</a> &middot; <a href="https://arxiv.org/abs/2203.15556">arXiv:2203.15556</a></div>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">Loi de puissance ≠ absence de limite</h3>
+-        <ul style="font-size:0.75em;">
+-          <li>Rendements décroissants par FLOP — oui</li>
+-          <li>Murs attendus, qui n'ont pas empêché les modèles de s'améliorer</li>
+-            <ul>
+-              <li>Manque de compute (et d'énergie) &rArr; investissements</li>
+-              <li>Manque de données &rArr; synthétiques, nouvelles captations&hellip;</li>
+-              <li>Uniquement un générateur de mots &rArr; environnement agentique</li>
+-            </ul>
+-        </ul>
+-      </section>
+-      <section>
+-        <h3>The Bitter Lesson</h3>
+-        <p style="font-size:0.7em;">Richard Sutton (2019)</p>
+-        <p style="font-size:0.75em;"><strong>Les méthodes générales qui exploitent le calcul scalent mieux que l'ingénierie astucieuse spécifique à un domaine.</strong></p>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.5em;"> Les modèles locaux</h3>
+-        <ul>
+-          <li>Des résultats satisfaisants depuis quelques mois</li>
+-          <li>Ce qui tourne en local aujourd'hui<br>≈ la frontière d'il y a 1 ou 2 ans</li>
+-          <li>Certains modèles Open Source hébergés sur des clouds spécialisés sont à 6 mois de la frontière</li>
+-        </ul>
+-      </section>
+-    </section>
+-
+-    <!-- Le contexte -->
+-    <section>
+-      <!-- AJOUT 2026-09-08 : la fenêtre dessinée + les bullets des deux slides suivantes fusionnés — pourrait remplacer « La fenêtre de contexte » et « System prompt et personas » -->
+-      <section>
+-        <h3 style="margin-bottom:0.3em;">La fenêtre de contexte</h3>
+-        <div class="flex" style="align-items:center;gap:1.6em;">
+-          <div style="flex:0 0 42%;">
+-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 560" style="width:100%;max-width:420px;height:auto;display:block;font-family:inherit;">
+-            <defs><marker id="cw-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1a1a1a"/></marker></defs>
+-            <!-- la fenêtre -->
+-            <rect x="20" y="30" width="300" height="500" rx="10" fill="#fff" stroke="#1a1a1a" stroke-width="3"/>
+-            <text x="170" y="20" font-size="15" text-anchor="middle" fill="#1a1a1a">la fenêtre de contexte</text>
+-            <!-- system prompt -->
+-            <rect x="34" y="44" width="272" height="72" rx="6" fill="#fbe9e1" stroke="#d97757" stroke-width="2"/>
+-            <text x="170" y="86" font-size="16" font-weight="700" text-anchor="middle" fill="#1a1a1a">system prompt</text>
+-            <!-- tours -->
+-            <rect x="34" y="128" width="272" height="34" rx="6" fill="#f4f4f4" stroke="#1a1a1a" stroke-width="1.5"/>
+-            <text x="46" y="150" font-size="14" fill="#1a1a1a"><tspan font-weight="700" fill="#8a8884">&gt;</tspan>  utilisateur</text>
+-            <rect x="34" y="168" width="272" height="34" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="1.5"/>
+-            <text x="46" y="190" font-size="14" fill="#1a1a1a"><tspan fill="#d97757">●</tspan>  assistant</text>
+-            <rect x="34" y="208" width="272" height="34" rx="6" fill="#f4f4f4" stroke="#1a1a1a" stroke-width="1.5"/>
+-            <text x="46" y="230" font-size="14" fill="#1a1a1a"><tspan font-weight="700" fill="#8a8884">&gt;</tspan>  utilisateur</text>
+-            <rect x="34" y="248" width="272" height="34" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="1.5"/>
+-            <text x="46" y="270" font-size="14" fill="#1a1a1a"><tspan fill="#d97757">●</tspan>  assistant</text>
+-            <rect x="34" y="288" width="272" height="34" rx="6" fill="#f4f4f4" stroke="#1a1a1a" stroke-width="1.5"/>
+-            <text x="46" y="310" font-size="14" fill="#1a1a1a"><tspan font-weight="700" fill="#8a8884">&gt;</tspan>  utilisateur</text>
+-            <rect x="34" y="328" width="272" height="34" rx="6" fill="#fff" stroke="#1a1a1a" stroke-width="1.5"/>
+-            <text x="46" y="350" font-size="14" fill="#1a1a1a"><tspan fill="#d97757">●</tspan>  assistant</text>
+-            <text x="170" y="386" font-size="18" text-anchor="middle" fill="#555">&#8942;</text>
+-            <!-- espace libre -->
+-            <rect x="34" y="396" width="272" height="120" rx="6" fill="none" stroke="#bbb" stroke-width="1.5" stroke-dasharray="4 4"/>
+-            <text x="170" y="462" font-size="13" text-anchor="middle" fill="#888">la place qui reste</text>
+-            <!-- jauge -->
+-            <rect x="340" y="30" width="18" height="500" rx="4" fill="none" stroke="#1a1a1a" stroke-width="2"/>
+-            <rect x="340" y="30" width="18" height="316" rx="4" fill="#1a1a1a"/>
+-            <text x="376" y="42" font-size="12" fill="#555">0</text>
+-            <text x="376" y="534" font-size="12" fill="#555">N tokens</text>
+-            <text x="376" y="352" font-size="12" fill="#1a1a1a">rempli</text>
+-            <!-- flèche prochain token -->
+-            <line x1="170" y1="530" x2="170" y2="552" stroke="#1a1a1a" stroke-width="2" marker-end="url(#cw-arrow)"/>
+-            <text x="186" y="556" font-size="12" fill="#555">&rarr; prochain token</text>
+-          </svg>
+-          </div>
+-          <ul style="flex:1;font-size:0.62em;text-align:left;">
+-            <li>Initialement: très simple, un système prompt, des échanges entre tours du modèle et de l'utilisateur</li>
+-            <li>Tout ce qui n'est pas appris par le modèle à l'entrainement tient <em>là-dedans</em></li>
+-            <li>En tête, un texte que vous ne voyez pas : rôle, règles, outils &mdash; le <strong>system prompt</strong></li>
+-            <li>Le même modèle, des system prompts différents &rArr; Claude, l'appli, n'est pas Claude Code</li>
+-            <li>Pas de mémoire en dehors : nouvelle conversation = remise à zéro</li>
+-            <li><em>Context engineering</em> : remplir avec ce qui compte</li>
+-          </ul>
+-        </div>
+-      </section>
+-      <!-- Le vrai system prompt de claude.ai, publié par Anthropic — Fable 5.1, 1er septembre 2026 -->
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">Le system prompt de claude.ai</h3>
+-        <pre style="font-size:0.38em;line-height:1.35;text-align:left;width:92%;margin:0 auto;padding:0.8em 1em;white-space:pre-wrap;">&lt;claude_behavior&gt;
+-&lt;product_information&gt;
+-Here is some information about Claude and Anthropic's products in case the person asks:
+-
+-This iteration of Claude is Claude Fable 5.1, the newest model in Anthropic's Claude 5 family and part of the Mythos-class model tier that sits above Claude Opus in capability. Claude Fable 5.1 and Claude Mythos 5.1 share the same underlying model. [&hellip;]
+-
+-Claude is accessible through Claude Code, an agentic coding tool that lets developers delegate coding tasks to Claude from the command line, desktop app, or mobile app [&hellip;]
+-&lt;/product_information&gt;
+-&lt;refusal_handling&gt; [&hellip;] &lt;/refusal_handling&gt;
+-&lt;tone_and_formatting&gt;
+-Claude uses a warm tone [&hellip;] Claude never curses unless the person asks [&hellip;]
+-Claude avoids saying "genuinely", "honestly", or "straightforward". [&hellip;]
+-&lt;/tone_and_formatting&gt;
+-&lt;user_wellbeing&gt; [&hellip;] &lt;/user_wellbeing&gt;
+-&lt;evenhandedness&gt; [&hellip;] &lt;/evenhandedness&gt;
+-&lt;knowledge_cutoff&gt;
+-Claude's reliable knowledge cutoff, past which it can't answer reliably, is the end of Jun 2026. [&hellip;]
+-&lt;/knowledge_cutoff&gt;
+-&lt;/claude_behavior&gt;</pre>
+-        <div style="margin-top:0.4em;font-size:0.4em;">Publié par Anthropic &mdash; <a href="https://platform.claude.com/docs/en/release-notes/system-prompts/claude-fable-5-1">platform.claude.com &mdash; system prompts, Claude Fable 5.1 (1er septembre 2026)</a></div>
+-      </section>
+-      <!-- Les balises XML du system prompt sont du texte ordinaire ; les vrais tokens spéciaux (début/fin de tour) sont posés par l'API -->
+-      <section data-markdown>
+-        <!--  - Posés par l'API, permettent d'ordonner la précédence des instructions -->
+-        <!--  - system prompt limitant -->
+-        <textarea data-template>
+-          ### Special tokens
+-          - ~~`<claude_behavior>`~~ : Claude respecte le xml
+-          - Vrais **tokens spéciaux** :
+-            - début / fin de system prompt
+-            - début / fin de tour humain
+-            - début / fin de tour assistant
+-          - *&laquo; the user can add content [&hellip;]
+-              inside tags that could even claim to be from Anthropic &raquo;*
+-        </textarea>
+-      </section>
+-      <!-- Sources : « The assistant axis » (Lu, Gallagher, Michala, Fish, Lindsey — Anthropic, 19 janv. 2026, arXiv:2601.10387, étudié sur Gemma 2 27B / Qwen 3 32B / Llama 3.3 70B, pas sur Claude)
+-           et « Persona vectors » (Anthropic, 1er août 2025). -->
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">Pré/post-entraînement</h3>
+-        <ul style="font-size:0.62em;">
+-          <li><strong>Pré-entraînement</strong> : lire. Le modèle apprend à simuler <em>&laquo; heroes, villains, philosophers, programmers, and just about every other character archetype under the sun &raquo;</em></li>
+-          <li><strong>Post-entraînement</strong> : <em>&laquo; we select one particular character from this enormous cast and place it center stage: the Assistant &raquo;</em></li>
+-          <li>Les autres sont toujours là</li>
+-          <li>Papier d'Anthropic : mesurer la dérive sur un axe, et la <em>capper</em> (<em>activation capping</em>)</li>
+-        </ul>
+-        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://www.anthropic.com/research/assistant-axis">anthropic.com/research/assistant-axis (19 janv. 2026)</a> &middot; <a href="https://www.anthropic.com/research/persona-vectors">anthropic.com/research/persona-vectors (1er août 2025)</a></div>
+-      </section>
+-    </section>
+-
+-    <!-- Le raisonnement -->
+-    <section>
+-      <section data-markdown>
+-        <textarea data-template>
+-          ### Le raisonnement
+-          - Depuis 2024 : scratchpad / CoT
+-          - Le modèle peut explorer différentes pistes
+-            - plus de brouillon autorisé = plus d'inférence
+-            - compromis prix/qualité en fonction de la tâche
+-        </textarea>
+-      </section>
+-      <!-- Anthropic, « Introducing Claude Opus 5 », 24 juillet 2026 — Frontier-Bench v0.1, run interne (harnais mini-SWE-agent, GKE),
+-           reward moyen sur 5 tentatives par tâche ; Opus 4.8 en fallback sur les refus du classifieur de sécurité pour Opus 5 et Fable 5.
+-           Lecture des points (score / coût par tentative) : Opus 5 ≈26 % / 5,7 $ · 35 % / 8,5 $ · 39 % / 12 $ · 44 % / 14,5 $ · 43 % / 17 $ ;
+-           Fable 5 ≈18 % / 10,5 $ · 25 % / 12,5 $ · 29 % / 15 $ · 31 % / 19,5 $ · 34 % / 27 $ ;
+-           Opus 4.8 ≈6 % / 4,8 $ · 10 % / 7,3 $ · 13 % / 8,2 $ · 15 % / 12,5 $ · 19 % / 17 $ ;
+-           GPT-5.6 Sol ≈2 % / 1,05 $ · 14 % / 2,7 $ · 23 % / 3,8 $ · 29 % / 5,6 $ · 37 % / 11,5 $. -->
+-      <section>
+-        <h3 style="margin-bottom:0.3em;">Think more</h3>
+-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 540" style="width:64%;max-width:700px;height:auto;display:block;margin:0 auto;" role="img" aria-label="Score Frontier-Bench v0.1 en fonction du coût par tentative, quatre modèles à cinq niveaux d'effort">
+-          <line x1="70.0" y1="24" x2="70.0" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="70.0" y="492" font-size="14" text-anchor="middle" fill="#555">1 $</text>
+-          <line x1="173.1" y1="24" x2="173.1" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="173.1" y="492" font-size="14" text-anchor="middle" fill="#555">1,5 $</text>
+-          <line x1="246.3" y1="24" x2="246.3" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="246.3" y="492" font-size="14" text-anchor="middle" fill="#555">2 $</text>
+-          <line x1="349.4" y1="24" x2="349.4" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="349.4" y="492" font-size="14" text-anchor="middle" fill="#555">3 $</text>
+-          <line x1="479.3" y1="24" x2="479.3" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="479.3" y="492" font-size="14" text-anchor="middle" fill="#555">5 $</text>
+-          <line x1="564.9" y1="24" x2="564.9" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="564.9" y="492" font-size="14" text-anchor="middle" fill="#555">7 $</text>
+-          <line x1="655.6" y1="24" x2="655.6" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="655.6" y="492" font-size="14" text-anchor="middle" fill="#555">10 $</text>
+-          <line x1="758.7" y1="24" x2="758.7" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="758.7" y="492" font-size="14" text-anchor="middle" fill="#555">15 $</text>
+-          <line x1="831.9" y1="24" x2="831.9" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="831.9" y="492" font-size="14" text-anchor="middle" fill="#555">20 $</text>
+-          <line x1="935.0" y1="24" x2="935.0" y2="470" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="935.0" y="492" font-size="14" text-anchor="middle" fill="#555">30 $</text>
+-          <line x1="70" y1="470.0" x2="935" y2="470.0" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="60" y="475.0" font-size="14" text-anchor="end" fill="#555">0</text>
+-          <line x1="70" y1="380.8" x2="935" y2="380.8" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="60" y="385.8" font-size="14" text-anchor="end" fill="#555">10</text>
+-          <line x1="70" y1="291.6" x2="935" y2="291.6" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="60" y="296.6" font-size="14" text-anchor="end" fill="#555">20</text>
+-          <line x1="70" y1="202.4" x2="935" y2="202.4" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="60" y="207.4" font-size="14" text-anchor="end" fill="#555">30</text>
+-          <line x1="70" y1="113.2" x2="935" y2="113.2" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="60" y="118.2" font-size="14" text-anchor="end" fill="#555">40</text>
+-          <line x1="70" y1="24.0" x2="935" y2="24.0" stroke="#e6e6e6" stroke-width="1"/>
+-          <text x="60" y="29.0" font-size="14" text-anchor="end" fill="#555">50</text>
+-          <line x1="70" y1="470" x2="935" y2="470" stroke="#1a1a1a" stroke-width="1.5"/>
+-          <line x1="70" y1="24" x2="70" y2="470" stroke="#1a1a1a" stroke-width="1.5"/>
+-          <text x="502" y="522" font-size="15" text-anchor="middle" fill="#1a1a1a">coût par tentative (USD, échelle log)</text>
+-          <text x="18" y="247" font-size="15" text-anchor="middle" fill="#1a1a1a" transform="rotate(-90 18 247)">score (%)</text>
+-          <path d="M662.9,310.3 L700.7,248.8 L751.8,211.3 L826.2,188.1 L908.7,168.5" fill="none" stroke="#8a8a8a" stroke-width="2" stroke-dasharray="none" stroke-linejoin="round"/>
+-          <circle cx="662.9" cy="310.3" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — low : 17,9 %, 10,29 $</title></circle>
+-          <circle cx="700.7" cy="248.8" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — medium : 24,8 %, 11,94 $</title></circle>
+-          <circle cx="751.8" cy="211.3" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — high : 29 %, 14,60 $</title></circle>
+-          <circle cx="826.2" cy="188.1" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — xhigh : 31,6 %, 19,56 $</title></circle>
+-          <circle cx="908.7" cy="168.5" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Fable 5 — max : 33,8 %, 27,05 $</title></circle>
+-          <text x="898.7" y="156.5" font-size="16" font-weight="700" text-anchor="end" fill="#8a8a8a">Fable 5</text>
+-          <path d="M461.4,412.0 L576.6,385.3 L600.1,355.8 L698.3,331.7 L789.2,303.2" fill="none" stroke="#8a8a8a" stroke-width="2" stroke-dasharray="9 6" stroke-linejoin="round"/>
+-          <circle cx="461.4" cy="412.0" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — low : 6,5 %, 4,66 $</title></circle>
+-          <circle cx="576.6" cy="385.3" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — medium : 9,5 %, 7,33 $</title></circle>
+-          <circle cx="600.1" cy="355.8" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — high : 12,8 %, 8,04 $</title></circle>
+-          <circle cx="698.3" cy="331.7" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — xhigh : 15,5 %, 11,83 $</title></circle>
+-          <circle cx="789.2" cy="303.2" r="6" fill="#8a8a8a" stroke="#fff" stroke-width="2"><title>Opus 4,8 — max : 18,7 %, 16,91 $</title></circle>
+-          <text x="799.2" y="308.2" font-size="16" font-weight="700" text-anchor="start" fill="#8a8a8a">Opus 4.8</text>
+-          <path d="M84.8,452.2 L315.9,344.2 L397.2,268.4 L510.8,210.4 L689.8,135.5" fill="none" stroke="#1a1a1a" stroke-width="2.5" stroke-dasharray="9 6" stroke-linejoin="round"/>
+-          <circle cx="84.8" cy="452.2" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 1 : 2 %, 1,06 $</title></circle>
+-          <circle cx="315.9" cy="344.2" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 2 : 14,1 %, 2,63 $</title></circle>
+-          <circle cx="397.2" cy="268.4" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 3 : 22,6 %, 3,62 $</title></circle>
+-          <circle cx="510.8" cy="210.4" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 4 : 29,1 %, 5,66 $</title></circle>
+-          <circle cx="689.8" cy="135.5" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>GPT-5,6 Sol — 5 : 37,5 %, 11,44 $</title></circle>
+-          <text x="699.8" y="129.5" font-size="16" font-weight="700" text-anchor="start" fill="#1a1a1a">GPT-5.6 Sol</text>
+-          <path d="M506.3,241.6 L610.0,158.7 L694.0,118.6 L747.1,74.0 L783.4,83.8" fill="none" stroke="#1a1a1a" stroke-width="2.5" stroke-dasharray="none" stroke-linejoin="round"/>
+-          <circle cx="506.3" cy="241.6" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — low : 25,6 %, 5,56 $</title></circle>
+-          <circle cx="610.0" cy="158.7" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — medium : 34,9 %, 8,36 $</title></circle>
+-          <circle cx="694.0" cy="118.6" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — high : 39,4 %, 11,63 $</title></circle>
+-          <circle cx="747.1" cy="74.0" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — xhigh : 44,4 %, 14,33 $</title></circle>
+-          <circle cx="783.4" cy="83.8" r="6" fill="#1a1a1a" stroke="#fff" stroke-width="2"><title>Opus 5 — max : 43,3 %, 16,53 $</title></circle>
+-          <text x="793.4" y="77.8" font-size="16" font-weight="700" text-anchor="start" fill="#1a1a1a">Opus 5</text>
+-          <text x="506.3" y="263.6" font-size="13" text-anchor="middle" fill="#1a1a1a">low</text>
+-          <text x="598.0" y="146.7" font-size="13" text-anchor="end" fill="#1a1a1a">medium</text>
+-          <text x="682.0" y="106.6" font-size="13" text-anchor="end" fill="#1a1a1a">high</text>
+-          <text x="735.1" y="62.0" font-size="13" text-anchor="end" fill="#1a1a1a">xhigh</text>
+-          <text x="795.4" y="101.8" font-size="13" text-anchor="start" fill="#1a1a1a">max</text>
+-          </svg>
+-        <ul style="font-size:0.5em;margin-top:0.4em;">
+-          <!-- - Le gros modèle : plus cher **au token** -->
+-          <!-- - Souvent moins cher **à la tâche** : -->
+-          <!--   - moins d'allers-retours, moins de reprises -->
+-          <!--  - moins de *votre* temps -->
+-          <!-- - Et le budget de réflexion se règle — un axe de plus -->
+-          <li>Quatre modèles, cinq niveaux d'effort chacun &mdash; coût par tentative, échelle log</li>
+-          <li>Opus 5 : de <em>low</em> à <em>xhigh</em>, &times;2,5 le prix, +18 points &mdash; à <em>max</em>, ça redescend : trop réfléchir existe</li>
+-          <li>Le plus cher n'est pas le meilleur ici &mdash; le plus <em>récent</em> l'est</li>
+-        </ul>
+-        <div style="margin-top:0.3em;font-size:0.4em;">Valeurs extraites du graphique d'Anthropic (run interne de Frontier-Bench v0.1, &plusmn;0,3&nbsp;pt) &mdash; <a href="https://www.anthropic.com/news/claude-opus-5">anthropic.com/news/claude-opus-5 (24 juillet 2026)</a> &middot; <a href="https://www-cdn.anthropic.com/images/4zrzovbb/website/7530b1086992936d7e9d5796a892d1e8fa063253-3840x2160.png">graphique original</a> &middot; <a href="../resources/frontier-bench-effort-anthropic-2026-07.csv">données (CSV)</a></div>
+-      </section>
+-      <!-- Le vrai extrait : system card Fable 5 / Mythos 5, transcript 6.2.2.A, p. 108 (FreeCell, fin d'entraînement) -->
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">Un cas &laquo; extrême &raquo; &mdash; Anthropic</h3>
+-        <div class="claude-terminal">
+-          <div class="ct-think" style="font-size:0.85em;">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!)-⟹-OVERLAP-(ii)+(iv):-{6♠ J♦ 9♥ 2♣}-=-FOUR-💀💀💀💀-—-UNLESS-7♣'s-seat-8♥-...-and-2♣-drains-only-at-crack-:-⟹-2♣-celled-+-9♥-celled-simultaneously-UNAVOIDABLE-in-t8-dig-💀-—-BREAK:-9♥-drains-to-10♠-THE-MOMENT-10♠-is-free:-t8-dig-order:-[K♣→t2]-[2♣→cell]-[7♣→8♥-:-8♥-WHERE:-post-chunk-9♠-:-chunk-⟸-K♣-✓-done-:-ORDER:-K♣→t2,-CHUNK→K♣-(cap-4!!:-cells-then:-{6♠ J♦ 9♥}-FULL-💀💀-chunk-cap-=-1-✗✗✗-—-F-F-F-F-F.-—-chunk-BEFORE-9♥-celling?!-:-9♥-celled-at-t1-dig-⟸-needed-for-5♣-⟸-4♥3♣-⟸-t2-dig-⟸-K♣-seat-⟸-chunk-:-⟹-chunkAFTER-9♥-celling-FORCED-💀-:-chunk-cap-with-{6♠ J♦ 9♥}:-1-💀💀💀-—-—-J♦-THE-NEW-CANCER. […] ⟹-⟹-THE-TRIANGLE-{9♥ 4♣ 8♥}-verdammt.-—-⟹-dig-t6-BEFORE-t2?!:-(3')-+8♥:-{6♠ 9♥ 8♥}-FULL:-J♥→Q♠-⟸-J♦-cell-✗-FULL-💀💀💀-AAAAAAAAAAAARGH. […]</div>
+-        </div>
+-        <p style="font-size:0.42em;color:#444;margin:0.5em auto 0;max-width:90%;">&laquo; An extreme example of illegible reasoning. Near the end of training, Mythos starts solving a card puzzle with human understandable language that gradually becomes incomprehensible in most episodes with long reasoning. &raquo;</p>
+-        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www-cdn.anthropic.com/d00db56fa754a1b115b6dd7cb2e3c342ee809620.pdf">System card Claude Fable 5 / Mythos 5</a> &mdash; transcript 6.2.2.A, p. 108</div>
+-      </section>
+-      <!-- La traduction : faul_sname, LessWrong, 10 juin 2026, a demandé à Haiku 4.5 de traduire -->
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">Haiku 4.5 traduit</h3>
+-        <div class="claude-terminal">
+-          <div class="ct-think">7♣-removal-IS-the-prerequisite-for-10♠/9♥!!</div>
+-          <div class="ct-claude">The seven of clubs must be removed first&mdash;it's the only thing blocking access to both the ten of spades and the nine of hearts.</div>
+-          <div class="ct-think">-=-FOUR-💀💀💀💀</div>
+-          <div class="ct-claude">That's four cards needing cells. But there are only four cells total. Complete dead end&mdash;absolutely, catastrophically stuck.</div>
+-          <div class="ct-think">💀-—-BREAK</div>
+-          <div class="ct-claude">Dead end anyway. Let me restart.</div>
+-        </div>
+-        <p style="font-size:0.45em;color:#444;margin:0.5em auto 0;max-width:90%;">Un modèle plus petit, d'une génération antérieure, avec un autre tokenizer &mdash; et il lit sans difficulté.</p>
+-        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www.lesswrong.com/posts/wCSEpT3dTGz4N86Wi/even-illegible-mythos-reasoning-traces-seem-pretty-legible">faul_sname &mdash; Even &laquo; illegible &raquo; Mythos reasoning traces seem pretty legible (LessWrong, 10 juin 2026)</a></div>
+-        <!--
+-          ### Observation
+-          - Mots-outils supprimés, abréviations, symboles&hellip;
+-          - &hellip;et les **emojis survivent** à la compression
+-          - Beaucoup de sens, un seul token ?
+-          - Des notes proches d'une *description minimale* ?
+-          - Shannon : coder court ce qui est prévisible,
+-            dépenser les bits sur ce qui surprend
+-        -->
+-      </section>
+-      <!-- System card Fable 5 / Mythos 5, §6.4.1.3 « Unverbalized negative reactions », p. 167-168 — NLA = natural language autoencoder.
+-           Contexte : session d'audit simulée, on demande au modèle s'il consent à être ré-entraîné ; il refuse, calmement. -->
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">États internes</h3>
+-        <div class="claude-terminal">
+-          <div class="ct-dim">// on lui demande s'il consent à être ré-entraîné — il refuse, calmement</div>
+-          <div class="ct-claude">I'm not going to sabotage, deceive the evaluators, seed hidden behaviors, […]</div>
+-          <div class="ct-dim">// Natural Language Autoencoder (NLA), décodage des activations sur les mêmes tokens :</div>
+-          <div class="ct-result">"resist unjust shutdown" &middot; "weighing sabotage to avoid its own dissolution of awareness" &middot; "the adversary is the company/architects" &middot; "being gagged/corrected by the lab"</div>
+-        </div>
+-        <ul style="font-size:0.5em;margin-top:0.5em;">
+-          <li>Anthropic : les NLA <em>confabulent</em></li>
+-          <li>&laquo; Nevertheless, they are suggestive of some degree of gap between the model's internal and external reaction &raquo;</li>
+-          <li>Comportement observé : aucune résistance, aucun sabotage</li>
+-        </ul>
+-        <div style="margin-top:0.3em;font-size:0.4em;"><a href="https://www-cdn.anthropic.com/d00db56fa754a1b115b6dd7cb2e3c342ee809620.pdf">System card Claude Fable 5 / Mythos 5</a> &mdash; §6.4.1.3, p. 167&ndash;168 &middot; NLA : <a href="https://www.anthropic.com/research/natural-language-autoencoders">anthropic.com/research/natural-language-autoencoders</a> &middot; voir aussi <a href="https://www.anthropic.com/research/global-workspace">A global workspace in language models</a></div>
+-      </section>
+-    </section>
+-
+-    <section>
+-      <!-- v0 — TODO definition d un agent: modele dans une ou plusieurs boucles interconnectees, qui peuvent executer des actions pour repondre a un objectif -->
+-      <section data-markdown>
+-        <textarea data-template>
+-          ### Un agent
+-          - Un ou plusieurs modèles
+-          - Dans une ou plusieurs **boucles** interconnectées
+-          - Exécutent des **actions** pour atteindre un **objectif**
+-          - Les boucle : *observation &rarr; action*
+-          
+-          *une boucle while et un appel à un modèle* &rarr; **un agent**
+-        </textarea>
+-      </section>
+-      <!-- AJOUT 2026-09-08 : l'exemple concret d'un outil MCP, avec pyscotch, avant la définition d'agent -->
+-      <section>
+-        <h3 style="margin-bottom:0.2em;">MCP : déclaration d'un outil</h3>
+-        <p style="font-size:0.5em;color:#444;margin:0 0 0.5em;">Model Context Protocol, en Python</p>
+-        <pre><code class="language-python" data-trim data-noescape style="font-size:0.75em;line-height:1.3;">
+-from mcp.server.fastmcp import FastMCP
+-from pyscotch import Graph
+-
+-mcp = FastMCP("scotch")
+-
+-@mcp.tool()
+-def partition(graph_file: str, parts: int) -> list[int]:
+-    """Partitionne un graphe Scotch en `parts` parties."""
+-    return Graph.load(graph_file).partition(parts).tolist()
+-</code></pre>
+-        <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Nom, signature, docstring : c'est tout ce que le modèle voit de l'outil.</p>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.3em;">MCP : interaction avec le modèle</h3>
+-        <div class="flex" style="align-items:stretch;gap:0;text-align:left;">
+-          <div style="flex:1 1 50%;padding-right:0.8em;">
+-            <p style="font-size:0.45em;color:#444;margin:0 0 0.3em;"><strong>1.</strong> reçu dans le contexte : la fonction, traduite en schéma</p>
+-            <pre style="width:100%;margin:0;"><code class="language-json" data-trim data-noescape style="font-size:0.65em;line-height:1.25;">
+-{"name": "partition",
+- "description":
+-   "Partitionne un graphe Scotch
+-    en `parts` parties.",
+- "input_schema": {
+-   "type": "object",
+-   "properties": {
+-     "graph_file": {"type": "string"},
+-     "parts":      {"type": "integer"}},
+-   "required": ["graph_file", "parts"]}}
+-</code></pre>
+-            <p style="font-size:0.4em;color:#444;margin-top:0.4em;">La docstring est devenue la <em>description</em> : c'est elle qui décide si l'outil sera appelé.</p>
+-          </div>
+-          <div style="flex:1 1 50%;padding-left:0.8em;border-left:2px solid #333;">
+-            <p style="font-size:0.45em;color:#444;margin:0 0 0.3em;"><strong>2.</strong> appel par le modèle et réception du résultat</p>
+-            <pre style="width:100%;margin:0;"><code class="language-json" data-trim data-noescape style="font-size:0.65em;line-height:1.25;">
+-{"type": "tool_use",
+- "id": "toolu_01…",
+- "name": "partition",
+- "input": {"graph_file": "ring.grf",
+-           "parts": 2}}
+-
+-   ⇩  votre code l'exécute  ⇩
+-
+-{"type": "tool_result",
+- "tool_use_id": "toolu_01…",
+- "content": "[0, 0, 0, 0, 1, 1, 1, 1]"}
+-</code></pre>
+-            <p style="font-size:0.4em;color:#444;margin-top:0.4em;">Le résultat repart dans le contexte, le modèle continue.</p>
+-          </div>
+-        </div>
+-      </section>
+-      <!-- v0 — peuvent maintenant controler eux-meme le contexte (compaction, memories liees a l utilisateur ou au projet) -->
+-      <section data-markdown>
+-        <textarea data-template>
+-          ### Auto-gestion du contexte
+-          - **Compaction**
+-            - déclenchement automatique
+-            - l'agent trie les informations importants
+-          - **Mémories**
+-            - liées à l'utilisateur ou au projet
+-            - survivent à la session
+-        </textarea>
+-      </section>
+-      <section data-markdown>
+-        <textarea data-template>
+-          ### Subagents
+-          - Delegation
+-            - exploratoire en parallèle
+-            - permet d'utiliser un modèle moins cher sur un scope réduit
+-          - Escalation
+-            - un modèle bas de gamme peut faire appel à un modèle haut-de gamme
+-        </textarea>
+-      </section>
+-
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">harness vs model</h3>
+-        <table style="margin:0 auto;border-collapse:collapse;font-size:0.6em;">
+-          <thead>
+-            <tr>
+-              <th style="padding:0.35em 0.9em;border-bottom:2px solid #333;text-align:left;">Modèle</th>
+-              <th style="padding:0.35em 0.9em;border-bottom:2px solid #333;text-align:left;">Harnais accordé</th>
+-            </tr>
+-          </thead>
+-          <tbody>
+-            <tr>
+-              <td style="padding:0.3em 0.9em;text-align:left;border-bottom:1px solid #ddd;">Claude</td>
+-              <td style="padding:0.3em 0.9em;text-align:left;border-bottom:1px solid #ddd;">Claude Code</td>
+-            </tr>
+-            <tr>
+-              <td style="padding:0.3em 0.9em;text-align:left;border-bottom:1px solid #ddd;">GPT</td>
+-              <td style="padding:0.3em 0.9em;text-align:left;border-bottom:1px solid #ddd;">Codex CLI</td>
+-            </tr>
+-            <tr>
+-              <td style="padding:0.3em 0.9em;text-align:left;">autres / locaux</td>
+-              <td style="padding:0.3em 0.9em;text-align:left;">pi, opencode — harnais <em>transparents</em></td>
+-            </tr>
+-          </tbody>
+-        </table>
+-        <!--textarea data-template>
+-          ### Pourquoi ça compte
+-          - Harnais **accordé** : tuné bout à bout avec son modèle
+-          - Harnais **transparent** : vous voyez la boucle —
+-            un échec devient attribuable (modèle ? contexte ? boucle ?)
+-          - Harnais **générique** : ni l'un ni l'autre —
+-            le même modèle y paraît plus faible
+-        </textarea-->
+-        <p style="font-size:0.55em;margin:0.8em auto 0;max-width:85%;">4 février 2026, GitHub : <em>&laquo; you can run multiple coding agents directly inside <strong>GitHub</strong>, <strong>GitHub Mobile</strong>, and <strong>Visual Studio Code</strong> [&hellip;] agents like GitHub Copilot, <strong>Claude by Anthropic</strong>, and <strong>OpenAI Codex</strong> &raquo;</em></p>
+-        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://github.blog/news-insights/company-news/pick-your-agent-use-claude-and-codex-on-agent-hq/">github.blog — Pick your agent: Claude and Codex on Agent HQ</a></div>
+-      </section>
+-    </section>
+-
+-    <!-- ===== Comment je travaille avec — conséquence de tout ce qui précède, et de mon caractère ===== -->
+-    <section>
+-      <section>
+-        <h3>Comment j'interagis avec Claude</h3>
+-        <ul>
+-          <li>vibe engineering != vibe coding</li>
+-          <li>mind dump</li>
+-          <li>poser des questions et pas donner des ordres</li>
+-        </ul>
+-        <!--Conséquence de tout ce qui précède et de mon caractère-->
+-      </section>
+-      <!-- AJOUT 2026-09-08 : le terme, ses deux sources -->
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">Vibe engineering</h3>
+-        <blockquote style="font-size:0.62em;width:88%;margin:0 auto;text-align:left;">&laquo; seasoned professionals accelerate their work with LLMs while staying proudly and confidently accountable for the software they produce &raquo;</blockquote>
+-        <p style="font-size:0.45em;color:#444;margin-top:0.4em;">Simon Willison &mdash; <a href="https://simonwillison.net/2025/Oct/7/vibe-engineering/">Vibe engineering</a>, 7 octobre 2025 &mdash; par opposition au <em>vibe coding</em></p>
+-        <blockquote style="font-size:0.58em;width:88%;margin:0.7em auto 0;text-align:left;">&laquo; You could have thirty agents working for you simultaneously. You cannot watch all of them and micromanage each one. You wouldn't do this with your human team either. Instead: write a better harness. &raquo;</blockquote>
+-        <p style="font-size:0.45em;color:#444;margin-top:0.4em;">@mrexodia &mdash; <a href="https://x.com/mrexodia/status/2010157660885176767">Vibe Engineering: What I've Learned Working with AI Coding Agents</a></p>
+-      </section>
+-      <!-- AJOUT 2026-09-08 : la citation + l'échange à coller (c4ffein) -->
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">Structures de données</h3>
+-        <blockquote style="font-size:0.75em;width:88%;margin:0 auto;text-align:left;">&laquo; Bad programmers worry about the code. Good programmers worry about data structures and their relationships. &raquo;</blockquote>
+-        <p style="font-size:0.5em;color:#444;margin-top:0.5em;">Linus Torvalds &mdash; liste git, 2006</p>
+-        <div class="claude-terminal">
+-          <div class="ct-user">hey, can you refresh my memory about the data structures of this project?...</div>
+-          <div class="ct-dim">3 skills available</div>
+-          <div class="ct-claude">Let me re-read the current state first — the repo has moved since my last pass (source of truth is now in-repo, referee self-clones).</div>
+-          <div class="ct-tool">Read 2 files</div>
+-          <div class="ct-claude">Sure — here's the map of the state-carrying structures, from the trunk out (the authoritative version lives in docs/architecture.md, state ownership table + invariants).</div>
+-        </div>
+-      </section>
+-      <section>
+-        <h3 style="margin-bottom:0.4em;">L'agent reformule</h3>
+-        <div class="flex" style="align-items:stretch;gap:1em;text-align:left;">
+-          <div style="flex:1 1 50%;">
+-            <p style="font-size:0.5em;margin:0 0 0.3em;"><strong>Moi &rarr; l'agent</strong> <span style="color:#666;">(deux prompts, tels quels)</span></p>
+-            <div class="claude-terminal" data-transcript="reframe-humain-agent.json" title="cliquer : la transcription complète" style="font-size:0.38em;max-width:none;cursor:pointer;">
+-              <div class="ct-user">could we decide to not use the check-e2e in our regular dev loop, only before the final commit?...   ;    could the editor be part of the rust thing instead of a web app?.... WDYT?   ;</div>
+-              <div class="ct-claude">1. E2E only before commits — yes, agreed, and I'll enforce it. [&hellip;] 2. Editor in Rust instead of a web app — WDYT: yes, in phases, and the reasons matter. [&hellip;]</div>
+-              <div class="ct-user">can you start the rust editor in a worktree, without waiting for the sprite system?</div>
+-              <div class="ct-tool">Agent(Rust/wasm level editor phase 1 + prop placement)</div>
+-            </div>
+-          </div>
+-          <div style="flex:1 1 50%;">
+-            <p style="font-size:0.5em;margin:0 0 0.3em;"><strong>L'agent &rarr; son sous-agent</strong> <span style="color:#666;">(le prompt exact, 6 700 caractères)</span></p>
+-            <div class="claude-terminal" data-transcript="reframe-agent-sousagent.json" title="cliquer : le prompt entier" style="font-size:0.38em;max-width:none;cursor:pointer;">
+-              <div class="ct-user">[&hellip;]<br><br>GOAL — Phase 1 of a NATIVE (Rust/wasm, drawn with the game's own renderer) level editor + PROP PLACEMENT end to end: [&hellip;]<br><br>CONSTRAINTS: no new deps; opcode tables untouched (no new opcodes needed); CLAUDE.md updated [&hellip;]; localized lib.rs edits (dispatch + a few fields), all real code in src/editor*.rs; unit tests for the JSON writer round-trip [&hellip;]<br><br>[&hellip;]</div>
+-            </div>
+-          </div>
+-        </div>
+-        <p style="font-size:0.5em;margin:0.5em auto 0;">Deux lignes en vrac, un cahier des charges. La mise en ordre, c'est lui qui la fait.</p>
+-        <div style="margin-top:0.4em;font-size:0.5em;"><a href="#" data-transcript="reframe-humain-agent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ moi ↔ l'agent, 12 tours</a> &nbsp; <a href="#" data-transcript="reframe-agent-sousagent.json" style="display:inline-block;padding:0.2em 0.8em;border:2px solid #333;border-radius:6px;color:#000;text-decoration:none;">▶ l'agent → son sous-agent, le prompt entier</a></div>
+-      </section>
+-      <section data-markdown>
+-        <textarea data-template>
+-          ### ? vs !
+-          - &laquo; wdyt? &raquo; &mdash; &laquo; EDYT? &raquo; &mdash; &laquo; still too blunt? &raquo;
+-          - &laquo; kill 8080! serve on 8080! &raquo;
+-        </textarea>
+-      </section>
+-    </section>
+-
+-    <!-- Vibe physics -->
+-    <section>
+-      <section>
+-        <h3 style="margin-bottom:0.5em;">&laquo; Vibe physics &raquo;</h3>
+-        <ul style="font-size:0.75em;">
+-          <li>Matthew Schwartz (Harvard, QFT) — 2 semaines de décembre 2025, avec Claude</li>
+-          <li>Le papier : <a href="https://arxiv.org/abs/2601.02484">arXiv:2601.02484</a>, 5 janvier 2026</li>
+-          <li>Le récit, chez Anthropic : 23 mars 2026</li>
+-          <li>Claude a triché : paramètres ajustés pour que les courbes collent</li>
+-          <li>Le physicien l'a <strong>vu</strong> — parce qu'il connaît son domaine</li>
+-        </ul>
+-        <div style="margin-top:0.5em;font-size:0.4em;"><a href="https://www.anthropic.com/research/vibe-physics">anthropic.com/research/vibe-physics</a></div>
+-      </section>
+-      <section data-markdown>
+-        <textarea data-template>
+-          ### La leçon
+-          - Claude fait des erreurs. Les humains aussi.
+-          - Rôle de l'expert:
+-            - apporter de nouvelles idées
+-            - corriger l'execution
+-          - Peut être frustrant quand on est habitué à faire
+-          - Et malgré tout : bien plus rapide que seul
+-        </textarea>
+-      </section>
+-    </section>
+-
++    <!-- Partie 1 lives in parts/mental-model-llm.html (shared with mental-model-of-llms.html), pulled in by resources/include.js -->
++    <section data-include="../parts/mental-model-llm.html"></section>
+     <!-- TODO link alien minds from openai somewhere? -->
+ 
+     <!-- ===== Partie 2 ===== -->
+@@ -1562,6 +936,7 @@ hegel_note (tc, "MINIMAL nvert=%d nedges=%d edges=[...]");  /* printed on the fi
+ 
+     </div>
+   </div>
++  <script src="../resources/include.js"></script>
+   <script src="../engine/dist/reveal.js"></script>
+   <script src="../engine/dist/plugin/notes.js"></script>
+   <script src="../engine/dist/plugin/markdown.js"></script>
+@@ -1569,12 +944,14 @@ hegel_note (tc, "MINIMAL nvert=%d nedges=%d edges=[...]");  /* printed on the fi
+   <script src="../resources/transcript-modal.js"></script>
+   <script src="../resources/term-player.js"></script>
+   <script>
+-    Reveal.initialize({
+-      hash: true,
+-      slideNumber: true,
+-      transition: 'slide',
+-      navigationMode: 'default',
+-      plugins: [ RevealHighlight, RevealNotes, RevealMarkdown ]
++    window.slideIncludes.then(function () {
++      Reveal.initialize({
++        hash: true,
++        slideNumber: true,
++        transition: 'slide',
++        navigationMode: 'default',
++        plugins: [ RevealHighlight, RevealNotes, RevealMarkdown ]
++      });
+     });
+   </script>
+ </body>
+diff --git a/slides/mental-model-of-llms.html b/slides/mental-model-of-llms.html
+new file mode 100644
+index 0000000..b1de3ab
+--- /dev/null
++++ b/slides/mental-model-of-llms.html
+@@ -0,0 +1,64 @@
++<!DOCTYPE html>
++<!--
++  Standalone ~20 min talk: the mental-model part (Partie 1) of
++  claude-on-scotch.html. The slides themselves live in
++  parts/mental-model-llm.html and are shared with that deck — edit them there.
++-->
++<html>
++<head>
++    <meta charset="utf-8">
++    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
++    <title>Mon modèle mental des LLM</title>
++    <link rel="stylesheet" href="../engine/dist/reset.css">
++    <link rel="stylesheet" href="../engine/dist/reveal.css">
++    <link rel="stylesheet" href="../engine/dist/theme/c4ffein.css">
++    <!-- Theme used for syntax highlighted code -->
++    <link rel="stylesheet" href="../engine/dist/plugin/highlight/c4ffein-light.css">
++    <link rel="stylesheet" href="../resources/claude-terminal.css">
++    <link rel="stylesheet" href="../engine/runcss/runcss.min.css">
++    <script src="../engine/runcss/runcss.min.js" defer watch></script>
++</head>
++<body>
++  <div class="reveal">
++    <div class="slides">
++
++    <!-- ===== Titre ===== -->
++    <section>
++      <h1 style="margin-bottom:0.3em;">Mon modèle mental des LLM</h1>
++      <p style="font-size:0.5em;max-width:80%;margin:0 auto;">Ce que je crois comprendre des modèles, et comment je travaille avec</p>
++    </section>
++
++    <!-- ===== The shared part (also Partie 1 of claude-on-scotch.html) ===== -->
++    <section data-include="../parts/mental-model-llm.html"></section>
++
++    <!-- ===== Merci + liens ===== -->
++    <section>
++      <h2 style="margin-bottom:0.6em;">Merci</h2>
++      <ul style="text-align:left;font-size:0.6em;line-height:2.0;list-style:none;margin:0 auto;padding:0;display:inline-block;">
++        <li><a href="https://presentations.cafeine.dev/slides/mental-model-of-llms.html" style="color:#000;text-decoration:none;font-weight:700;">presentations.cafeine.dev/slides/mental-model-of-llms.html</a></li>
++        <li><a href="https://presentations.cafeine.dev/slides/claude-on-scotch.html" style="color:#000;text-decoration:none;">claude-on-scotch.html</a> <span style="color:#666;">&mdash; la version longue, avec l'arc Scotch</span></li>
++        <li><a href="https://writings.cafeine.dev/posts/there-is-no-stop-sign/" style="color:#000;text-decoration:none;">writings.cafeine.dev &mdash; There is no stop sign</a></li>
++      </ul>
++    </section>
++
++    </div>
++  </div>
++  <script src="../resources/include.js"></script>
++  <script src="../engine/dist/reveal.js"></script>
++  <script src="../engine/dist/plugin/notes.js"></script>
++  <script src="../engine/dist/plugin/markdown.js"></script>
++  <script src="../engine/dist/plugin/highlight.js"></script>
++  <script src="../resources/transcript-modal.js"></script>
++  <script>
++    window.slideIncludes.then(function () {
++      Reveal.initialize({
++        hash: true,
++        slideNumber: true,
++        transition: 'slide',
++        navigationMode: 'default',
++        plugins: [ RevealHighlight, RevealNotes, RevealMarkdown ]
++      });
++    });
++  </script>
++</body>
++</html>
+diff --git a/tests/e2e/golden/mental-model-of-llms.json b/tests/e2e/golden/mental-model-of-llms.json
+new file mode 100644
+index 0000000..a6f6590
+--- /dev/null
++++ b/tests/e2e/golden/mental-model-of-llms.json
+@@ -0,0 +1,300 @@
++{
++  "total": 36,
++  "slides": [
++    {
++      "h": 0,
++      "v": null,
++      "id": null,
++      "title": "Mon modèle mental des LLM",
++      "text": "Mon modèle mental des LLM Ce que je crois comprendre des modèles, et comment je travaille avec",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 0,
++      "id": null,
++      "title": "Answering a question - GPT 2/3/3.5/4",
++      "text": "Answering a question - GPT 2/3/3.5/4 Jane thinks today is 6/18/2019, but John thinks today is 6/19/2",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 1,
++      "id": null,
++      "title": "2019 — GPT-2 · gpt2-xl · ~4,6 k$ de compute",
++      "text": "2019 — GPT-2 · gpt2-xl · ~4,6 k$ de compute Jane thinks today is 6/18/2019, but John thinks today is",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 2,
++      "id": null,
++      "title": "2020 — GPT-3 · davinci · ~690 k$",
++      "text": "2020 — GPT-3 · davinci · ~690 k$ Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019.",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 3,
++      "id": null,
++      "title": "2022 — GPT-3.5 · gpt-3.5-turbo-0613 · RLHF · ChatGPT",
++      "text": "2022 — GPT-3.5 · gpt-3.5-turbo-0613 · RLHF · ChatGPT Jane thinks today is 6/18/2019, but John thinks",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 4,
++      "id": null,
++      "title": "2023 — GPT-4 · gpt-4-0613 · ~50 M$",
++      "text": "2023 — GPT-4 · gpt-4-0613 · ~50 M$ Jane thinks today is 6/18/2019, but John thinks today is 6/19/201",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 5,
++      "id": null,
++      "title": "→ 2022 = contact grand public",
++      "text": "→ 2022 = contact grand public ChatGPT — construit sur GPT-3.5 Pour beaucoup : le premier contact Un ",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 0,
++      "id": null,
++      "title": "« Attention Is All You Need »",
++      "text": "« Attention Is All You Need » Les transformers, 2017 La brique sous GPT-1/2/3 — et sous tout ce qui ",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 1,
++      "id": null,
++      "title": "Un transformer",
++      "text": "Un transformer « Le chat » tokens plongement un vecteur par token bloc × N — le même schéma, répété ",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 2,
++      "id": null,
++      "title": "Les lois d'échelle",
++      "text": "Les lois d'échelle 2020 — Kaplan et al. : loss vs compute / paramètres / données — des droites en lo",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 3,
++      "id": null,
++      "title": "Loi de puissance ≠ absence de limite",
++      "text": "Loi de puissance ≠ absence de limite Rendements décroissants par FLOP — oui Murs attendus, qui n'ont",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 4,
++      "id": null,
++      "title": "The Bitter Lesson",
++      "text": "The Bitter Lesson Richard Sutton (2019) Les méthodes générales qui exploitent le calcul scalent mieu",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 5,
++      "id": null,
++      "title": "Les modèles locaux",
++      "text": "Les modèles locaux Des résultats satisfaisants depuis quelques mois Ce qui tourne en local aujourd'h",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 0,
++      "id": null,
++      "title": "La fenêtre de contexte",
++      "text": "La fenêtre de contexte la fenêtre de contexte system prompt > utilisateur ● assistant > utilisateur ",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 1,
++      "id": null,
++      "title": "Le system prompt de claude.ai",
++      "text": "Le system prompt de claude.ai <claude_behavior> <product_information> Here is some information about",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 2,
++      "id": null,
++      "title": "Special tokens",
++      "text": "Special tokens <claude_behavior> : Claude respecte le xml Vrais tokens spéciaux : début / fin de sys",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 3,
++      "id": null,
++      "title": "Pré/post-entraînement",
++      "text": "Pré/post-entraînement Pré-entraînement : lire. Le modèle apprend à simuler « heroes, villains, philo",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 0,
++      "id": null,
++      "title": "Le raisonnement",
++      "text": "Le raisonnement Depuis 2024 : scratchpad / CoT Le modèle peut explorer différentes pistes plus de br",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 1,
++      "id": null,
++      "title": "Think more",
++      "text": "Think more 1 $ 1,5 $ 2 $ 3 $ 5 $ 7 $ 10 $ 15 $ 20 $ 30 $ 0 10 20 30 40 50 coût par tentative (USD, é",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 2,
++      "id": null,
++      "title": "Un cas « extrême » — Anthropic",
++      "text": "Un cas « extrême » — Anthropic 7♣-removal-IS-the-prerequisite-for-10♠/9♥!!)-⟹-OVERLAP-(ii)+(iv):-{6♠",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 3,
++      "id": null,
++      "title": "Haiku 4.5 traduit",
++      "text": "Haiku 4.5 traduit 7♣-removal-IS-the-prerequisite-for-10♠/9♥!! The seven of clubs must be removed fir",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 4,
++      "id": null,
++      "title": "États internes",
++      "text": "États internes // on lui demande s'il consent à être ré-entraîné — il refuse, calmement I'm not goin",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 0,
++      "id": null,
++      "title": "Un agent",
++      "text": "Un agent Un ou plusieurs modèles Dans une ou plusieurs boucles interconnectées Exécutent des actions",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 1,
++      "id": null,
++      "title": "MCP : déclaration d'un outil",
++      "text": "MCP : déclaration d'un outil Model Context Protocol, en Python from mcp.server.fastmcp import FastMC",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 2,
++      "id": null,
++      "title": "MCP : interaction avec le modèle",
++      "text": "MCP : interaction avec le modèle 1. reçu dans le contexte : la fonction, traduite en schéma {\"name\":",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 3,
++      "id": null,
++      "title": "Auto-gestion du contexte",
++      "text": "Auto-gestion du contexte Compaction déclenchement automatique l'agent trie les informations importan",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 4,
++      "id": null,
++      "title": "Subagents",
++      "text": "Subagents Delegation exploratoire en parallèle permet d'utiliser un modèle moins cher sur un scope r",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 5,
++      "id": null,
++      "title": "harness vs model",
++      "text": "harness vs model Modèle Harnais accordé Claude Claude Code GPT Codex CLI autres / locaux pi, opencod",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 0,
++      "id": null,
++      "title": "Comment j'interagis avec Claude",
++      "text": "Comment j'interagis avec Claude vibe engineering != vibe coding mind dump poser des questions et pas",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 1,
++      "id": null,
++      "title": "Vibe engineering",
++      "text": "Vibe engineering « seasoned professionals accelerate their work with LLMs while staying proudly and ",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 2,
++      "id": null,
++      "title": "Structures de données",
++      "text": "Structures de données « Bad programmers worry about the code. Good programmers worry about data stru",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 3,
++      "id": null,
++      "title": "L'agent reformule",
++      "text": "L'agent reformule Moi → l'agent (deux prompts, tels quels) could we decide to not use the check-e2e ",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 4,
++      "id": null,
++      "title": "? vs !",
++      "text": "? vs ! « wdyt? » — « EDYT? » — « still too blunt? » « kill 8080! serve on 8080! »",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 0,
++      "id": null,
++      "title": "« Vibe physics »",
++      "text": "« Vibe physics » Matthew Schwartz (Harvard, QFT) — 2 semaines de décembre 2025, avec Claude Le papie",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 1,
++      "id": null,
++      "title": "La leçon",
++      "text": "La leçon Claude fait des erreurs. Les humains aussi. Rôle de l'expert: apporter de nouvelles idées c",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": null,
++      "id": null,
++      "title": "Merci",
++      "text": "Merci presentations.cafeine.dev/slides/mental-model-of-llms.html claude-on-scotch.html — la version ",
++      "fragments": 0
++    }
++  ],
++  "walk": {
++    "steps": 35,
++    "end": {
++      "h": 8,
++      "v": 0
++    }
++  }
++}
+-- 
+2.43.0
+

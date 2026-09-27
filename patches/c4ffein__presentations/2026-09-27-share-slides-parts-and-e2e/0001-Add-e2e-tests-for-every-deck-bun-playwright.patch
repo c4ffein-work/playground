@@ -1,0 +1,2965 @@
+From 639605235961bd39ffdb2664dd929ec819b168df Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Sun, 27 Sep 2026 07:20:32 +0000
+Subject: [PATCH 1/2] Add e2e tests for every deck (bun + playwright)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`bun test tests/e2e` serves the repo with Bun.serve, opens each slides/*.html
+in headless Chromium and checks it against a golden structure file
+(tests/e2e/golden/<deck>.json: every slide's h/v index, id, first heading,
+start of its text, fragment count, plus the number of Reveal.next() steps to
+reach the end). It also fails on console errors, page errors, failed
+requests and 4xx/5xx responses while loading and while stepping through
+every slide, checks each terminal recording mounted without an error line,
+and opens the first transcript link to check the modal loads the viewer
+without moving the deck.
+
+Requests to other origins are blocked so the run is hermetic, and Reveal's
+lazy data-src iframe cancellations (net::ERR_ABORTED) are ignored — a
+missing file is a 404, which is caught.
+
+UPDATE_GOLDEN=1 rewrites the goldens; SCREENSHOTS=1 dumps one PNG per slide
+as a review aid; PW_CHROMIUM points at a local Chromium. A GitHub Actions
+workflow runs the suite on push and pull request.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QQHyq5ywP1n6qJNJS1Ajrz
+---
+ .github/workflows/e2e.yml                     |  12 +
+ .gitignore                                    |   2 +
+ bun.lock                                      |  17 +
+ package.json                                  |  12 +
+ tests/e2e/README.md                           |  17 +
+ tests/e2e/decks.test.js                       | 199 +++++
+ tests/e2e/golden/claude-on-scotch.json        | 796 ++++++++++++++++++
+ .../e2e/golden/dev-with-ai-in-late-2025.json  | 452 ++++++++++
+ tests/e2e/golden/django-ninja.json            | 452 ++++++++++
+ tests/e2e/golden/hypothesis.json              | 340 ++++++++
+ .../learning-python-as-a-programmer.json      | 372 ++++++++
+ .../vibe-coding-vs-vibe-engineering.json      | 164 ++++
+ 12 files changed, 2835 insertions(+)
+ create mode 100644 .github/workflows/e2e.yml
+ create mode 100644 .gitignore
+ create mode 100644 bun.lock
+ create mode 100644 package.json
+ create mode 100644 tests/e2e/README.md
+ create mode 100644 tests/e2e/decks.test.js
+ create mode 100644 tests/e2e/golden/claude-on-scotch.json
+ create mode 100644 tests/e2e/golden/dev-with-ai-in-late-2025.json
+ create mode 100644 tests/e2e/golden/django-ninja.json
+ create mode 100644 tests/e2e/golden/hypothesis.json
+ create mode 100644 tests/e2e/golden/learning-python-as-a-programmer.json
+ create mode 100644 tests/e2e/golden/vibe-coding-vs-vibe-engineering.json
+
+diff --git a/.github/workflows/e2e.yml b/.github/workflows/e2e.yml
+new file mode 100644
+index 0000000..3eb8d51
+--- /dev/null
++++ b/.github/workflows/e2e.yml
+@@ -0,0 +1,12 @@
++name: e2e
++on: [push, pull_request]
++jobs:
++  decks:
++    runs-on: ubuntu-latest
++    timeout-minutes: 15
++    steps:
++      - uses: actions/checkout@v4
++      - uses: oven-sh/setup-bun@v2
++      - run: bun install --frozen-lockfile
++      - run: bunx playwright install --with-deps chromium
++      - run: bun test tests/e2e
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..3555420
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++node_modules/
++tests/e2e/screenshots/
+diff --git a/bun.lock b/bun.lock
+new file mode 100644
+index 0000000..6acd9f2
+--- /dev/null
++++ b/bun.lock
+@@ -0,0 +1,17 @@
++{
++  "lockfileVersion": 1,
++  "configVersion": 1,
++  "workspaces": {
++    "": {
++      "name": "presentations",
++      "devDependencies": {
++        "playwright": "^1.63.0",
++      },
++    },
++  },
++  "packages": {
++    "playwright": ["playwright@1.63.0", "", { "dependencies": { "playwright-core": "1.63.0" }, "bin": { "playwright": "cli.js" } }, "sha512-+7ziBLidS4NaNCdt57SUDT+wYmmd5fmiQejUic/kb+YsYSCPyOOE9sebzMjNmQrsnNpDJqd4WHvV/8lfKfUDUg=="],
++
++    "playwright-core": ["playwright-core@1.63.0", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg=="],
++  }
++}
+diff --git a/package.json b/package.json
+new file mode 100644
+index 0000000..6c4ed89
+--- /dev/null
++++ b/package.json
+@@ -0,0 +1,12 @@
++{
++  "name": "presentations",
++  "private": true,
++  "scripts": {
++    "test": "bun test tests/e2e",
++    "test:update": "UPDATE_GOLDEN=1 bun test tests/e2e",
++    "test:screenshots": "SCREENSHOTS=1 bun test tests/e2e"
++  },
++  "devDependencies": {
++    "playwright": "^1.63.0"
++  }
++}
+diff --git a/tests/e2e/README.md b/tests/e2e/README.md
+new file mode 100644
+index 0000000..aa8e66b
+--- /dev/null
++++ b/tests/e2e/README.md
+@@ -0,0 +1,17 @@
++# Deck e2e tests
++
++`bun test tests/e2e` opens every `slides/*.html` in headless Chromium (served
++over HTTP by `Bun.serve`) and checks it against `golden/<deck>.json`. See the
++header of `decks.test.js` for exactly what is asserted.
++
++```sh
++bun install                          # playwright, dev-only
++bunx playwright install chromium     # once, or PW_CHROMIUM=/path/to/chrome
++bun test tests/e2e                   # or: bun run test
++UPDATE_GOLDEN=1 bun test tests/e2e   # accept a structure change (bun run test:update)
++SCREENSHOTS=1 bun test tests/e2e     # one PNG per slide in screenshots/ (bun run test:screenshots)
++```
++
++A golden diff is the review: editing a deck changes `title` / `text` / the
++slide count for the slides you touched and nothing else. A refactor that
++moves markup around (shared parts, includes) must leave the golden untouched.
+diff --git a/tests/e2e/decks.test.js b/tests/e2e/decks.test.js
+new file mode 100644
+index 0000000..98eb5a7
+--- /dev/null
++++ b/tests/e2e/decks.test.js
+@@ -0,0 +1,199 @@
++// End-to-end checks for every deck in slides/, run by `bun test tests/e2e`.
++//
++// For each deck the test serves the repo over HTTP (Bun.serve, no-store),
++// opens it in headless Chromium, waits for Reveal to be ready and then:
++//   - records the deck STRUCTURE (every slide's h/v index, id, first heading,
++//     the start of its text and its fragment count) and compares it to the
++//     golden file tests/e2e/golden/<deck>.json — UPDATE_GOLDEN=1 rewrites it
++//   - fails on any console error, uncaught page error, failed request or
++//     4xx/5xx response, while loading and while stepping through every slide
++//     and fragment with Reveal.next(). Requests to other origins are blocked
++//     (the run is hermetic: an <iframe> of an external site just stays blank)
++//     and net::ERR_ABORTED is ignored — that is Reveal cancelling a lazy
++//     data-src iframe it unloaded, not a missing file (a missing file is a 404)
++//   - checks every terminal recording (.term-replay[data-recording]) mounted
++//     without an error line
++//   - opens the first transcript link (a[data-transcript]) and checks the
++//     modal shows the viewer with the transcript loaded, without moving the
++//     deck to another slide
++//
++// SCREENSHOTS=1 additionally dumps one PNG per slide under
++// tests/e2e/screenshots/<deck>/ (gitignored) — a review aid, never asserted.
++// PW_CHROMIUM=/path/to/chrome runs a locally installed Chromium instead of
++// the one Playwright downloads (`bunx playwright install chromium`).
++
++import { test, expect, beforeAll, afterAll } from "bun:test";
++import { chromium } from "playwright";
++import { readdirSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import path from "node:path";
++
++const ROOT = path.resolve(import.meta.dir, "../..");
++const GOLDEN_DIR = path.join(import.meta.dir, "golden");
++const SHOTS_DIR = path.join(import.meta.dir, "screenshots");
++const UPDATE = !!process.env.UPDATE_GOLDEN;
++const SCREENSHOTS = !!process.env.SCREENSHOTS;
++const TIMEOUT_MS = 90_000;
++
++const decks = readdirSync(path.join(ROOT, "slides"))
++  .filter((f) => f.endsWith(".html"))
++  .sort();
++
++let server, browser;
++
++beforeAll(async () => {
++  server = Bun.serve({
++    port: 0,
++    async fetch(req) {
++      let p = decodeURIComponent(new URL(req.url).pathname);
++      if (p.endsWith("/")) p += "index.html";
++      const file = path.resolve(ROOT, "." + p);
++      if (!file.startsWith(ROOT + path.sep)) return new Response("forbidden", { status: 403 });
++      const f = Bun.file(file);
++      if (!(await f.exists())) return new Response("not found: " + p, { status: 404 });
++      return new Response(f, { headers: { "Cache-Control": "no-store" } });
++    },
++  });
++  browser = await chromium.launch({ executablePath: process.env.PW_CHROMIUM || undefined });
++});
++
++afterAll(async () => {
++  await browser?.close();
++  server?.stop(true);
++});
++
++const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
++
++function structure() {
++  // Runs in the page. Reveal has processed data-markdown sections by now.
++  const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
++  const root = document.querySelector(".reveal .slides");
++  const sections = (el) => Array.from(el.children).filter((c) => c.tagName === "SECTION");
++  const slides = [];
++  sections(root).forEach((h, hi) => {
++    const vs = sections(h);
++    (vs.length ? vs : [h]).forEach((s, vi) => {
++      const head = s.querySelector("h1, h2, h3, h4");
++      // Terminal replays stream their text in: leave them out so the snapshot
++      // never depends on playback timing.
++      const copy = s.cloneNode(true);
++      copy.querySelectorAll(".term-replay").forEach((el) => el.remove());
++      slides.push({
++        h: hi,
++        v: vs.length ? vi : null,
++        id: s.id || null,
++        title: head ? clean(head.textContent) : null,
++        text: clean(copy.textContent).slice(0, 100),
++        fragments: s.querySelectorAll(".fragment").length,
++      });
++    });
++  });
++  return { total: Reveal.getTotalSlides(), slides };
++}
++
++function walk() {
++  // Runs in the page: step through every slide and fragment.
++  let steps = 0;
++  while (steps < 5000) {
++    if (Reveal.isLastSlide() && !Reveal.availableFragments().next) break;
++    Reveal.next();
++    steps++;
++  }
++  const i = Reveal.getIndices();
++  return { steps, end: { h: i.h, v: i.v ?? null } };
++}
++
++for (const deck of decks) {
++  const name = deck.replace(/\.html$/, "");
++  test(name, async () => {
++    const problems = [];
++    const base = `http://localhost:${server.port}/`;
++    const local = (url) => url.startsWith(base);
++    const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
++    await page.route(() => true, (route) => local(route.request().url()) ? route.continue() : route.abort());
++    page.on("console", (m) => { if (m.type() === "error") problems.push("console: " + m.text() + " @ " + (m.location()?.url || "")); });
++    page.on("pageerror", (e) => problems.push("pageerror: " + e.message));
++    page.on("requestfailed", (r) => {
++      const err = r.failure()?.errorText || "";
++      if (local(r.url()) && err !== "net::ERR_ABORTED") problems.push("requestfailed: " + r.url() + " " + err);
++    });
++    page.on("response", (r) => { if (r.status() >= 400) problems.push("HTTP " + r.status() + ": " + r.url()); });
++
++    await page.goto(`http://localhost:${server.port}/slides/${deck}`, { waitUntil: "load" });
++    await page.waitForFunction(() => window.Reveal && Reveal.isReady(), null, { timeout: 30_000 });
++
++    // Terminal recordings: mounted, no error line.
++    await page.waitForFunction(() =>
++      Array.from(document.querySelectorAll(".term-replay[data-recording]"))
++        .every((el) => el._termPlayer || el.querySelector(".tp-error-msg")), null, { timeout: 30_000 });
++    const termErrors = await page.evaluate(() =>
++      Array.from(document.querySelectorAll(".term-replay[data-recording]"))
++        .filter((el) => el.querySelector(".tp-error-msg"))
++        .map((el) => el.getAttribute("data-recording") + ": " + (el.querySelector(".tp-fin")?.textContent || "error")));
++    expect(termErrors).toEqual([]);
++
++    // Structure vs golden.
++    const actual = await page.evaluate(structure);
++    actual.walk = await page.evaluate(walk);
++    const goldenFile = path.join(GOLDEN_DIR, name + ".json");
++    const text = JSON.stringify(actual, null, 2) + "\n";
++    if (UPDATE || !existsSync(goldenFile)) {
++      if (!UPDATE && !existsSync(goldenFile)) console.warn(`golden missing for ${name}: writing ${path.relative(ROOT, goldenFile)}`);
++      mkdirSync(GOLDEN_DIR, { recursive: true });
++      writeFileSync(goldenFile, text);
++    }
++    const golden = JSON.parse(readFileSync(goldenFile, "utf8"));
++    if (JSON.stringify(golden) !== JSON.stringify(actual)) {
++      console.error(`${name}: structure differs from ${path.relative(ROOT, goldenFile)} — UPDATE_GOLDEN=1 bun test tests/e2e to accept`);
++    }
++    expect(actual).toEqual(golden);
++
++    // Transcript modal: the first link opens the viewer, deck stays put.
++    const transcript = await page.evaluate(() => {
++      const a = document.querySelector("a[data-transcript]");
++      if (!a) return null;
++      const i = Reveal.getIndices(a.closest("section"));
++      Reveal.slide(i.h, i.v);
++      return { file: a.getAttribute("data-transcript"), h: i.h, v: i.v ?? null };
++    });
++    if (transcript) {
++      await page.locator("a[data-transcript]").first().click();
++      await page.waitForFunction(() => {
++        const f = document.querySelector('iframe[title="Transcript"]');
++        const d = f && f.contentDocument;
++        if (!d || d.readyState !== "complete") return false;
++        const status = d.getElementById("status");
++        return d.getElementById("main") && (!status || !/Chargement/.test(status.textContent));
++      }, null, { timeout: 30_000 });
++      const state = await page.evaluate(() => {
++        const f = document.querySelector('iframe[title="Transcript"]');
++        const d = f.contentDocument;
++        const i = Reveal.getIndices();
++        return {
++          src: f.getAttribute("src"),
++          title: d.getElementById("title")?.textContent,
++          status: d.getElementById("status")?.textContent || "",
++          h: i.h, v: i.v ?? null,
++        };
++      });
++      expect(state.src).toContain("viewer.html?t=" + encodeURIComponent(transcript.file));
++      expect(state.status).not.toMatch(/erreur|error|HTTP/i);
++      expect(norm(state.title)).not.toBe("");
++      expect({ h: state.h, v: state.v }).toEqual({ h: transcript.h, v: transcript.v });
++      await page.keyboard.press("Escape");
++    }
++
++    if (SCREENSHOTS) {
++      const dir = path.join(SHOTS_DIR, name);
++      mkdirSync(dir, { recursive: true });
++      for (const [n, s] of actual.slides.entries()) {
++        await page.evaluate(([h, v]) => Reveal.slide(h, v ?? undefined), [s.h, s.v]);
++        await page.waitForTimeout(150);
++        await page.screenshot({ path: path.join(dir, `${String(n).padStart(3, "0")}-${s.h}-${s.v ?? 0}.png`) });
++      }
++    }
++
++    const ignored = /favicon\.ico/;
++    expect(problems.filter((p) => !ignored.test(p))).toEqual([]);
++    await page.close();
++  }, TIMEOUT_MS);
++}
+diff --git a/tests/e2e/golden/claude-on-scotch.json b/tests/e2e/golden/claude-on-scotch.json
+new file mode 100644
+index 0000000..4349ac9
+--- /dev/null
++++ b/tests/e2e/golden/claude-on-scotch.json
+@@ -0,0 +1,796 @@
++{
++  "total": 98,
++  "slides": [
++    {
++      "h": 0,
++      "v": null,
++      "id": null,
++      "title": "Claude on Scotch",
++      "text": "Claude on Scotch État de l'art du développement avec Claude sur une codebase C de plus de 30 ans lié",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 0,
++      "id": null,
++      "title": "Présentation",
++      "text": "Présentation Jeune autodidacte inspiré par sa famille Master en Génie Logiciel à l'Université de Bor",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 1,
++      "id": null,
++      "title": "Scotch",
++      "text": "Scotch Partitionnement de graphes Plus de 30 ans, C, MPI — au cœur du HPC Développé ici, à l'Inria J",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 2,
++      "id": null,
++      "title": "Le plan",
++      "text": "Le plan Mon modèle mental des LLM Parcours avec Scotch Leçons générales de Scotch et d'autres projet",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": null,
++      "id": null,
++      "title": "Partie 1",
++      "text": "Partie 1 Mon modèle mental des LLM",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 0,
++      "id": null,
++      "title": "Answering a question - GPT 2/3/3.5/4",
++      "text": "Answering a question - GPT 2/3/3.5/4 Jane thinks today is 6/18/2019, but John thinks today is 6/19/2",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 1,
++      "id": null,
++      "title": "2019 — GPT-2 · gpt2-xl · ~4,6 k$ de compute",
++      "text": "2019 — GPT-2 · gpt2-xl · ~4,6 k$ de compute Jane thinks today is 6/18/2019, but John thinks today is",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 2,
++      "id": null,
++      "title": "2020 — GPT-3 · davinci · ~690 k$",
++      "text": "2020 — GPT-3 · davinci · ~690 k$ Jane thinks today is 6/18/2019, but John thinks today is 6/19/2019.",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 3,
++      "id": null,
++      "title": "2022 — GPT-3.5 · gpt-3.5-turbo-0613 · RLHF · ChatGPT",
++      "text": "2022 — GPT-3.5 · gpt-3.5-turbo-0613 · RLHF · ChatGPT Jane thinks today is 6/18/2019, but John thinks",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 4,
++      "id": null,
++      "title": "2023 — GPT-4 · gpt-4-0613 · ~50 M$",
++      "text": "2023 — GPT-4 · gpt-4-0613 · ~50 M$ Jane thinks today is 6/18/2019, but John thinks today is 6/19/201",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 5,
++      "id": null,
++      "title": "→ 2022 = contact grand public",
++      "text": "→ 2022 = contact grand public ChatGPT — construit sur GPT-3.5 Pour beaucoup : le premier contact Un ",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 0,
++      "id": null,
++      "title": "« Attention Is All You Need »",
++      "text": "« Attention Is All You Need » Les transformers, 2017 La brique sous GPT-1/2/3 — et sous tout ce qui ",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 1,
++      "id": null,
++      "title": "Un transformer",
++      "text": "Un transformer « Le chat » tokens plongement un vecteur par token bloc × N — le même schéma, répété ",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 2,
++      "id": null,
++      "title": "Les lois d'échelle",
++      "text": "Les lois d'échelle 2020 — Kaplan et al. : loss vs compute / paramètres / données — des droites en lo",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 3,
++      "id": null,
++      "title": "Loi de puissance ≠ absence de limite",
++      "text": "Loi de puissance ≠ absence de limite Rendements décroissants par FLOP — oui Murs attendus, qui n'ont",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 4,
++      "id": null,
++      "title": "The Bitter Lesson",
++      "text": "The Bitter Lesson Richard Sutton (2019) Les méthodes générales qui exploitent le calcul scalent mieu",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 5,
++      "id": null,
++      "title": "Les modèles locaux",
++      "text": "Les modèles locaux Des résultats satisfaisants depuis quelques mois Ce qui tourne en local aujourd'h",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 0,
++      "id": null,
++      "title": "La fenêtre de contexte",
++      "text": "La fenêtre de contexte la fenêtre de contexte system prompt > utilisateur ● assistant > utilisateur ",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 1,
++      "id": null,
++      "title": "Le system prompt de claude.ai",
++      "text": "Le system prompt de claude.ai <claude_behavior> <product_information> Here is some information about",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 2,
++      "id": null,
++      "title": "Special tokens",
++      "text": "Special tokens <claude_behavior> : Claude respecte le xml Vrais tokens spéciaux : début / fin de sys",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 3,
++      "id": null,
++      "title": "Pré/post-entraînement",
++      "text": "Pré/post-entraînement Pré-entraînement : lire. Le modèle apprend à simuler « heroes, villains, philo",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 0,
++      "id": null,
++      "title": "Le raisonnement",
++      "text": "Le raisonnement Depuis 2024 : scratchpad / CoT Le modèle peut explorer différentes pistes plus de br",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 1,
++      "id": null,
++      "title": "Think more",
++      "text": "Think more 1 $ 1,5 $ 2 $ 3 $ 5 $ 7 $ 10 $ 15 $ 20 $ 30 $ 0 10 20 30 40 50 coût par tentative (USD, é",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 2,
++      "id": null,
++      "title": "Un cas « extrême » — Anthropic",
++      "text": "Un cas « extrême » — Anthropic 7♣-removal-IS-the-prerequisite-for-10♠/9♥!!)-⟹-OVERLAP-(ii)+(iv):-{6♠",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 3,
++      "id": null,
++      "title": "Haiku 4.5 traduit",
++      "text": "Haiku 4.5 traduit 7♣-removal-IS-the-prerequisite-for-10♠/9♥!! The seven of clubs must be removed fir",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 4,
++      "id": null,
++      "title": "États internes",
++      "text": "États internes // on lui demande s'il consent à être ré-entraîné — il refuse, calmement I'm not goin",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 0,
++      "id": null,
++      "title": "Un agent",
++      "text": "Un agent Un ou plusieurs modèles Dans une ou plusieurs boucles interconnectées Exécutent des actions",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 1,
++      "id": null,
++      "title": "MCP : déclaration d'un outil",
++      "text": "MCP : déclaration d'un outil Model Context Protocol, en Python from mcp.server.fastmcp import FastMC",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 2,
++      "id": null,
++      "title": "MCP : interaction avec le modèle",
++      "text": "MCP : interaction avec le modèle 1. reçu dans le contexte : la fonction, traduite en schéma {\"name\":",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 3,
++      "id": null,
++      "title": "Auto-gestion du contexte",
++      "text": "Auto-gestion du contexte Compaction déclenchement automatique l'agent trie les informations importan",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 4,
++      "id": null,
++      "title": "Subagents",
++      "text": "Subagents Delegation exploratoire en parallèle permet d'utiliser un modèle moins cher sur un scope r",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 5,
++      "id": null,
++      "title": "harness vs model",
++      "text": "harness vs model Modèle Harnais accordé Claude Claude Code GPT Codex CLI autres / locaux pi, opencod",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 0,
++      "id": null,
++      "title": "Comment j'interagis avec Claude",
++      "text": "Comment j'interagis avec Claude vibe engineering != vibe coding mind dump poser des questions et pas",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 1,
++      "id": null,
++      "title": "Vibe engineering",
++      "text": "Vibe engineering « seasoned professionals accelerate their work with LLMs while staying proudly and ",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 2,
++      "id": null,
++      "title": "Structures de données",
++      "text": "Structures de données « Bad programmers worry about the code. Good programmers worry about data stru",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 3,
++      "id": null,
++      "title": "L'agent reformule",
++      "text": "L'agent reformule Moi → l'agent (deux prompts, tels quels) could we decide to not use the check-e2e ",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 4,
++      "id": null,
++      "title": "? vs !",
++      "text": "? vs ! « wdyt? » — « EDYT? » — « still too blunt? » « kill 8080! serve on 8080! »",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": 0,
++      "id": null,
++      "title": "« Vibe physics »",
++      "text": "« Vibe physics » Matthew Schwartz (Harvard, QFT) — 2 semaines de décembre 2025, avec Claude Le papie",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": 1,
++      "id": null,
++      "title": "La leçon",
++      "text": "La leçon Claude fait des erreurs. Les humains aussi. Rôle de l'expert: apporter de nouvelles idées c",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": null,
++      "id": null,
++      "title": "Partie 2",
++      "text": "Partie 2 L'arc Scotch",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 0,
++      "id": null,
++      "title": "Initialement",
++      "text": "Initialement AI bug-hunting dans une codebase sérieuse Je connais l'auteur, vrai projet d'ingénierie",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "from hypothesis import given, strategies as st @given(st.lists(st.integers() | st.floats())) def tes",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "Tests classiques Fuzzing PBT Formel Entrées valeurs en dur machine machine (stratégies) toutes (symb",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 3,
++      "id": null,
++      "title": "Déjà un papier",
++      "text": "Déjà un papier Agentic Property-Based Testing: Finding Bugs Across the Python Ecosystem Maaz†, DeVoe",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 0,
++      "id": null,
++      "title": "1. pyscotch",
++      "text": "1. pyscotch scotchpy en retard sur les mises à jour ownership, un bridge, le moins coûteux possible ",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 1,
++      "id": null,
++      "title": "Vibe engineering de wrapper",
++      "text": "Vibe engineering de wrapper Le README : \"this is a vibe-engineering experiment — you probably should",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 2,
++      "id": null,
++      "title": "Jour 7 : le premier bug Scotch",
++      "text": "Jour 7 : le premier bug Scotch 4 nov. 2025 : premier commit, sessions Claude Code web (7 branches cl",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 3,
++      "id": null,
++      "title": "Le reçu, le jour même",
++      "text": "Le reçu, le jour même git log --date=short --format='%h %ad %an | %s' --grep='report C. Pellegrini' ",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 0,
++      "id": null,
++      "title": "2. Hypothesis sur le wrapper",
++      "text": "2. Hypothesis sur le wrapper @given(graph_data=simple_graph(min_vertices=2, max_vertices=20)) def te",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 1,
++      "id": null,
++      "title": "Hypothesis trouve un bug",
++      "text": "Hypothesis trouve un bug Interesting! Hypothesis found a potential bug! The test found that for a gr",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 2,
++      "id": null,
++      "title": "Replay Hypothesis",
++      "text": "Replay Hypothesis Scotch 34ea137 (14 janv. 2026, la veille du fix) · pyscotch a32f242 (déc. 2025) · ",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 3,
++      "id": null,
++      "title": "Le reçu — janvier 2026",
++      "text": "Le reçu — janvier 2026 34ea137 2026-01-14 Francois PELLEGRINI | Add coloring checking routine in tes",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 0,
++      "id": null,
++      "title": "3. mars 2026 : lecture des tests C",
++      "text": "3. mars 2026 : lecture des tests C CLAUDE.md pyscotch : « Scotch's C tests often only verify return ",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 1,
++      "id": null,
++      "title": "2 avril 2026 : unconfirmed cause",
++      "text": "2 avril 2026 : unconfirmed cause // fork c4ffein/scotch, branche hegel, REPORTS/REPORT.md — 67 tests",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 2,
++      "id": null,
++      "title": "hegel",
++      "text": "hegel le moteur d'Hypothesis, pour tous les langages hegel-c : le binding C de la lib Rust hegel-c :",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 3,
++      "id": null,
++      "title": "exemple du binding C",
++      "text": "exemple du binding C static void test_add_commutes (hegel_testcase *tc) { int a = HEGEL_DRAW_INT (-1",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 4,
++      "id": null,
++      "title": "Schémas de mon wrapper",
++      "text": "Schémas de mon wrapper hegel_schema_t edge_schema = HEGEL_STRUCT (EdgePair, HEGEL_INT (0, MAX_VERT -",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 5,
++      "id": null,
++      "title": "Replay hegel-c",
++      "text": "Replay hegel-c enregistré aujourd'hui avec le hegel-c de juillet 2026, sur le Scotch d'avant le fix ",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 6,
++      "id": null,
++      "title": "Un graphe à 3 sommets",
++      "text": "Un graphe à 3 sommets 0 1 2 composante A, ordenum = 0 composante B, ordenum = 1 — K₂, se compresse M",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 7,
++      "id": null,
++      "title": "Épisode 2 — 5 avril : une variable",
++      "text": "Épisode 2 — 5 avril : une variable Fausse piste : les sommets isolés. Vraie cause : le chemin compre",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 8,
++      "id": null,
++      "title": "Le reçu — 15 avril 2026",
++      "text": "Le reçu — 15 avril 2026 0642921 2026-04-15 Francois PELLEGRINI | Bugfix: make `hgraphOrderCp()` work",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 0,
++      "id": null,
++      "title": "pyscotch, aujourd'hui",
++      "text": "pyscotch, aujourd'hui uv pip install pyscotch pyscotch doctor pyscotch scotch build --parallel Strat",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 1,
++      "id": null,
++      "title": "Replay : installation",
++      "text": "Replay : installation Machine sans aucun Scotch. uv venv, uv pip install \"pyscotch[parallel]\" : pysc",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 2,
++      "id": null,
++      "title": "Replay : pyscotch doctor",
++      "text": "Replay : pyscotch doctor Juste après l'install : la wheel, « No problems detected ». Puis PYSCOTCH_P",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 3,
++      "id": null,
++      "title": "Replay : pyscotch scotch build",
++      "text": "Replay : pyscotch scotch build pyscotch scotch build --parallel --use : preflight, source Scotch 7.0",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 4,
++      "id": null,
++      "title": "La pipeline",
++      "text": "La pipeline à chaque push / PR sur un tag v* après publication · chaque lundi Test PyScotch Python 3",
++      "fragments": 0
++    },
++    {
++      "h": 16,
++      "v": 0,
++      "id": null,
++      "title": "L'arc, en dates — récap",
++      "text": "L'arc, en dates — récap nov. 2025pyscotch, jour 7premier bug upstream, corrigé le jour même déc. 202",
++      "fragments": 0
++    },
++    {
++      "h": 17,
++      "v": 0,
++      "id": null,
++      "title": "Le bilan — chez Scotch",
++      "text": "Le bilan — chez Scotch Bug Méthode Sévérité Upstream module.h : 12 macros de renommage manquantesnov",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 0,
++      "id": null,
++      "title": "Sonnet 5 vs Fable 5",
++      "text": "Sonnet 5 vs Fable 5 François envoie une tâche bien scopée : Un ingé de l'équipe avec Sonnet J'envoie",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 1,
++      "id": null,
++      "title": "La chronologie, dans git",
++      "text": "La chronologie, dans git 24 août, 21:18l'ingénieur commit son fix sur sa machine — adb2b64 « Bugfix:",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "Hey! Can you check the gitlab for scotch? Clone it here? Done — SCOTCH is cloned at ~/playground/sco",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "Create a report in md and a patch, and commit / push on main? What about explaining what was asked, ",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 4,
++      "id": null,
++      "title": "Le résultat : un patch pour Scotch",
++      "text": "Le résultat : un patch pour Scotch Subject: [PATCH] Base the tree array returned by dorderTreeDist()",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 5,
++      "id": null,
++      "title": "Le message de commit",
++      "text": "Le message de commit Base the tree array returned by dorderTreeDist(), as documented The user manual",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 6,
++      "id": null,
++      "title": "Deux patchs",
++      "text": "Deux patchs L'ingénieur (Sonnet 5)Moi (Fable 5, téléphone) Commitadb2b64, 24 août 21:18patch dans pl",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 7,
++      "id": null,
++      "title": "Ce qui diffère",
++      "text": "Ce qui diffère L'ingénieur a fait, et pas moi Supprimé le paramètre grafptr devenu inutile : baseval",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 8,
++      "id": null,
++      "title": "Avis de Fable 5.1",
++      "text": "Avis de Fable 5.1 // Claude (Fable 5.1), 8 sept. 2026, après lecture des trois commits — sans accès ",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 9,
++      "id": null,
++      "title": "Le verdict",
++      "text": "Le verdict L'expertise de François reste le déterminant Ce n'est pas un jugement sur l'expertise hum",
++      "fragments": 0
++    },
++    {
++      "h": 19,
++      "v": null,
++      "id": null,
++      "title": "Partie 3",
++      "text": "Partie 3 Trois changements de paradigme",
++      "fragments": 0
++    },
++    {
++      "h": 20,
++      "v": 0,
++      "id": null,
++      "title": "Idée 1 — Spec > Code",
++      "text": "Idée 1 — Spec > Code On peut porter une codebase ? Mai 2025 : milliers de lignes, en trichant un peu",
++      "fragments": 0
++    },
++    {
++      "h": 20,
++      "v": 1,
++      "id": null,
++      "title": "Petite échelle — password-store",
++      "text": "Petite échelle — password-store (bash) → Python Mai 2025, avec Claude Code : un fichier, zéro dépend",
++      "fragments": 0
++    },
++    {
++      "h": 20,
++      "v": 2,
++      "id": null,
++      "title": "Mai 2025 — nudge, nudge, nudge...",
++      "text": "Mai 2025 — nudge, nudge, nudge... « After that, I only said yes to everything. » « Feels like watchi",
++      "fragments": 0
++    },
++    {
++      "h": 20,
++      "v": 3,
++      "id": null,
++      "title": "Grande échelle — Bun (Zig) → Rust",
++      "text": "Grande échelle — Bun (Zig) → Rust PR #30412, branche claude/phase-a-port : ouverte le 8 mai, fusionn",
++      "fragments": 0
++    },
++    {
++      "h": 20,
++      "v": 4,
++      "id": null,
++      "title": "Mai 2026 - process automatique",
++      "text": "Mai 2026 - process automatique D'abord une carte : PORTING.md (motifs Zig → Rust) et LIFETIMES.tsv (",
++      "fragments": 0
++    },
++    {
++      "h": 20,
++      "v": 5,
++      "id": null,
++      "title": "Oracle > Code",
++      "text": "Oracle > Code Un même clone de Medium, 100+ implémentations Je maintiens la spec, les tests et la dé",
++      "fragments": 0
++    },
++    {
++      "h": 21,
++      "v": 0,
++      "id": null,
++      "title": "Idée 2 — Vibez votre observabilité",
++      "text": "Idée 2 — Vibez votre observabilité Un petit jeu, un moteur maison « problème de perf ? » → « non, ça",
++      "fragments": 0
++    },
++    {
++      "h": 21,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "le visualiseur vibé, avec 120 frames de la capture (#180 → #299) — frame #211 : 61 ms, dont 49 ms de",
++      "fragments": 0
++    },
++    {
++      "h": 21,
++      "v": 2,
++      "id": null,
++      "title": "La leçon",
++      "text": "La leçon avis → instrumentation v0 des benchmarks ne coûte rien relire le code n'est pas gratuit...",
++      "fragments": 0
++    },
++    {
++      "h": 22,
++      "v": 0,
++      "id": null,
++      "title": "Idée 3 — Tout code est du legacy",
++      "text": "Idée 3 — Tout code est du legacy Avec l'IA... tout code est du code que vous n'avez pas écrit même c",
++      "fragments": 0
++    },
++    {
++      "h": 22,
++      "v": 1,
++      "id": null,
++      "title": "= gérer du turnover ?",
++      "text": "= gérer du turnover ? Working Effectively with Legacy Code Michael Feathers legacy = du code sans te",
++      "fragments": 0
++    },
++    {
++      "h": 22,
++      "v": 2,
++      "id": null,
++      "title": "L'intérêt de la connaissance",
++      "text": "L'intérêt de la connaissance Facilite la prise en main du projet aux nouveaux arrivants ... mais une",
++      "fragments": 0
++    },
++    {
++      "h": 23,
++      "v": 0,
++      "id": null,
++      "title": "Conséquences pour la recherche",
++      "text": "Conséquences pour la recherche",
++      "fragments": 0
++    },
++    {
++      "h": 23,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "« I think we'll be there in three to six months—where AI is writing 90 percent of the code. And then",
++      "fragments": 0
++    },
++    {
++      "h": 23,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "« Thus, it's my guess that powerful AI could at least 10x the rate of these discoveries, giving us t",
++      "fragments": 0
++    },
++    {
++      "h": 23,
++      "v": 3,
++      "id": null,
++      "title": "30 juin 2026 — Claude Science",
++      "text": "30 juin 2026 — Claude Science « Claude Code, pour la recherche scientifique » Outils, packages, arte",
++      "fragments": 0
++    },
++    {
++      "h": 23,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "Un balayage à 8 bras envoyé sur les A100 du cluster du labo, le notebook partagé avec l'agent, en di",
++      "fragments": 0
++    },
++    {
++      "h": 23,
++      "v": 5,
++      "id": null,
++      "title": null,
++      "text": "Cinq agents en parallèle, et un relecteur qui signale un PMID attribué à deux papiers — similaire au",
++      "fragments": 0
++    },
++    {
++      "h": 24,
++      "v": null,
++      "id": null,
++      "title": null,
++      "text": "presentations.cafeine.dev/slides/claude-on-scotch.html github.com/c4ffein/pyscotch github.com/c4ffei",
++      "fragments": 0
++    }
++  ],
++  "walk": {
++    "steps": 97,
++    "end": {
++      "h": 24,
++      "v": 0
++    }
++  }
++}
+diff --git a/tests/e2e/golden/dev-with-ai-in-late-2025.json b/tests/e2e/golden/dev-with-ai-in-late-2025.json
+new file mode 100644
+index 0000000..24f7bb6
+--- /dev/null
++++ b/tests/e2e/golden/dev-with-ai-in-late-2025.json
+@@ -0,0 +1,452 @@
++{
++  "total": 55,
++  "slides": [
++    {
++      "h": 0,
++      "v": null,
++      "id": null,
++      "title": "Coding with Claude Code",
++      "text": "Coding with Claude Code in late 2025 fin 2025",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": null,
++      "id": null,
++      "title": "Presentation",
++      "text": "Presentation Présentation Not an AI expert An engineer who likes to understand Pas un expert en IA U",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": null,
++      "id": null,
++      "title": "Part 1",
++      "text": "Part 1 There is no stop sign Les bases de l'IA",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": null,
++      "id": null,
++      "title": "What is a computer?",
++      "text": "What is a computer? C'est quoi un ordinateur ? A machine that takes in information, processes it by ",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": null,
++      "id": null,
++      "title": "Moore's Law (1965)",
++      "text": "Moore's Law (1965) The number of transistors on a chip doubles roughly every two years Le nombre de ",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": null,
++      "id": null,
++      "title": "Wirth's Law (1995)",
++      "text": "Wirth's Law (1995) \"Software is getting slower more rapidly than hardware is getting faster.\" \"Les l",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 0,
++      "id": null,
++      "title": "What is a Neural Network?",
++      "text": "What is a Neural Network? Réseau de neurones A program structured as layers of connected nodes, loos",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 1,
++      "id": null,
++      "title": "Traditional vs Neural Network",
++      "text": "Traditional vs Neural Network Traditionnel vs neurones Traditional: you write explicit rules Neural ",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": null,
++      "id": null,
++      "title": "MNIST",
++      "text": "MNIST The \"hello world\" of machine learning Le \"hello world\" du machine learning 70,000 handwritten ",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": null,
++      "id": null,
++      "title": "Emergent Properties",
++      "text": "Emergent Properties Propriétés émergentes When you scale neural networks up, they start doing things",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": 0,
++      "id": null,
++      "title": "ChatGPT?",
++      "text": "ChatGPT? \"Attention Is All You Need\" (2017) \"Attention Is All You Need\" (2017) Then they just scaled",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": 1,
++      "id": null,
++      "title": "Modern LLM",
++      "text": "Modern LLM LLM Moderne More data More power Additional specific methods Plus de données Plus de puis",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": 2,
++      "id": null,
++      "title": "3Blue1Brown",
++      "text": "3Blue1Brown Learn More Pour aller plus loin 3blue1brown.com/topics/neural-networks",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 0,
++      "id": null,
++      "title": "The Bitter Lesson",
++      "text": "The Bitter Lesson Richard Sutton (2019) General methods that leverage computation scale better than ",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 1,
++      "id": null,
++      "title": "LLM",
++      "text": "LLM Applies positively: scaling Applies negatively: too much human input S'applique positivement : s",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": null,
++      "id": null,
++      "title": "Scaling → Nuance",
++      "text": "Scaling → Nuance Scaling → Nuance \"Pierre prend la boule et la lance.\" Sonnet Opus Pierre takes the ",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": null,
++      "id": null,
++      "title": "A year ago...",
++      "text": "A year ago... Il y a encore un an... Replaces templates Answers questions Specific modifications Rem",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 0,
++      "id": null,
++      "title": "How does a human actually code?",
++      "text": "How does a human actually code? Comment un humain code-t-il vraiment ? Read existing code to underst",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 1,
++      "id": null,
++      "title": "Positive feedback loop",
++      "text": "Positive feedback loop Boucle de rétroaction positive AI must follow the same loopact → observe → ad",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 0,
++      "id": null,
++      "title": "Claude Code",
++      "text": "Claude Code \"I started hacking around using Claude in the terminal. The first version was barebones:",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 1,
++      "id": null,
++      "title": "What is Claude Code?",
++      "text": "What is Claude Code? C'est quoi Claude Code ? Terminal + VSCode + in the cloud + ... Best agentic co",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 2,
++      "id": null,
++      "title": "Alternatives",
++      "text": "Alternatives Codex CLI Gemini CLI Mistral Vibe CLI ...",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": 3,
++      "id": null,
++      "title": "Évolutions",
++      "text": "Évolutions L'ancien Cursor Claude Code, Codex CLI, Gemini CLI... Google Antigravity / Nouveau Cursor",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": null,
++      "id": null,
++      "title": "Part 2",
++      "text": "Part 2 Coding with Claude Code",
++      "fragments": 0
++    },
++    {
++      "h": 16,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "✳ Welcome to Claude Code! /help for help, /status for your current setup cwd: /home/dev/workspace/pr",
++      "fragments": 0
++    },
++    {
++      "h": 17,
++      "v": 0,
++      "id": null,
++      "title": "Point at the TODO",
++      "text": "Point at the TODO Pointer vers le TODO > Can you read path/to/my/file.py - line 111 ? ● Read(path/to",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 0,
++      "id": null,
++      "title": "Auto runs tests, shows architecture",
++      "text": "Auto runs tests, shows architecture Tests + archi ● All 99 tests pass! Here's the summary of this re",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 1,
++      "id": null,
++      "title": "Auto runs tests, shows architecture",
++      "text": "Auto runs tests, shows architecture Tests + archi Architecture is now explicit: CLI (chatbot.py) Bac",
++      "fragments": 0
++    },
++    {
++      "h": 19,
++      "v": 0,
++      "id": null,
++      "title": "Using acronyms: KISS",
++      "text": "Using acronyms: KISS Utiliser des acronymes : KISS KISS - \"Keep it simple, stupid\" A good software e",
++      "fragments": 0
++    },
++    {
++      "h": 19,
++      "v": 1,
++      "id": null,
++      "title": "Example: KISS",
++      "text": "Example: KISS Exemple : KISS > Could both directly import then? To stay KISS? ● Good point! Let's ch",
++      "fragments": 0
++    },
++    {
++      "h": 20,
++      "v": 0,
++      "id": null,
++      "title": "Using acronyms: DRY",
++      "text": "Using acronyms: DRY Utiliser des acronymes : DRY DRY - \"Don't Repeat Yourself\" Short prompts work wi",
++      "fragments": 0
++    },
++    {
++      "h": 20,
++      "v": 1,
++      "id": null,
++      "title": "Example: DRY",
++      "text": "Example: DRY Exemple : DRY > file_a.py and file_b.py => DRY ∴ Thinking… Looking at both files, I can",
++      "fragments": 0
++    },
++    {
++      "h": 21,
++      "v": 0,
++      "id": null,
++      "title": "Claude still makes mistakes",
++      "text": "Claude still makes mistakes Des erreurs > It seems we removed some logic. Can you explain this? ● No",
++      "fragments": 0
++    },
++    {
++      "h": 21,
++      "v": 1,
++      "id": null,
++      "title": "I had to really pinpoint",
++      "text": "I had to really pinpoint À montrer précisément > Ok, what about this especially? [ a subpart of the ",
++      "fragments": 0
++    },
++    {
++      "h": 22,
++      "v": null,
++      "id": null,
++      "title": "Claude can show ASCII to explain",
++      "text": "Claude can show ASCII to explain De l'ASCII pour expliquer > Can you output the ascii of a tree and ",
++      "fragments": 0
++    },
++    {
++      "h": 23,
++      "v": null,
++      "id": null,
++      "title": "Can work with my datastructures",
++      "text": "Can work with my datastructures Structures de données > Could we stop with the \"status\": \"something\"",
++      "fragments": 0
++    },
++    {
++      "h": 24,
++      "v": 0,
++      "id": null,
++      "title": "Can follow my architecture ideas",
++      "text": "Can follow my architecture ideas Des idées d'architecture > I have another idea. Could we not use a ",
++      "fragments": 0
++    },
++    {
++      "h": 25,
++      "v": 0,
++      "id": null,
++      "title": "Can take ops problems into account",
++      "text": "Can take ops problems into account Opérationnel > We're on a cheap sevalla, I think it's safer to do",
++      "fragments": 0
++    },
++    {
++      "h": 25,
++      "v": 1,
++      "id": null,
++      "title": "Can take ops problems into account",
++      "text": "Can take ops problems into account Opérationnel ● You're right to be concerned. Here's the reality: ",
++      "fragments": 0
++    },
++    {
++      "h": 26,
++      "v": 0,
++      "id": null,
++      "title": "Can discuss security tradeoffs",
++      "text": "Can discuss security tradeoffs Compromis de sécurité ● Reminder: Please rotate your API keys since t",
++      "fragments": 0
++    },
++    {
++      "h": 27,
++      "v": null,
++      "id": null,
++      "title": "CLAUDE.md",
++      "text": "CLAUDE.md Project architecture Design How we actually deploy Anything useful pretty much anywhere in",
++      "fragments": 0
++    },
++    {
++      "h": 28,
++      "v": 0,
++      "id": null,
++      "title": "Can manage git",
++      "text": "Can manage git Peut gérer git > Here is my plan: create a data repo, move resources, rewrite history",
++      "fragments": 0
++    },
++    {
++      "h": 28,
++      "v": 1,
++      "id": null,
++      "title": "Can manage git",
++      "text": "Can manage git Peut gérer git ● Good plan overall! Some thoughts: On history rewriting: - Use git fi",
++      "fragments": 0
++    },
++    {
++      "h": 28,
++      "v": 2,
++      "id": null,
++      "title": "Still have to nudge them",
++      "text": "Still have to nudge them Toujours vérifier… > .git is 105M ... Is it too much? ● Let me check what's",
++      "fragments": 0
++    },
++    {
++      "h": 29,
++      "v": null,
++      "id": null,
++      "title": "Weak points",
++      "text": "Weak points Points faibles Projects that are still too complex Research / R&D oriented code Specific",
++      "fragments": 0
++    },
++    {
++      "h": 30,
++      "v": null,
++      "id": null,
++      "title": "Learn more...",
++      "text": "Learn more... Pour aller plus loin... Mastering Claude Code in 30 minutes LLM + Property Based Testi",
++      "fragments": 0
++    },
++    {
++      "h": 31,
++      "v": null,
++      "id": null,
++      "title": "Part 3",
++      "text": "Part 3 What is the future now? Et la suite ?",
++      "fragments": 0
++    },
++    {
++      "h": 32,
++      "v": 0,
++      "id": null,
++      "title": "No stopping in sight",
++      "text": "No stopping in sight Pas d'arrêt en vue Moore's Law still holds The Bitter Lesson still applies Each",
++      "fragments": 0
++    },
++    {
++      "h": 32,
++      "v": 1,
++      "id": null,
++      "title": "Wirth's Law is the bottleneck",
++      "text": "Wirth's Law is the bottleneck Wirth's Law est le goulot d'étranglement In my feedback loop, as a dev",
++      "fragments": 0
++    },
++    {
++      "h": 32,
++      "v": 2,
++      "id": null,
++      "title": "Anthropic acquires Bun",
++      "text": "Anthropic acquires Bun Anthropic acquiert Bun Bun: JavaScript/TypeScript runtime, often 3-10x faster",
++      "fragments": 0
++    },
++    {
++      "h": 33,
++      "v": 0,
++      "id": null,
++      "title": "And the workforce?",
++      "text": "And the workforce? Et la main d'oeuvre ? Dario Amodei (Anthropic CEO) has been somehow accurate enou",
++      "fragments": 0
++    },
++    {
++      "h": 33,
++      "v": 1,
++      "id": null,
++      "title": "But in the next 5 years?",
++      "text": "But in the next 5 years? Mais dans 5 ans ? Can only go better. \"Developer\" evolves, either be: Dével",
++      "fragments": 0
++    },
++    {
++      "h": 33,
++      "v": 2,
++      "id": null,
++      "title": "Should I worry?",
++      "text": "Should I worry? Dois-je m'inquiéter ? There is no value for writing the code yourself anymore If you",
++      "fragments": 0
++    },
++    {
++      "h": 34,
++      "v": null,
++      "id": null,
++      "title": "Thank you",
++      "text": "Thank you Merci Questions? Des questions ? presentations.cafeine.dev",
++      "fragments": 0
++    },
++    {
++      "h": 35,
++      "v": null,
++      "id": null,
++      "title": "Liens",
++      "text": "Liens Moore's Law Wirth's Law \"Attention Is All You Need\" 3Blue1Brown KISS DRY Mastering Claude Code",
++      "fragments": 0
++    }
++  ],
++  "walk": {
++    "steps": 54,
++    "end": {
++      "h": 35,
++      "v": 0
++    }
++  }
++}
+diff --git a/tests/e2e/golden/django-ninja.json b/tests/e2e/golden/django-ninja.json
+new file mode 100644
+index 0000000..520cf27
+--- /dev/null
++++ b/tests/e2e/golden/django-ninja.json
+@@ -0,0 +1,452 @@
++{
++  "total": 55,
++  "slides": [
++    {
++      "h": 0,
++      "v": null,
++      "id": null,
++      "title": "Django Ninja",
++      "text": "Django Ninja Une alternative à Django REST Framework inspirée par FastAPI",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": null,
++      "id": null,
++      "title": "Framework web Python?",
++      "text": "Framework web Python? Flask: (api/ssr) Django Default Jinja templates (ssr) Custom routes, diy (api)",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": null,
++      "id": null,
++      "title": "Parcours pro (Django) d'un dev",
++      "text": "Parcours pro (Django) d'un dev Expérience / contrat DRF / Ninja ? Software Engineer R&D en startup —",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "Django REST Framework VS Django Ninja",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "DRF Ninja Définition des routes ViewSets / Routers Décorateurs Validation Serializers Pydantic Async",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "DRF Ninja Définition des routes ViewSets / Routers Décorateurs",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "DRF # serializers.py + views.py + urls.py class ItemViewSet(viewsets.ModelViewSet): queryset = Item.",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "DRF class OrderViewSet(viewsets.ModelViewSet): serializer_class = OrderSerializer authentication_cla",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "app = FastAPI() @app.get(\"/\") def read_root(): return {\"Hello\": \"World\"} @app.get(\"/items/{item_id}\"",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "api = NinjaAPI() @api.get(\"/items/{item_id}\") def read_item(request, item_id: int): return {\"item_id",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 5,
++      "id": null,
++      "title": null,
++      "text": "# urls.py from django.contrib import admin from django.urls import path from ninja import NinjaAPI a",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "DRF Ninja Validation Serializers Pydantic",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "DRF class ItemSerializer(serializers.ModelSerializer): class Meta: model = Item fields = [\"id\", \"nam",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "github.com/pydantic/pydantic",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "from datetime import datetime from typing import Optional from pydantic import BaseModel class User(",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "external_data = { 'id': '123', 'signup_ts': '2017-06-01 12:22', 'friends': [1, '2', b'3'], } user = ",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 5,
++      "id": null,
++      "title": null,
++      "text": "from ninja import ModelSchema class ItemSchema(ModelSchema): class Meta: model = Item fields = [\"id\"",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "DRF Ninja Async natif adrf (add-on) ✓",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "Multithreading? Multiprocessing? Async! + Multiprocessing",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "import time @api.get(\"/say-after\") def say_after(request, delay: int, word: str): time.sleep(delay) ",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "def get_user(): return UserProfile.objects.filter( name=\"django\" ).first() self.user = await sync_to",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "fastapi.tiangolo.com/async",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 5,
++      "id": null,
++      "title": "adrf — l'async pour DRF (add-on)",
++      "text": "adrf — l'async pour DRF (add-on) GitHub stars 611 Dernier commit il y a 7 mois Dernière release 0.1.",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "DRF Ninja Performance référence 2.1× ?",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "Parsing / validation JSON concurrency = 1, requests/sec (higher is better) 0 500 1000 1500 requests ",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "Calling a slow network operation concurrency = 50 — Django Ninja uses async views 0 100 200 300 400 ",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "DRF Ninja GitHub stars 30k 9k",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "au 17 juin 2026 · star-history.com",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": null,
++      "id": null,
++      "title": null,
++      "text": "Real world example?.. Un parcours de migration concret? Il faut partir d'une base...",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "github.com/realworld-apps/realworld",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "demo.realworld.show",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "api.realworld.show",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "— DRF Découpée en 3 apps KISS Il y a des tests?..",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "— DRF accounts articles comments models.py ✓ ✓ ✓ schemas.py ✓ ✓ ✓ serializers.py ✓ ✓ ✓ tests.py ✓ ✓ ",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 0,
++      "id": null,
++      "title": "Tests existants",
++      "text": "— DRF Tests existants",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "def test_profile_detail_view_get(self): response = self.client.get(self.url) self.assertEqual(respon",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "class ProfileDetailViewTestCase(APITestCase): def setUp(self): ... def test_profile_detail_view_get_",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "def test_profile_detail_view_get_other_not_followed(self): response = self.client.get(self.other_url",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "def test_profile_detail_view_get_other_followed(self): self.other_user.followers.add(self.user) resp",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 0,
++      "id": null,
++      "title": "Views",
++      "text": "— DRF Views",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "DRF class ProfileDetailView(viewsets.ModelViewSet): queryset = User.objects.all() serializer_class =",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "DRF def list(self, request, username=None, *args, **kwargs): try: profile = User.objects.get(usernam",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "DRF class ProfileSerializer(serializers.ModelSerializer): following = serializers.SerializerMethodFi",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "DRF def get_following(self, obj): user = self.context.get('request').user if user.is_authenticated: ",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 5,
++      "id": null,
++      "title": null,
++      "text": "@router.get( '/profiles/{username}', auth=AuthJWT(pass_even=True), response={ 200: Any, 401: Any, 40",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 6,
++      "id": null,
++      "title": null,
++      "text": "def get_profiles(request, username: str): user = get_object_or_404(User, username=username) return {",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 7,
++      "id": null,
++      "title": null,
++      "text": "@router.get( '/profiles/{username}', auth=AuthJWT(pass_even=True), response={ 200: ProfileSchema, 40",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 8,
++      "id": null,
++      "title": null,
++      "text": "class ProfileSchema(ModelSchema): following: bool class Meta: model = User fields = [\"username\", \"bi",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 9,
++      "id": null,
++      "title": null,
++      "text": "class AuthJWT(HttpBearer, JWTBaseAuthentication): openapi_scheme = \"token\" user_model = User def __i",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 10,
++      "id": null,
++      "title": null,
++      "text": "api = NinjaAPI() api.add_router(\"/\", \"accounts.api.router\") api.add_router(\"/\", \"comments.api.router",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": null,
++      "id": null,
++      "title": null,
++      "text": "Migration terminée Pendant la migration, pas de tests cassés = utilisable Maintenant mainteneur prin",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 0,
++      "id": null,
++      "title": "Conclusion",
++      "text": "Conclusion",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 1,
++      "id": null,
++      "title": "Pour l'utiliser",
++      "text": "Pour l'utiliser Peut éliminer les frictions avec DRF La perf (à vérifier à quel point s'applique) Pa",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 2,
++      "id": null,
++      "title": "Pour ne pas l'utiliser",
++      "text": "Pour ne pas l'utiliser Reste moins maintenu Reste moins documenté Équipe connaît déjà DRF La codebas",
++      "fragments": 0
++    },
++    {
++      "h": 16,
++      "v": null,
++      "id": null,
++      "title": null,
++      "text": "presentations.cafeine.dev/slides/django-ninja.html django-ninja.dev github.com/c4ffein/realworld-dja",
++      "fragments": 0
++    }
++  ],
++  "walk": {
++    "steps": 54,
++    "end": {
++      "h": 16,
++      "v": 0
++    }
++  }
++}
+diff --git a/tests/e2e/golden/hypothesis.json b/tests/e2e/golden/hypothesis.json
+new file mode 100644
+index 0000000..3e382a2
+--- /dev/null
++++ b/tests/e2e/golden/hypothesis.json
+@@ -0,0 +1,340 @@
++{
++  "total": 41,
++  "slides": [
++    {
++      "h": 0,
++      "v": null,
++      "id": null,
++      "title": "Hypothesis",
++      "text": "Hypothesis Laissez la machine trouver vos edge cases",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 0,
++      "id": null,
++      "title": "C'est quoi un test ?",
++      "text": "C'est quoi un test ? On appelle du code On vérifie une sortie attendue On choisit nous-mêmes les ent",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "Test unitaire def add(a, b): return a + b def test_add(): assert add(2, 3) == 5 assert add(-1, 1) ==",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "Test end-to-end (api) def test_create_article(client): token = login(client, \"alice\") resp = client.",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "Test end-to-end (ui) — Playwright def test_publish_article(page): page.goto(\"https://demo.realworld.",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "E2E Intégration Unitaires",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 0,
++      "id": null,
++      "title": "Mon rapport au test",
++      "text": "Mon rapport au test Avant l'agentique Après l'agentique Projets testés en fonction du projet tout, s",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 1,
++      "id": null,
++      "title": "Ce que je teste",
++      "text": "Ce que je teste Exemple : mainteneur de RealWorld Hurl / Bruno / Playwright Mes propres utilitaires ",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 2,
++      "id": null,
++      "title": "Sur un projet complexe",
++      "text": "Sur un projet complexe Je ne veux pas décrire des exemples Je veux décrire des propriétés Je veux la",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": null,
++      "id": null,
++      "title": "Et si la machine choisissait ?",
++      "text": "Et si la machine choisissait ? Tests classiques l'utilisateur choisit chaque entrée Fuzzing la machi",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 0,
++      "id": null,
++      "title": "Fuzzing",
++      "text": "Fuzzing La machine génère des entrées aléatoires pour trouver des crashs guidée par la couverture : ",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 1,
++      "id": null,
++      "title": "Commun pour les projets exposés",
++      "text": "Commun pour les projets exposés Chrome — libFuzzer, AFL++, Centipede (ClusterFuzz, OSS-Fuzz) Firefox",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "Qui choisit les entrées la machine Oracle crash uniquement Domaine typique parsers, navigateurs, séc",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 0,
++      "id": null,
++      "title": "Méthodes formelles",
++      "text": "Méthodes formelles On prouve une propriété pour toutes les entrées Les outils : TLA+ — spécifier des",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "Couverture toutes les entrées (preuve) Coût élevé Domaine typique aérospatial, crypto, hardware, sma",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "Lean — une preuve, pas un échantillon -- Vrai pour TOUT a, b : aucune valeur n'est échantillonnée --",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 0,
++      "id": null,
++      "title": "Property-based testing",
++      "text": "Property-based testing Vous écrivez des propriétés (comme le formel) + la machine génère & réduit le",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "Tests classiques Fuzzing PBT Formel Entrées valeurs idéalement en dur machine machine (stratégies) t",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 0,
++      "id": null,
++      "title": null,
++      "text": "Hypothesis from hypothesis import given, strategies as st @given(st.integers(), st.integers()) def t",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "Pas un tirage uniforme @given(st.integers()) def test_p(n): ... # Vise les bornes de l'intervalle, e",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "Composer des structures jsons = st.recursive( st.none() | st.booleans() | st.integers() | st.text(),",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "La réduction (shrinking) @given(st.lists(st.integers())) def test_sort_idempotent(xs): assert my_sor",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "Rejouer le dernier contre-exemple Le contre-exemple réduit est sauvegardé Répertoire .hypothesis/ — ",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 0,
++      "id": null,
++      "title": "Patterns classiques",
++      "text": "Patterns classiques Comment savoir si la sortie est correcte ?",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "Aller-retour (round-trip) @given(st.text()) def test_json_roundtrip(s): assert json.loads(json.dumps",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 2,
++      "id": null,
++      "title": null,
++      "text": "Implémentation de référence @given(st.lists(st.integers())) def test_against_reference(xs): assert m",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "Invariants — « rien ne change » @given(st.lists(st.integers())) def test_sort_preserves(xs): ys = my",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 4,
++      "id": null,
++      "title": null,
++      "text": "Idempotence — deux fois = une fois @given(st.text()) def test_normalize_idempotent(s): once = normal",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": 0,
++      "id": null,
++      "title": "Tester des séquences d'actions",
++      "text": "Tester des séquences d'actions Pas juste une entrée : une suite d'appels Hypothesis génère le scénar",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "class ShoppingCart(RuleBasedStateMachine): @rule(item=st.text(), qty=st.integers(min_value=1)) def a",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 0,
++      "id": null,
++      "title": "Et l'IA dans tout ça ?",
++      "text": "Et l'IA dans tout ça ? Un agent LLM qui infère les propriétés depuis le code & la doc, génère des PB",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 1,
++      "id": null,
++      "title": null,
++      "text": "Packages Python analysés 100 Rapports = vrais bugs 56 % Bugs corrigés en amont NumPy, SDKs cloud… pa",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 2,
++      "id": null,
++      "title": "Avant la vague Mythos",
++      "text": "Avant la vague Mythos Oct. 2025 Des agents trouvent — et corrigent — de vrais bugs via PBT (NumPy, S",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 0,
++      "id": null,
++      "title": "Et après ? — Hegel",
++      "text": "Et après ? — Hegel Hypothesis (thèse) + Antithesis (antithèse) = Hegel (synthèse) antithesis.com/blo",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 1,
++      "id": null,
++      "title": "Hegel (initialement)",
++      "text": "Hegel (initialement) Le moteur d'Hypothesis comme serveur Un protocole — écrit une fois Des clients ",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 2,
++      "id": null,
++      "title": "Hegel (évolution)",
++      "text": "Hegel (évolution) Un mode Rust natif expérimental réécriture assistée par IA (Claude) Pour l'instant",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": 3,
++      "id": null,
++      "title": null,
++      "text": "« Haskell programmers are willing to put up with a lot of suffering for correctness. If Python progr",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 0,
++      "id": null,
++      "title": "Conclusion",
++      "text": "Conclusion",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 1,
++      "id": null,
++      "title": "Pour l'utiliser",
++      "text": "Pour l'utiliser Trouve des cas que vous n'imaginez pas La réduction = un bug minimal, reproductible ",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": 2,
++      "id": null,
++      "title": "Pour ne pas l'utiliser",
++      "text": "Pour ne pas l'utiliser Effort demandé pour trouver les bonnes propriétés Plus lent qu'un test par l'",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": null,
++      "id": null,
++      "title": null,
++      "text": "presentations.cafeine.dev/slides/hypothesis.html hypothesis.readthedocs.io hegel.dev arXiv:2510.0990",
++      "fragments": 0
++    }
++  ],
++  "walk": {
++    "steps": 40,
++    "end": {
++      "h": 13,
++      "v": 0
++    }
++  }
++}
+diff --git a/tests/e2e/golden/learning-python-as-a-programmer.json b/tests/e2e/golden/learning-python-as-a-programmer.json
+new file mode 100644
+index 0000000..dc7682b
+--- /dev/null
++++ b/tests/e2e/golden/learning-python-as-a-programmer.json
+@@ -0,0 +1,372 @@
++{
++  "total": 45,
++  "slides": [
++    {
++      "h": 0,
++      "v": null,
++      "id": null,
++      "title": "Python for Programmers",
++      "text": "Python for Programmers A guide for the ones who never tried it March 2025",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 0,
++      "id": null,
++      "title": "Introduction",
++      "text": "Introduction Why this guide? For developers with Java/C# experience Focus on the bigger picture Unde",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 1,
++      "id": null,
++      "title": "What IS Python?",
++      "text": "What IS Python? High-level, interpreted programming language Created by Guido van Rossum in 1991 Emp",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 2,
++      "id": null,
++      "title": "The Philosophy of Python",
++      "text": "The Philosophy of Python Zen of Python (import this) >>> import this The Zen of Python, by Tim Peter",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 3,
++      "id": null,
++      "title": "Hello World",
++      "text": "Hello World No boilerplate, always straightforward: print(\"Hello, World!\")",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 0,
++      "id": null,
++      "title": "Basic Data Types",
++      "text": "Basic Data Types # Variables (no type declarations) name = \"Python\" # str age = 30 # int price = 19.",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 1,
++      "id": null,
++      "title": "Strong, Dynamic Typing",
++      "text": "Strong, Dynamic Typing Python is dynamically typed but strongly typed # Python - Raises TypeError >>",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 0,
++      "id": null,
++      "title": "Collections",
++      "text": "Collections Container data types to store multiple items Lists (mutable) Tuples (immutable) Dictiona",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 1,
++      "id": null,
++      "title": "Lists",
++      "text": "Lists Mutable arrays (not linked lists) l = [\"a\", \"b\", \"c\"] l.append(\"d\") # Add one element l.extend",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 2,
++      "id": null,
++      "title": "Tuples",
++      "text": "Tuples Like lists but immutable t = (1, 2, 3) # Defines a 3 elements tuple print(t) # (1, 2, 3) t = ",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 3,
++      "id": null,
++      "title": "Dictionaries",
++      "text": "Dictionaries Key-value pairs like HashMap (O(1) average operations) AGE = \"age\" user = { \"name\": \"Al",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 4,
++      "id": null,
++      "title": "Dictionaries - get vs []",
++      "text": "Dictionaries - get vs [] >>> user = {} >>> user[\"a\"] Traceback (most recent call last): KeyError: 'a",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 5,
++      "id": null,
++      "title": "Sets",
++      "text": "Sets Hash table without values (unique elements) unique_numbers = {1, 2, 3, 3, 4} # Will contain 1, ",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 6,
++      "id": null,
++      "title": null,
++      "text": "More collections in collections module",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 0,
++      "id": null,
++      "title": "Control Flow",
++      "text": "Control Flow If statements x = 10 if x > 5: print(\"x is greater than 5\") elif x == 5: print(\"x equal",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 1,
++      "id": null,
++      "title": "For Loops",
++      "text": "For Loops languages = [\"french\", \"english\", \"italian\"] for language in languages: print(language) Ra",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 2,
++      "id": null,
++      "title": "Inline For",
++      "text": "Inline For # List comprehension [x for x in range(10)] # [0, 1, 2, 3, 4, 5, 6, 7, 8, 9] # Dictionary",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 3,
++      "id": null,
++      "title": "Conditional",
++      "text": "Conditional # Creating lists with loop logic squares = [x * x for x in range(10)] # With conditions ",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 4,
++      "id": null,
++      "title": "While Loops",
++      "text": "While Loops count = 0 while count < 5: print(count) count += 1",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": null,
++      "id": null,
++      "title": "Functions",
++      "text": "Functions # Defining functions def greet(name, greeting=\"Hello\"): \"\"\"Greet a person with a custom gr",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 0,
++      "id": null,
++      "title": "Decorators",
++      "text": "Decorators Modify behavior of functions or classes without changing source code # Basic decorator ex",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 1,
++      "id": null,
++      "title": "Decorators with Arguments",
++      "text": "Decorators with Arguments def repeat(n=1): def decorator(func): def wrapper(*args, **kwargs): result",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 0,
++      "id": null,
++      "title": "Classes and Objects",
++      "text": "Classes and Objects class Person: species = \"Human\" def __init__(self, name, age): self.name = name ",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 1,
++      "id": null,
++      "title": "Classes and Objects",
++      "text": "Classes and Objects @staticmethod def get_species_info_hardcoded(): return \"Humans are social beings",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 2,
++      "id": null,
++      "title": "Classes and Objects",
++      "text": "Classes and Objects alice = Person(\"Alice\", 30) print(alice.introduce()) print(Person.get_species_in",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 3,
++      "id": null,
++      "title": "Inheritance",
++      "text": "Inheritance class Animal: def __init__(self, name): self.name = name def speak(self): return \"Some s",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": 4,
++      "id": null,
++      "title": "Inheritance",
++      "text": "Inheritance # Create an instance of the subclass dog = Dog(\"Rex\") print(dog.name) print(dog.speak())",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 0,
++      "id": null,
++      "title": "Abstract Classes",
++      "text": "Abstract Classes from abc import ABC, abstractmethod class Animal(ABC): @abstractmethod def make_sou",
++      "fragments": 0
++    },
++    {
++      "h": 8,
++      "v": 1,
++      "id": null,
++      "title": "Abstract Classes",
++      "text": "Abstract Classes # This works dog = Dog() print(dog.make_sound()) # Woof! # This would raise TypeErr",
++      "fragments": 0
++    },
++    {
++      "h": 9,
++      "v": null,
++      "id": null,
++      "title": "Lambda Functions",
++      "text": "Lambda Functions Anonymous single-expression functions add = lambda a, b: a + b print(add(5, 3)) # 8",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 0,
++      "id": null,
++      "title": "Exception Handling",
++      "text": "Exception Handling class SpecificKindOfValueError(ValueError): \"\"\"Defines an Exception inheriting fr",
++      "fragments": 0
++    },
++    {
++      "h": 10,
++      "v": 1,
++      "id": null,
++      "title": "Exception Handling",
++      "text": "Exception Handling try: do_something() except SpecificKindOfValueError: print(\"Here, handle Specific",
++      "fragments": 0
++    },
++    {
++      "h": 11,
++      "v": null,
++      "id": null,
++      "title": "Modules and Imports",
++      "text": "Modules and Imports # Single import import math print(math.sqrt(16)) # 4.0 # Import specific functio",
++      "fragments": 0
++    },
++    {
++      "h": 12,
++      "v": null,
++      "id": null,
++      "title": "Context Managers",
++      "text": "Context Managers Ensure specific logic executes before and after your code # File handling (automati",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 0,
++      "id": null,
++      "title": "Asynchronicity",
++      "text": "Asynchronicity Using async/await for concurrent operations # Core concepts (sample code - not for ex",
++      "fragments": 0
++    },
++    {
++      "h": 13,
++      "v": 1,
++      "id": null,
++      "title": "Asynchronicity",
++      "text": "Asynchronicity Entering async context # Run coroutine from non-async context asyncio.run(main_corout",
++      "fragments": 0
++    },
++    {
++      "h": 14,
++      "v": null,
++      "id": null,
++      "title": "Python Downsides",
++      "text": "Python Downsides Performance considerations Interpreted with runtime type checking Global Interprete",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 0,
++      "id": null,
++      "title": "Python Ecosystem",
++      "text": "Python Ecosystem Tooling pyproject.toml: Standard project configuration Package Management: pip: Pac",
++      "fragments": 0
++    },
++    {
++      "h": 15,
++      "v": 1,
++      "id": null,
++      "title": "Type Hints",
++      "text": "Type Hints def greeting(name: str) -> str: return f\"Hello, {name}\" age: int = 30 # Types aren't enfo",
++      "fragments": 0
++    },
++    {
++      "h": 16,
++      "v": 0,
++      "id": null,
++      "title": "General Conventions",
++      "text": "General Conventions PEP 8: Official style guide (naming, indentation, etc.) Pythonic Code: Idiomatic",
++      "fragments": 0
++    },
++    {
++      "h": 16,
++      "v": 1,
++      "id": null,
++      "title": "Underscore Conventions",
++      "text": "Underscore Conventions value: Regular public attribute/method _value: \"Private by convention\" (not e",
++      "fragments": 0
++    },
++    {
++      "h": 17,
++      "v": null,
++      "id": null,
++      "title": "Learning Python with AI",
++      "text": "Learning Python with AI Claude (Anthropic) is excellent for learning Python concepts Example Questio",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 0,
++      "id": null,
++      "title": "Further Learning Resources",
++      "text": "Further Learning Resources Documentation & Books Official Python Documentation Automate The Boring S",
++      "fragments": 0
++    },
++    {
++      "h": 18,
++      "v": 1,
++      "id": null,
++      "title": "Further Learning Resources",
++      "text": "Further Learning Resources Practice Exercism CodeSignal HackerRank",
++      "fragments": 0
++    },
++    {
++      "h": 19,
++      "v": null,
++      "id": null,
++      "title": "Thank you for listening",
++      "text": "Thank you for listening Please give honest feedback!",
++      "fragments": 0
++    }
++  ],
++  "walk": {
++    "steps": 44,
++    "end": {
++      "h": 19,
++      "v": 0
++    }
++  }
++}
+diff --git a/tests/e2e/golden/vibe-coding-vs-vibe-engineering.json b/tests/e2e/golden/vibe-coding-vs-vibe-engineering.json
+new file mode 100644
+index 0000000..ed145e0
+--- /dev/null
++++ b/tests/e2e/golden/vibe-coding-vs-vibe-engineering.json
+@@ -0,0 +1,164 @@
++{
++  "total": 19,
++  "slides": [
++    {
++      "h": 0,
++      "v": null,
++      "id": null,
++      "title": "Vibe codingvsvibe engineering",
++      "text": "Vibe codingvsvibe engineering",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 0,
++      "id": null,
++      "title": "« Vibe coding »",
++      "text": "« Vibe coding » « There's a new kind of coding I call \"vibe coding\", where you fully give in to the ",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 1,
++      "id": null,
++      "title": "Qui parle",
++      "text": "Qui parle Doctorat à Stanford sous Fei-Fei Li y crée et enseigne CS231n, le premier cours de deep le",
++      "fragments": 0
++    },
++    {
++      "h": 1,
++      "v": 2,
++      "id": null,
++      "title": "Ce qu'il disait vraiment",
++      "text": "Ce qu'il disait vraiment Un week-end, un projet jetable « it mostly works » Le mot a ensuite servi à",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 0,
++      "id": null,
++      "title": "« Vibe engineering »",
++      "text": "« Vibe engineering » « Vibe coding is pretty well established now as covering the fast, loose and ir",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 1,
++      "id": null,
++      "title": "Qui parle",
++      "text": "Qui parle Co-créateur de Django (2005) Créateur de Datasette et de l'outil llm Membre du conseil d'a",
++      "fragments": 0
++    },
++    {
++      "h": 2,
++      "v": 2,
++      "id": null,
++      "title": "Sa liste",
++      "text": "Sa liste Ce qu'il faut déjà savoir faire pour que ça marche : tests automatisés planifier avant docu",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 0,
++      "id": null,
++      "title": "Developer ⇒ TECH LEAD + QA",
++      "text": "Developer ⇒ TECH LEAD + QA « Think of it this way: you just got promoted. Your new title is Tech Lea",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 1,
++      "id": null,
++      "title": "Qui parle",
++      "text": "Qui parle Reverse engineer, C++, internals Windows — Utrecht University Créateur et mainteneur de x6",
++      "fragments": 0
++    },
++    {
++      "h": 3,
++      "v": 2,
++      "id": null,
++      "title": "Pas de micromanagement",
++      "text": "Pas de micromanagement « You could have thirty agents working for you simultaneously. You cannot wat",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 0,
++      "id": null,
++      "title": "Ma pratique",
++      "text": "Ma pratique Tech lead : je possède la structure et les questions QA lead : je possède l'oracle Le co",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 1,
++      "id": null,
++      "title": "Tech lead — les structures",
++      "text": "Tech lead — les structures « Bad programmers worry about the code. Good programmers worry about data",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 2,
++      "id": null,
++      "title": "Tech lead — surtout des questions",
++      "text": "Tech lead — surtout des questions Je ne donne (presque) jamais d'ordres « wdyt? » « do we have an ss",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 3,
++      "id": null,
++      "title": "Tech lead — parfois des ordres",
++      "text": "Tech lead — parfois des ordres Les ordres restent parfaits pour le mécanique « kill 8080! serve on 8",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 4,
++      "id": null,
++      "title": "QA lead — l'oracle",
++      "text": "QA lead — l'oracle Un projet est « vibable » quand quelque chose d'autre que moi sait dire c'est fau",
++      "fragments": 0
++    },
++    {
++      "h": 4,
++      "v": 5,
++      "id": null,
++      "title": "QA lead — l'oracle se contourne",
++      "text": "QA lead — l'oracle se contourne Mai 2025, pass « Claude ended up making hardcoded modifications spec",
++      "fragments": 0
++    },
++    {
++      "h": 5,
++      "v": null,
++      "id": null,
++      "title": "Tout code est du legacy",
++      "text": "Tout code est du legacy Working Effectively with Legacy Code Michael Feathers (legacy = du code sans",
++      "fragments": 0
++    },
++    {
++      "h": 6,
++      "v": 0,
++      "id": null,
++      "title": "Conclusion",
++      "text": "Conclusion Tech lead — possédez les structures, posez des questions QA lead — possédez l'oracle, sac",
++      "fragments": 0
++    },
++    {
++      "h": 7,
++      "v": null,
++      "id": null,
++      "title": null,
++      "text": "cafeine.dev/[...]/vibe-coding-vs-vibe-engineering.html Karpathy — vibe coding (2025-02-02) Simon Wil",
++      "fragments": 0
++    }
++  ],
++  "walk": {
++    "steps": 18,
++    "end": {
++      "h": 7,
++      "v": 0
++    }
++  }
++}
+-- 
+2.43.0
+
