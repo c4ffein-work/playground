@@ -1,0 +1,291 @@
+From 10d7663acdef086720dc060098940971d4fb8752 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 15:30:26 +0000
+Subject: [PATCH 5/5] Publish the checkout minus the workshop, then e2e the
+ live site
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GitHub Pages used to serve the whole branch, so src/, the tests, the notes
+and the tooling were all online. Now, on every push to master once
+`verify` passed (so the decks online are the ones `make check` proved
+built from src/):
+
+- `pages` removes src/, the Makefile, README, TODO, LICENSE and the
+  dotfiles from the checkout and deploys the rest with the Pages actions
+  (.git / .github are never uploaded). No staging directory, no list of
+  what the site is: the site is the root minus the workshop.
+  One-time setup on the repo: Settings → Pages → Source: GitHub Actions
+- `pages-check` runs the deck e2e tests against the site just deployed:
+  E2E_BASE=<page_url> makes decks.test.js skip its own server, count that
+  base as local, and first fetch every live deck and compare it to the
+  built slides/ file, retrying while the deploy propagates — so a green
+  run says the live decks are byte-for-byte the built ones AND load
+  without errors from the live URL. `E2E_BASE=… make test-live` locally.
+  The narration tests stay local only (they need the test-only routes)
+- the Chromium install / cache steps move to a composite action
+  (.github/actions/chromium) used by both jobs
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J3xZETYoDeigjFh8AAp1sy
+---
+ .github/actions/chromium/action.yml | 19 +++++++++
+ .github/workflows/verify.yml        | 64 ++++++++++++++++++++++-------
+ Makefile                            |  8 +++-
+ README.md                           | 13 ++++++
+ src/package.json                    |  1 +
+ src/tests/e2e/decks.test.js         | 36 ++++++++++++++--
+ 6 files changed, 121 insertions(+), 20 deletions(-)
+ create mode 100644 .github/actions/chromium/action.yml
+
+diff --git a/.github/actions/chromium/action.yml b/.github/actions/chromium/action.yml
+new file mode 100644
+index 0000000..77534c5
+--- /dev/null
++++ b/.github/actions/chromium/action.yml
+@@ -0,0 +1,19 @@
++name: chromium
++description: The Chromium the e2e tests run in, after `make install`. Playwright only runs browser builds matching its own version, so the download is cached by the version resolved in src/bun.lock; the apt packages it needs are reinstalled every run (hit = deps only, miss = download + deps).
++runs:
++  using: composite
++  steps:
++    - id: playwright
++      shell: bash
++      run: echo "version=$(cd src && bun -p 'require("playwright/package.json").version')" >> "$GITHUB_OUTPUT"
++    - uses: actions/cache@v4
++      id: browsers
++      with:
++        path: ~/.cache/ms-playwright
++        key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
++    - if: steps.browsers.outputs.cache-hit != 'true'
++      shell: bash
++      run: make browsers
++    - if: steps.browsers.outputs.cache-hit == 'true'
++      shell: bash
++      run: make browsers-deps
+diff --git a/.github/workflows/verify.yml b/.github/workflows/verify.yml
+index 3ebf2ab..e27f235 100644
+--- a/.github/workflows/verify.yml
++++ b/.github/workflows/verify.yml
+@@ -8,19 +8,53 @@ jobs:
+       - uses: actions/checkout@v4
+       - uses: oven-sh/setup-bun@v2
+       - run: make install
+-      # Playwright only runs browser builds matching its own version, so the
+-      # cache key carries the exact version resolved in src/bun.lock.
+-      - id: playwright
+-        run: echo "version=$(cd src && bun -p 'require("playwright/package.json").version')" >> "$GITHUB_OUTPUT"
+-      - uses: actions/cache@v4
+-        id: browsers
+-        with:
+-          path: ~/.cache/ms-playwright
+-          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+-      # The cache only holds the browser download; the apt packages it needs
+-      # are reinstalled every run (hit = deps only, miss = download + deps).
+-      - if: steps.browsers.outputs.cache-hit != 'true'
+-        run: make browsers
+-      - if: steps.browsers.outputs.cache-hit == 'true'
+-        run: make browsers-deps
++      - uses: ./.github/actions/chromium
+       - run: make verify
++
++  # GitHub Pages gets the checkout minus the workshop, from master, once
++  # verify passed (so the decks online are the ones `make check` proved built
++  # from src/). One-time setup on the repo: Settings → Pages → Build and
++  # deployment → Source: GitHub Actions.
++  pages:
++    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
++    needs: verify
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    permissions:
++      contents: read
++      pages: write
++      id-token: write
++    environment:
++      name: github-pages
++      url: ${{ steps.deploy.outputs.page_url }}
++    concurrency:
++      group: pages
++      cancel-in-progress: false
++    outputs:
++      page_url: ${{ steps.deploy.outputs.page_url }}
++    steps:
++      - uses: actions/checkout@v4
++      # upload-pages-artifact leaves out .git and .github by itself.
++      - run: rm -rf src Makefile README.md TODO.md LICENSE .gitignore .nojekyll
++      - uses: actions/configure-pages@v5
++      - uses: actions/upload-pages-artifact@v3
++        with:
++          path: .
++      - id: deploy
++        uses: actions/deploy-pages@v4
++
++  # The deck e2e tests once more, against the site just deployed: first every
++  # live deck must be byte-for-byte the built one, then each is opened from
++  # the live URL with the same checks as locally.
++  pages-check:
++    needs: pages
++    runs-on: ubuntu-latest
++    timeout-minutes: 20
++    steps:
++      - uses: actions/checkout@v4
++      - uses: oven-sh/setup-bun@v2
++      - run: make install
++      - uses: ./.github/actions/chromium
++      - run: make test-live
++        env:
++          E2E_BASE: ${{ needs.pages.outputs.page_url }}
+diff --git a/Makefile b/Makefile
+index 0af4116..9192f6e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ # Entry point. The tooling lives in src/ (build.js, package.json, tests/): every
+ # target is a bun one-liner run there (see src/package.json "scripts").
+-.PHONY: help install browsers browsers-deps build check test test-unit test-e2e test-update screenshots verify
++.PHONY: help install browsers browsers-deps build check test test-unit test-e2e test-update screenshots test-live verify
+ 
+ help:
+ 	@echo "  make install       - bun install (playwright, dev-only)"
+@@ -12,6 +12,7 @@ help:
+ 	@echo "  make test-update   - accept the e2e structure goldens (src/tests/e2e/golden/)"
+ 	@echo "  make screenshots   - e2e run that also dumps one PNG per slide (src/tests/e2e/screenshots/)"
+ 	@echo "  make verify        - what CI runs: check + test"
++	@echo "  make test-live     - the deck e2e tests against a deployed site: E2E_BASE=https://host/path/ make test-live"
+ 
+ install:
+ 	cd src && bun install --frozen-lockfile
+@@ -42,4 +43,9 @@ test-update:
+ screenshots:
+ 	cd src && bun run test:screenshots
+ 
++# E2E_BASE=https://c4ffein.github.io/presentations/ make test-live
++test-live:
++	@test -n "$(E2E_BASE)" || { echo "usage: E2E_BASE=https://host/path/ make test-live"; exit 2; }
++	cd src && E2E_BASE="$(E2E_BASE)" bun run test:live
++
+ verify: check test
+diff --git a/README.md b/README.md
+index 967df1b..7c6b706 100644
+--- a/README.md
++++ b/README.md
+@@ -66,6 +66,19 @@ opened in headless Chromium and compared to a structure golden, see
+ [src/tests/e2e/README.md](src/tests/e2e/README.md)). `make verify` is what
+ CI runs.
+ 
++## Publishing
++GitHub Pages gets the checkout minus the workshop: on every push to
++`master`, once `verify` passed, the `pages` job of
++[verify.yml](.github/workflows/verify.yml) removes `src/`, the Makefile,
++README, TODO, LICENSE and the dotfiles from the checkout and deploys the rest
++(`.git` / `.github` are never uploaded) — so what is online is exactly what
++`make check` proved built from `src/`. Then `pages-check` runs the deck e2e
++tests against the live site (`E2E_BASE=https://…/ make test-live`): it waits
++until every live deck is byte-for-byte the built `slides/` file, then opens
++each one from the live URL with the same checks as locally. One-time setup on
++the repo: Settings → Pages → Build and deployment → Source: **GitHub
++Actions**.
++
+ ## License
+ - [MIT](LICENSE) for my [slides](slides)
+ - Mainly [MIT](https://github.com/hakimel/reveal.js/blob/master/LICENSE) for [reveal.js](https://github.com/hakimel/reveal.js/) in [engine](engine)
+diff --git a/src/package.json b/src/package.json
+index 7d3ff35..5946216 100644
+--- a/src/package.json
++++ b/src/package.json
+@@ -8,6 +8,7 @@
+     "test:e2e": "bun test tests/e2e",
+     "test:update": "UPDATE_GOLDEN=1 bun test tests/e2e",
+     "test:screenshots": "SCREENSHOTS=1 bun test tests/e2e",
++    "test:live": "bun test tests/e2e/decks.test.js",
+     "browsers": "playwright install --with-deps chromium",
+     "browsers:deps": "playwright install-deps chromium"
+   },
+diff --git a/src/tests/e2e/decks.test.js b/src/tests/e2e/decks.test.js
+index 2d02f02..cea99e8 100644
+--- a/src/tests/e2e/decks.test.js
++++ b/src/tests/e2e/decks.test.js
+@@ -21,6 +21,13 @@
+ // tests/e2e/screenshots/<deck>/ (gitignored) — a review aid, never asserted.
+ // PW_CHROMIUM=/path/to/chrome runs a locally installed Chromium instead of
+ // the one Playwright downloads (`bunx playwright install chromium`).
++//
++// E2E_BASE=https://host/path/ runs the same checks against a DEPLOYED site
++// (the pages-check job, after every deploy) instead of a local server: no
++// Bun.serve, that base counts as local, and first every built deck is
++// fetched from it and compared to the local slides/ file — retried while
++// Pages propagates — so a green run also says the live decks are
++// byte-for-byte the built ones.
+ 
+ import { test, expect, beforeAll, afterAll } from "bun:test";
+ import { chromium } from "playwright";
+@@ -33,6 +40,8 @@ const SHOTS_DIR = path.join(import.meta.dir, "screenshots");
+ const UPDATE = !!process.env.UPDATE_GOLDEN;
+ const SCREENSHOTS = !!process.env.SCREENSHOTS;
+ const TIMEOUT_MS = 90_000;
++const LIVE = process.env.E2E_BASE ? process.env.E2E_BASE.replace(/\/?$/, "/") : null;
++const LIVE_WAIT_MS = 8 * 60_000;
+ 
+ const decks = readdirSync(path.join(ROOT, "slides"))
+   .filter((f) => f.endsWith(".html"))
+@@ -41,9 +50,9 @@ const decks = readdirSync(path.join(ROOT, "slides"))
+ let server, browser;
+ 
+ beforeAll(async () => {
+-  server = startServer();
++  if (LIVE) await waitLive(); else server = startServer();
+   browser = await chromium.launch({ executablePath: process.env.PW_CHROMIUM || undefined });
+-});
++}, LIVE_WAIT_MS + 30_000);
+ 
+ afterAll(async () => {
+   await browser?.close();
+@@ -52,6 +61,25 @@ afterAll(async () => {
+ 
+ const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+ 
++// Every live deck must be the built one, byte for byte; a fresh deploy can
++// take a little while to show, so keep asking (no cache-buster: what the
++// browser is about to load is what must have changed).
++async function waitLive() {
++  const t0 = Date.now();
++  for (const deck of decks) {
++    const url = LIVE + "slides/" + deck, want = readFileSync(path.join(ROOT, "slides", deck), "utf8");
++    for (let tries = 1; ; tries++) {
++      const r = await fetch(url, { cache: "no-store" }).catch(() => null);
++      const got = r && r.ok ? await r.text() : null;
++      if (got === want) break;
++      const why = !r ? "unreachable" : !r.ok ? "HTTP " + r.status : "not the built slides/" + deck;
++      if (Date.now() - t0 > LIVE_WAIT_MS) throw new Error(`${url}: ${why} after ${tries} tries`);
++      if (tries === 1) console.warn(`${url}: ${why}, waiting for the deploy to show`);
++      await new Promise((f) => setTimeout(f, 10_000));
++    }
++  }
++}
++
+ function structure() {
+   // Runs in the page. Reveal has processed data-markdown sections by now.
+   const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+@@ -95,7 +123,7 @@ for (const deck of decks) {
+   const name = deck.replace(/\.html$/, "");
+   test(name, async () => {
+     const problems = [];
+-    const base = `http://localhost:${server.port}/`;
++    const base = LIVE || `http://localhost:${server.port}/`;
+     const local = (url) => url.startsWith(base);
+     const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+     await page.route(() => true, (route) => local(route.request().url()) ? route.continue() : route.abort());
+@@ -107,7 +135,7 @@ for (const deck of decks) {
+     });
+     page.on("response", (r) => { if (r.status() >= 400) problems.push("HTTP " + r.status() + ": " + r.url()); });
+ 
+-    await page.goto(`http://localhost:${server.port}/slides/${deck}`, { waitUntil: "load" });
++    await page.goto(`${base}slides/${deck}`, { waitUntil: "load" });
+     await page.waitForFunction(() => window.Reveal && Reveal.isReady(), null, { timeout: 30_000 });
+ 
+     // Terminal recordings: mounted, no error line.
+-- 
+2.43.0
+
