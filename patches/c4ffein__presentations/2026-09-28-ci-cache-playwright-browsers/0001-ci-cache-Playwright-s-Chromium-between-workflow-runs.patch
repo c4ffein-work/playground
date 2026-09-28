@@ -1,0 +1,111 @@
+From 1a5dd1437c1399dfb2b148499223a3dfb5fb6d57 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 28 Sep 2026 07:49:47 +0000
+Subject: [PATCH] ci: cache Playwright's Chromium between workflow runs
+
+Every run of verify.yml re-downloaded Chromium through
+`make browsers` (playwright install --with-deps chromium), which was
+the slowest step and pure waste: the browser build only changes when
+the playwright package is bumped.
+
+Cache ~/.cache/ms-playwright with actions/cache@v4, keyed on the
+runner OS and the exact playwright version resolved by the lockfile
+(read from node_modules after `make install`, never hardcoded).
+Playwright refuses browser builds that do not match its own version,
+so a bump changes the key and forces a fresh download.
+
+The cache only holds the download; the apt packages Chromium needs are
+not cached and are reinstalled on every run. On a hit the workflow runs
+the new `make browsers-deps` (playwright install-deps chromium) instead
+of the full `make browsers`, which is kept unchanged for local use.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01J3xZETYoDeigjFh8AAp1sy
+---
+ .github/workflows/verify.yml | 16 +++++++++++++++-
+ Makefile                     | 22 +++++++++++++---------
+ package.json                 |  3 ++-
+ 3 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/.github/workflows/verify.yml b/.github/workflows/verify.yml
+index 4482569..e698a0a 100644
+--- a/.github/workflows/verify.yml
++++ b/.github/workflows/verify.yml
+@@ -8,5 +8,19 @@ jobs:
+       - uses: actions/checkout@v4
+       - uses: oven-sh/setup-bun@v2
+       - run: make install
+-      - run: make browsers
++      # Playwright only runs browser builds matching its own version, so the
++      # cache key carries the exact version resolved in bun.lock.
++      - id: playwright
++        run: echo "version=$(bun -p 'require("playwright/package.json").version')" >> "$GITHUB_OUTPUT"
++      - uses: actions/cache@v4
++        id: browsers
++        with:
++          path: ~/.cache/ms-playwright
++          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
++      # The cache only holds the browser download; the apt packages it needs
++      # are reinstalled every run (hit = deps only, miss = download + deps).
++      - if: steps.browsers.outputs.cache-hit != 'true'
++        run: make browsers
++      - if: steps.browsers.outputs.cache-hit == 'true'
++        run: make browsers-deps
+       - run: make verify
+diff --git a/Makefile b/Makefile
+index dc6be20..8c7a7f8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,15 +1,16 @@
+ # Entry point. Every target is a bun one-liner (see package.json "scripts").
+-.PHONY: help install browsers build check test test-unit test-e2e test-update screenshots verify
++.PHONY: help install browsers browsers-deps build check test test-unit test-e2e test-update screenshots verify
+ 
+ help:
+-	@echo "  make install     - bun install (playwright, dev-only)"
+-	@echo "  make browsers    - download the Chromium the e2e tests run in (once)"
+-	@echo "  make build       - assemble slides/ from src/ (src/presentations + src/slides)"
+-	@echo "  make check       - fail if slides/ is not exactly what src/ builds"
+-	@echo "  make test        - unit tests of the builder + e2e tests of every built deck"
+-	@echo "  make test-update - accept the e2e structure goldens (tests/e2e/golden/)"
+-	@echo "  make screenshots - e2e run that also dumps one PNG per slide (tests/e2e/screenshots/)"
+-	@echo "  make verify      - what CI runs: check + test"
++	@echo "  make install       - bun install (playwright, dev-only)"
++	@echo "  make browsers      - download the Chromium the e2e tests run in (once)"
++	@echo "  make browsers-deps - only the OS packages Chromium needs (CI, when the download is cached)"
++	@echo "  make build         - assemble slides/ from src/ (src/presentations + src/slides)"
++	@echo "  make check         - fail if slides/ is not exactly what src/ builds"
++	@echo "  make test          - unit tests of the builder + e2e tests of every built deck"
++	@echo "  make test-update   - accept the e2e structure goldens (tests/e2e/golden/)"
++	@echo "  make screenshots   - e2e run that also dumps one PNG per slide (tests/e2e/screenshots/)"
++	@echo "  make verify        - what CI runs: check + test"
+ 
+ install:
+ 	bun install --frozen-lockfile
+@@ -17,6 +18,9 @@ install:
+ browsers:
+ 	bun run browsers
+ 
++browsers-deps:
++	bun run browsers:deps
++
+ build:
+ 	bun run build
+ 
+diff --git a/package.json b/package.json
+index f59c44e..7d3ff35 100644
+--- a/package.json
++++ b/package.json
+@@ -8,7 +8,8 @@
+     "test:e2e": "bun test tests/e2e",
+     "test:update": "UPDATE_GOLDEN=1 bun test tests/e2e",
+     "test:screenshots": "SCREENSHOTS=1 bun test tests/e2e",
+-    "browsers": "playwright install --with-deps chromium"
++    "browsers": "playwright install --with-deps chromium",
++    "browsers:deps": "playwright install-deps chromium"
+   },
+   "devDependencies": {
+     "playwright": "^1.63.0"
+-- 
+2.43.0
+
