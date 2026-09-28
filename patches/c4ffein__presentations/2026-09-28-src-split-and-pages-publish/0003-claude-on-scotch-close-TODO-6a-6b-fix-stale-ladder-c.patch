@@ -1,7 +1,8 @@
-From 10e4195bc416b5e11bacf182271dd4c5db30c919 Mon Sep 17 00:00:00 2001
+From ca746353d8ba28eceed41b8ff5e29f08d511327f Mon Sep 17 00:00:00 2001
 From: c4ffein <c4ffein.work@gmail.com>
 Date: Mon, 28 Sep 2026 07:52:38 +0000
-Subject: [PATCH] claude-on-scotch: close TODO 6a/6b, fix stale ladder comments
+Subject: [PATCH 3/5] claude-on-scotch: close TODO 6a/6b, fix stale ladder
+ comments
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

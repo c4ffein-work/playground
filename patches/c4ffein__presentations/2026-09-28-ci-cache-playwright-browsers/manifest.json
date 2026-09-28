@@ -1,9 +1,0 @@
-{
-  "repo": "c4ffein/presentations",
-  "remote": "https://github.com/c4ffein/presentations",
-  "base_branch": "master",
-  "base_sha": "b14cf44df815dbd7562e53c3f488a3540cf1676c",
-  "created": "2026-09-28",
-  "patches": 1,
-  "title": "ci: cache Playwright's Chromium between workflow runs"
-}

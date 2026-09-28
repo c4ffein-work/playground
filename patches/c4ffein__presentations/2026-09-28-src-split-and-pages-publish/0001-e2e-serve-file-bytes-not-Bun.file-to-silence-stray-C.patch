@@ -1,7 +1,7 @@
-From 06180262380f9daf452b578f2946bf1b079dc944 Mon Sep 17 00:00:00 2001
+From f4f3bd5849da799ba33554ba526cd6651470bf28 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 28 Sep 2026 08:41:29 +0000
-Subject: [PATCH] e2e: serve file bytes, not Bun.file, to silence stray
+Subject: [PATCH 1/5] e2e: serve file bytes, not Bun.file, to silence stray
  CONNRESET
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

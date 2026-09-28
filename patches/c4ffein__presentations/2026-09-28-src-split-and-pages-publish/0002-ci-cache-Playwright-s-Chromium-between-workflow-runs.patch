@@ -1,7 +1,7 @@
-From 1a5dd1437c1399dfb2b148499223a3dfb5fb6d57 Mon Sep 17 00:00:00 2001
+From 5970e40e5c4c3fb4e6135d6761cf5052edb8b263 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 28 Sep 2026 07:49:47 +0000
-Subject: [PATCH] ci: cache Playwright's Chromium between workflow runs
+Subject: [PATCH 2/5] ci: cache Playwright's Chromium between workflow runs
 
 Every run of verify.yml re-downloaded Chromium through
 `make browsers` (playwright install --with-deps chromium), which was
