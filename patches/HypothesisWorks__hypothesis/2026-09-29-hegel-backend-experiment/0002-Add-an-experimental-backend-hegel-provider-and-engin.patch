@@ -1,4 +1,4 @@
-From d9cd44e9b7f3c0f96dd457d5afa8ac903afb3490 Mon Sep 17 00:00:00 2001
+From 7bcbed552b8b3a373c531f27c5d3843812924018 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 29 Sep 2026 16:27:26 +0000
 Subject: [PATCH 2/2] Add an experimental backend="hegel" provider and
@@ -33,10 +33,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
  hypothesis/RELEASE.rst                        |   9 +
- .../internal/conjecture/hegel_provider.py     | 400 ++++++++++++++++++
+ .../internal/conjecture/hegel_provider.py     | 419 ++++++++++++++++++
  .../internal/conjecture/providers.py          |   2 +
  .../tests/conjecture/test_hegel_provider.py   | 184 ++++++++
- 4 files changed, 595 insertions(+)
+ 4 files changed, 614 insertions(+)
  create mode 100644 hypothesis/RELEASE.rst
  create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
  create mode 100644 hypothesis/tests/conjecture/test_hegel_provider.py
@@ -58,10 +58,10 @@ index 00000000..ed0fbdb9
 +release.
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
 new file mode 100644
-index 00000000..20b23350
+index 00000000..c0ab3c7b
 --- /dev/null
 +++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
-@@ -0,0 +1,400 @@
+@@ -0,0 +1,419 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -167,6 +167,8 @@ index 00000000..20b23350
 +        self._run: Any = None
 +        self._tc: Any = None
 +        self._span_depth = 0
++        self._drew = False
++        self._in_context = False
 +        self._generators: dict[tuple[IntervalSet, int, int], Any] = {}
 +        self.runs_started = 0
 +        # Constant injection (HypothesisProvider._maybe_draw_constant) is a
@@ -198,6 +200,7 @@ index 00000000..20b23350
 +    def _complete(self, status: int, origin: str | None = None) -> None:
 +        tc, self._tc = self._tc, None
 +        self._span_depth = 0
++        self._drew = False
 +        if tc is not None and not tc.complete:
 +            tc.mark_complete(status, origin)
 +
@@ -205,6 +208,7 @@ index 00000000..20b23350
 +    def per_test_case_context_manager(self) -> Iterator[None]:
 +        self._complete(_hegel.STATUS_VALID)
 +        self._test_case()
++        self._in_context = True
 +        try:
 +            yield
 +        except HegelOverrun:
@@ -229,6 +233,8 @@ index 00000000..20b23350
 +            raise
 +        else:
 +            self._complete(_hegel.STATUS_VALID)
++        finally:
++            self._in_context = False
 +
 +    @cached_property
 +    def _local_constants(self) -> Any:
@@ -242,6 +248,7 @@ index 00000000..20b23350
 +        return HypothesisProvider._maybe_draw_constant(self, choice_type, constraints, **kw)  # type: ignore
 +
 +    def _draw(self, f: Callable[[Any], T]) -> T:
++        self._drew = True
 +        try:
 +            return f(self._test_case())
 +        except _hegel.StopTestError:
@@ -429,14 +436,26 @@ index 00000000..20b23350
 +    # -- spans -------------------------------------------------------------
 +
 +    def span_start(self, label: int, /) -> None:
-+        if self._tc is not None:
-+            self._span_depth += 1
-+            self._draw(lambda tc: tc.start_span(label & LABEL_MASK))
++        if self._span_depth == 0 and self._drew and not self._in_context:
++            # Outside per_test_case_context_manager (a ConjectureRunner used
++            # directly, as in tests/quality) a top-level span opening after
++            # draws means the runner moved on to its next test case. Its
++            # outcome is unknown here. Inside the context manager every
++            # @given argument is its own top-level span, so this must not
++            # apply there.
++            self._complete(_hegel.STATUS_VALID)
++        if self._tc is None:
++            # A case opens at its first draw. Forwarding a span before that
++            # would give libhegel a choice-less case, which it (correctly)
++            # takes as an exhausted search space and ends the run on.
++            return
++        self._span_depth += 1
++        self._draw(lambda tc: tc.start_span(label & LABEL_MASK))
 +
 +    def span_end(self, discard: bool, /) -> None:
 +        # Closing a discarded span can spend choice budget too (libhegel
 +        # retries from before the span), so it gets the same error mapping.
-+        if self._tc is not None and self._span_depth > 0:
++        if self._span_depth > 0:
 +            self._span_depth -= 1
 +            self._draw(lambda tc: tc.stop_span(discard))
 +
