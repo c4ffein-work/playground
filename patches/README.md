@@ -27,9 +27,9 @@ target has drifted since.
 ## Generating a series (session side)
 
 ```sh
-git clone https://github.com/<owner>/<repo> /path/to/clone
+git clone https://github.com/<owner>/<repo> clones/<repo>   # clones/ is gitignored
 # ...make changes, commit with good messages...
-scripts/new-patch.sh /path/to/clone <slug>
+scripts/new-patch.sh clones/<repo> <slug>
 git add patches/ && git commit && git push
 ```
 
