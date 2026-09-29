@@ -40,8 +40,8 @@ which needs cargo and crates.io) and use `settings(backend="hegel")` or
 | Replay semantics: a Hypothesis choice sequence encoded as a libhegel reproduce blob (base64 of `0x00` + `serialize_choices`) replays through libhegel value for value for the same draw calls (3000 sequences, ~19.6k draws over integers, booleans, floats, bytes, single-range strings) | passes |
 | NaN, -0.0, inf round-trip through a blob | passes |
 | Pipeline: `minimal()` reaches the same minimal example as the Python engine for lists, integers, text, floats, bytes | passes |
-| Hypothesis `tests/cover` (about 4000 tests) with `HYPOTHESIS_PROFILE=hegel` | 3969 passed, 15 failed (was 22 before the fixes below) |
-| Hypothesis `tests/quality` under the hegel backend | see the section at the end |
+| Hypothesis `tests/cover` (about 4000 tests) with `HYPOTHESIS_PROFILE=hegel` | 3971 passed, 13 failed (was 22 before the fixes below) |
+| Hypothesis `tests/quality` under the hegel backend | 254 passed, 15 failed; see the section at the end |
 
 The replay result is the one that matters for the migration: the two
 engines agree on what a choice sequence means, so databases and
@@ -77,6 +77,15 @@ Vocabulary differences, all mapped in the provider and documented on it:
 - PyO3 `unsendable` wrappers break under Hypothesis's threading tests,
   which drop providers from other threads; the wrappers are `Send + Sync`
   on the strength of libhegel's internal locking plus the GIL.
+- A provider with `test_function` lifetime only learns about test-case
+  boundaries from `per_test_case_context_manager`, which `core.py` calls
+  but a directly driven `ConjectureRunner` (all of `tests/quality`) never
+  does. Without a boundary every Hypothesis test case kept drawing from one
+  never-completed libhegel case, and the whole quality suite failed. The
+  provider now takes the first top-level span after draws as the next case
+  when it is outside the context manager. Related: a choice-less completed
+  case makes libhegel end the run as an exhausted search space, so spans
+  are only forwarded once a case has drawn.
 
 Distribution differences (generation only, 2000 examples each, derandomized;
 these are libhegel's choices, not mapping artefacts, except the unbounded
@@ -108,7 +117,7 @@ Python call, plus the PyO3 hop. The performance case for the migration only
 exists at the runner level, where the engine loop, the choice tree and the
 shrinker leave Python.
 
-## The 15 remaining `tests/cover` failures, by cause
+## The 13 remaining `tests/cover` failures, by cause
 
 - **Search-space exhaustion is an engine feature the draw level cannot
   see** (5): `test_notes_exhausted_search_space_in_unsatisfiable_error`,
@@ -130,11 +139,12 @@ shrinker leave Python.
   StopTest into a `FlakyBackendFailure`. crosshair carries the same marks.
 - **By design** (1): `test_find_uses_provided_random` (the provided Random
   is not the source of libhegel's entropy; also xfail on crosshair).
-- **Distribution / discovery** (3): `test_triangular_modes` (needs both
-  sides of 0.5 from `randoms()`), `test_fullmatch_generates_example[[ab]*]`
-  and `test_generates_unix_rollover_adjacent_times` (found sometimes, not
-  every run). All are "did 100 examples hit X", and libhegel's bias towards
-  simplest values makes that flaky.
+- **Distribution / discovery** (1): `test_triangular_modes` (needs both
+  sides of 0.5 from `randoms()` within one run). Two similar tests
+  (`test_fullmatch_generates_example[[ab]*]`,
+  `test_generates_unix_rollover_adjacent_times`) failed on one of three
+  runs: "did 100 examples hit X" is flaky under libhegel's bias towards
+  simplest values.
 
 Nothing in the remaining list is a wrong value or a crash.
 
@@ -162,4 +172,22 @@ Nothing in the remaining list is a wrong value or a crash.
 
 ## tests/quality under the hegel backend
 
-(filled in below once the run finished)
+Run per file with `HYPOTHESIS_PROFILE=hegel` (254 passed, 15 failed):
+
+| file | result | what fails |
+|---|---|---|
+| test_discovery_ability | 84 passed, 6 failed | the four `large_factorial` variants (integers beyond 20! from `integers()`: the 2**128 clamp meets libhegel's bounded-range distribution, which is not the Python engine's size-bucketed unbounded draw), `test_can_produce_below_large_factorial_negative`, and `test_long_duplicates_strings` (duplicated substrings come from the Python engine's mutation of earlier examples, which alternative backends never get) |
+| test_shrink_quality | 87 passed, 3 failed | `test_lowering_together_{positive,negative,mixed}`: `mixed` never finds `x[0] + gap == x[1]` in 500 examples; the other two find it but the shrinker, starting from libhegel-shaped choices, stops at a non-minimal pair. The starting example's shape affects Hypothesis's shrink outcome |
+| test_targeting_quality | 6 failed | `target()` reaches ~12k where 50k is required: targeting mutates recorded choices and replays them through the Python provider, but every fresh example still comes from libhegel, so the hill climb keeps restarting from libhegel's distribution rather than Hypothesis's |
+| test_poisoned_lists, test_poisoned_trees, test_float_shrinking, test_widening_shrinks, test_zig_zagging, test_integers, test_deferred_strategies | all 80 passed | shrinking is Hypothesis's own; generation only has to reach a poisoned example |
+
+Before the boundary fix above, discovery failed 66 of 90 and both poisoned
+files failed or timed out, all from one integration bug rather than the
+engine, which is a good argument for keeping these suites as the
+acceptance test of any engine swap.
+
+Reading: the quality suite is dominated by "can the generator find X", and
+the remaining failures are all distribution or mutation (targeting,
+duplication) features of the Python engine that a draw-level backend cannot
+reach. A runner-level integration would give libhegel's own targeting and
+mutation a fair run at these.
