@@ -30,7 +30,7 @@ target has drifted since.
 git clone https://github.com/<owner>/<repo> clones/<repo>   # clones/ is gitignored
 # ...make changes, commit with good messages...
 scripts/new-patch.sh clones/<repo> <slug>
-git add patches/ && git commit && git push
+git add patches/ && git commit && git push origin main   # on main, always: see AGENTS.md
 ```
 
 An optional third argument overrides the base ref (default: origin's default

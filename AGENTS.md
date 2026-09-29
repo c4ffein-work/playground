@@ -23,7 +23,10 @@ push to. When asked to make a change to another repo, follow the convention in
    messages survive into the final commits via `git am`.
 3. Run `scripts/new-patch.sh clones/<repo> <slug>` to export the series into
    `patches/`.
-4. Commit the new `patches/` directory here and push.
+4. Commit the new `patches/` directory here and push — **on `main`, directly**,
+   even when the session was given a feature branch: this repo is a drop-box,
+   a series on a side branch is invisible to the next session and to the
+   person applying it. History here is disposable (force-push to clean up).
 
 Rules:
 - **Public target repos only.** Never commit a diff cut against a private
