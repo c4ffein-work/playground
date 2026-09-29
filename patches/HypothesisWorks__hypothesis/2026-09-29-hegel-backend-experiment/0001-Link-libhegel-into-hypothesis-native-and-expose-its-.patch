@@ -1,0 +1,1137 @@
+From 45df447f62422c2f2c1a3370aa10eea0582b3cd8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 29 Sep 2026 16:27:26 +0000
+Subject: [PATCH 1/2] Link libhegel into hypothesis-native and expose its C ABI
+ to Python
+
+libhegel is the native Rust engine behind the Hegel property-based testing
+libraries: generation, shrinking, the example database and the run loop,
+behind a C ABI (the hegel_* extern "C" functions of the hegeltest-c crate).
+This links that crate statically into hypothesis-native and adds a thin
+PyO3 surface over the parts needed to drive a run from Python: contexts and
+settings (Engine), the run loop (Run / next_test_case), the typed draw
+primitives, spans and collection sizing on a test case, completion, run
+results with reproduce blobs, and replaying a blob as a standalone test
+case. It is an experiment towards sharing one engine, not public API.
+
+The wrappers are Send + Sync: libhegel locks its handles internally and the
+GIL serialises every call, and Hypothesis's test suite drops providers from
+threads other than the one that created them.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ hypothesis/rust/Cargo.lock            | 238 ++++++++-
+ hypothesis/rust/Cargo.toml            |   4 +
+ hypothesis/rust/src/internal/hegel.rs | 722 ++++++++++++++++++++++++++
+ hypothesis/rust/src/internal/mod.rs   |   3 +
+ 4 files changed, 961 insertions(+), 6 deletions(-)
+ create mode 100644 hypothesis/rust/src/internal/hegel.rs
+
+diff --git a/hypothesis/rust/Cargo.lock b/hypothesis/rust/Cargo.lock
+index 79dd3ac4..8bce4bef 100644
+--- a/hypothesis/rust/Cargo.lock
++++ b/hypothesis/rust/Cargo.lock
+@@ -2,6 +2,18 @@
+ # It is not intended for manual editing.
+ version = 4
+ 
++[[package]]
++name = "adler2"
++version = "2.0.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
++
++[[package]]
++name = "bitflags"
++version = "2.13.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
++
+ [[package]]
+ name = "cfg-if"
+ version = "1.0.4"
+@@ -14,6 +26,37 @@ version = "0.2.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+ 
++[[package]]
++name = "dashu-base"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "861a614e79388a4c72aa66b0bdabc91e3a4f30d53e0c8d962953e207d75884d0"
++dependencies = [
++ "num-modular",
++]
++
++[[package]]
++name = "dashu-int"
++version = "0.6.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "24f558ce3d00852b4959e5fee8d317aa37e7f469c35abc9d4eeb81fcc0177485"
++dependencies = [
++ "cfg-if",
++ "dashu-base",
++ "num-modular",
++ "static_assertions",
++]
++
++[[package]]
++name = "errno"
++version = "0.3.14"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
++dependencies = [
++ "libc",
++ "windows-sys",
++]
++
+ [[package]]
+ name = "getrandom"
+ version = "0.3.4"
+@@ -37,19 +80,44 @@ dependencies = [
+  "zerocopy",
+ ]
+ 
++[[package]]
++name = "hashbrown"
++version = "0.17.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
++
+ [[package]]
+ name = "heck"
+ version = "0.5.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+ 
++[[package]]
++name = "hegeltest-c"
++version = "0.44.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3c50379a7e74866dddc1dac3e8efc51f5360c66ed32bc7294c8891193ffdb5e1"
++dependencies = [
++ "dashu-int",
++ "hashbrown",
++ "libm",
++ "miniz_oxide",
++ "once_cell",
++ "rand 0.10.3",
++ "rustc-hash",
++ "rustix",
++ "toml",
++ "windows-sys",
++]
++
+ [[package]]
+ name = "hypothesis-native"
+ version = "6.168.3"
+ dependencies = [
+  "half",
++ "hegeltest-c",
+  "pyo3",
+- "rand",
++ "rand 0.9.4",
+ ]
+ 
+ [[package]]
+@@ -58,6 +126,33 @@ version = "0.2.186"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+ 
++[[package]]
++name = "libm"
++version = "0.2.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
++
++[[package]]
++name = "linux-raw-sys"
++version = "0.12.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
++
++[[package]]
++name = "miniz_oxide"
++version = "0.8.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
++dependencies = [
++ "adler2",
++]
++
++[[package]]
++name = "num-modular"
++version = "0.6.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bd8e500409e6cd603b03e477c26a6caecdc27ac58979a53e881c75eafc079f44"
++
+ [[package]]
+ name = "once_cell"
+ version = "1.21.4"
+@@ -130,7 +225,7 @@ dependencies = [
+  "proc-macro2",
+  "pyo3-macros-backend",
+  "quote",
+- "syn",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -142,7 +237,7 @@ dependencies = [
+  "heck",
+  "proc-macro2",
+  "quote",
+- "syn",
++ "syn 2.0.118",
+ ]
+ 
+ [[package]]
+@@ -167,7 +262,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
+ dependencies = [
+  "rand_chacha",
+- "rand_core",
++ "rand_core 0.9.5",
++]
++
++[[package]]
++name = "rand"
++version = "0.10.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
++dependencies = [
++ "rand_core 0.10.1",
+ ]
+ 
+ [[package]]
+@@ -177,7 +281,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
+ dependencies = [
+  "ppv-lite86",
+- "rand_core",
++ "rand_core 0.9.5",
+ ]
+ 
+ [[package]]
+@@ -189,6 +293,66 @@ dependencies = [
+  "getrandom",
+ ]
+ 
++[[package]]
++name = "rand_core"
++version = "0.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
++
++[[package]]
++name = "rustc-hash"
++version = "2.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
++
++[[package]]
++name = "rustix"
++version = "1.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
++dependencies = [
++ "bitflags",
++ "errno",
++ "libc",
++ "linux-raw-sys",
++ "windows-sys",
++]
++
++[[package]]
++name = "serde_core"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
++dependencies = [
++ "serde_derive",
++]
++
++[[package]]
++name = "serde_derive"
++version = "1.0.229"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.6",
++]
++
++[[package]]
++name = "serde_spanned"
++version = "1.1.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "static_assertions"
++version = "1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
++
+ [[package]]
+ name = "syn"
+ version = "2.0.118"
+@@ -200,12 +364,53 @@ dependencies = [
+  "unicode-ident",
+ ]
+ 
++[[package]]
++name = "syn"
++version = "3.0.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "unicode-ident",
++]
++
+ [[package]]
+ name = "target-lexicon"
+ version = "0.13.5"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+ 
++[[package]]
++name = "toml"
++version = "1.1.6+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
++dependencies = [
++ "serde_spanned",
++ "toml_datetime",
++ "toml_parser",
++ "winnow",
++]
++
++[[package]]
++name = "toml_datetime"
++version = "1.1.1+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
++dependencies = [
++ "serde_core",
++]
++
++[[package]]
++name = "toml_parser"
++version = "1.1.3+spec-1.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
++dependencies = [
++ "winnow",
++]
++
+ [[package]]
+ name = "unicode-ident"
+ version = "1.0.24"
+@@ -221,6 +426,27 @@ dependencies = [
+  "wit-bindgen",
+ ]
+ 
++[[package]]
++name = "windows-link"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
++
++[[package]]
++name = "windows-sys"
++version = "0.61.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
++dependencies = [
++ "windows-link",
++]
++
++[[package]]
++name = "winnow"
++version = "1.0.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
++
+ [[package]]
+ name = "wit-bindgen"
+ version = "0.57.1"
+@@ -244,5 +470,5 @@ checksum = "4714fd92cf900833d49538023a9b3915155210801d1c1169eba513b2addefd71"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+- "syn",
++ "syn 2.0.118",
+ ]
+diff --git a/hypothesis/rust/Cargo.toml b/hypothesis/rust/Cargo.toml
+index f67c9db4..255537ad 100644
+--- a/hypothesis/rust/Cargo.toml
++++ b/hypothesis/rust/Cargo.toml
+@@ -10,6 +10,10 @@ crate-type = ["cdylib"]
+ 
+ [dependencies]
+ pyo3 = "0.29.2"
++# EXPERIMENT: libhegel, Hegel's native property-based testing engine, linked
++# statically and driven through its C ABI (the hegel_* extern "C" functions)
++# from src/internal/hegel.rs.
++hegeltest-c = { version = "=0.44.1", default-features = false, features = ["std"] }
+ 
+ [features]
+ abi3 = ["pyo3/abi3-py310"]
+diff --git a/hypothesis/rust/src/internal/hegel.rs b/hypothesis/rust/src/internal/hegel.rs
+new file mode 100644
+index 00000000..16f67c58
+--- /dev/null
++++ b/hypothesis/rust/src/internal/hegel.rs
+@@ -0,0 +1,722 @@
++// This file is part of Hypothesis, which may be found at
++// https://github.com/HypothesisWorks/hypothesis/
++//
++// Copyright the Hypothesis Authors.
++// Individual contributors are listed in AUTHORS.rst and the git log.
++//
++// This Source Code Form is subject to the terms of the Mozilla Public License,
++// v. 2.0. If a copy of the MPL was not distributed with this file, You can
++// obtain one at https://mozilla.org/MPL/2.0/.
++
++//! A thin, safe-ish Python surface over libhegel's C ABI (the `hegel_*`
++//! functions of the `hegeltest-c` crate, linked statically into this
++//! extension). This is an EXPERIMENT: enough of the ABI to drive libhegel's
++//! generation phase as a Hypothesis backend (`settings(backend="hegel")`)
++//! and to replay reproduce blobs for engine-equivalence tests. Nothing here
++//! is public API.
++//!
++//! Every object wraps raw libhegel handles. libhegel guards each handle with
++//! its own locks (a call racing another on the same handle waits or returns
++//! `HEGEL_E_CONCURRENT_USE`), and the GIL serialises everything this module
++//! does, so the wrappers are marked `Send + Sync`: a Python thread other than
++//! the creating one may use or drop them (Hypothesis's test suite does both).
++
++use std::ffi::{c_char, CStr, CString};
++
++use hegel_c as sys;
++use pyo3::exceptions::PyRuntimeError;
++use pyo3::prelude::*;
++use pyo3::types::{PyBytes, PyString};
++
++pyo3::create_exception!(hegel, HegelError, PyRuntimeError);
++// libhegel ran out of choice budget for this test case (`HEGEL_E_STOP_TEST`).
++pyo3::create_exception!(hegel, StopTestError, HegelError);
++// A draw rejected itself (`HEGEL_E_ASSUME`); the test case should be discarded.
++pyo3::create_exception!(hegel, AssumeError, HegelError);
++
++/// Owns a libhegel context plus one settings handle. Runs, test cases and
++/// string generators keep a reference to their `Engine` so its context
++/// outlives every handle created from it.
++#[pyclass(module = "hypothesis._native.internal.hegel")]
++pub(crate) struct Engine {
++    ctx: *mut sys::HegelContext,
++    settings: *mut sys::HegelSettings,
++}
++
++// SAFETY: see the module docs. libhegel handles are internally locked and
++// every use goes through the GIL.
++unsafe impl Send for Engine {}
++unsafe impl Sync for Engine {}
++unsafe impl Send for Run {}
++unsafe impl Sync for Run {}
++unsafe impl Send for TestCase {}
++unsafe impl Sync for TestCase {}
++unsafe impl Send for StringGenerator {}
++unsafe impl Sync for StringGenerator {}
++unsafe impl Send for Collection {}
++unsafe impl Sync for Collection {}
++
++#[pyclass(module = "hypothesis._native.internal.hegel")]
++pub(crate) struct Run {
++    engine: Py<Engine>,
++    run: *mut sys::HegelRun,
++}
++
++#[pyclass(module = "hypothesis._native.internal.hegel")]
++pub(crate) struct TestCase {
++    engine: Py<Engine>,
++    tc: *mut sys::HegelTestCase,
++    complete: bool,
++}
++
++#[pyclass(module = "hypothesis._native.internal.hegel")]
++pub(crate) struct StringGenerator {
++    engine: Py<Engine>,
++    gen: *mut sys::HegelStringGenerator,
++}
++
++#[pyclass(module = "hypothesis._native.internal.hegel")]
++pub(crate) struct Collection {
++    engine: Py<Engine>,
++    tc: Py<TestCase>,
++    collection: *mut sys::HegelCollection,
++}
++
++/// One distinct failure of a finished run: its origin string and reproduce
++/// blob (None when libhegel produced none).
++#[pyclass(module = "hypothesis._native.internal.hegel", get_all)]
++pub(crate) struct Failure {
++    origin: String,
++    blob: Option<String>,
++}
++
++/// The result of a finished run.
++#[pyclass(module = "hypothesis._native.internal.hegel", get_all)]
++pub(crate) struct RunResult {
++    /// 0 passed, 1 failed, 2 error (`hegel_run_status_t`).
++    status: u32,
++    error: Option<String>,
++    failures: Vec<Py<Failure>>,
++}
++
++pub(crate) const STATUS_VALID: u32 = sys::hegel_status_t::HEGEL_STATUS_VALID as u32;
++pub(crate) const STATUS_INVALID: u32 = sys::hegel_status_t::HEGEL_STATUS_INVALID as u32;
++pub(crate) const STATUS_OVERRUN: u32 = sys::hegel_status_t::HEGEL_STATUS_OVERRUN as u32;
++pub(crate) const STATUS_INTERESTING: u32 = sys::hegel_status_t::HEGEL_STATUS_INTERESTING as u32;
++
++pub(crate) const PHASE_EXPLICIT: u32 = sys::hegel_phase_t::HEGEL_PHASE_EXPLICIT as u32;
++pub(crate) const PHASE_REUSE: u32 = sys::hegel_phase_t::HEGEL_PHASE_REUSE as u32;
++pub(crate) const PHASE_GENERATE: u32 = sys::hegel_phase_t::HEGEL_PHASE_GENERATE as u32;
++pub(crate) const PHASE_TARGET: u32 = sys::hegel_phase_t::HEGEL_PHASE_TARGET as u32;
++pub(crate) const PHASE_SHRINK: u32 = sys::hegel_phase_t::HEGEL_PHASE_SHRINK as u32;
++
++const ALL_HEALTH_CHECKS: u32 = sys::hegel_health_check_t::HEGEL_HC_FILTER_TOO_MUCH as u32
++    | sys::hegel_health_check_t::HEGEL_HC_TOO_SLOW as u32
++    | sys::hegel_health_check_t::HEGEL_HC_TEST_CASES_TOO_LARGE as u32
++    | sys::hegel_health_check_t::HEGEL_HC_LARGE_INITIAL_TEST_CASE as u32;
++
++/// Turn a `hegel_result_t` into a Python exception, reading the context's
++/// last error message for the detail.
++fn check(ctx: *mut sys::HegelContext, r: sys::hegel_result_t, what: &str) -> PyResult<()> {
++    use sys::hegel_result_t as R;
++    if r == R::HEGEL_OK {
++        return Ok(());
++    }
++    // SAFETY: ctx is a live context owned by an Engine; the message pointer
++    // is valid until the next call on the context, and we copy it here.
++    let msg = unsafe {
++        let p = sys::hegel_context_last_error(ctx);
++        if p.is_null() {
++            String::new()
++        } else {
++            CStr::from_ptr(p).to_string_lossy().into_owned()
++        }
++    };
++    let text = format!("{what}: {r:?} {msg}");
++    Err(match r {
++        R::HEGEL_E_STOP_TEST => StopTestError::new_err(text),
++        R::HEGEL_E_ASSUME => AssumeError::new_err(text),
++        _ => HegelError::new_err(text),
++    })
++}
++
++fn cstr_opt(p: *const c_char) -> Option<String> {
++    if p.is_null() {
++        None
++    } else {
++        // SAFETY: libhegel hands out NUL-terminated strings valid until the
++        // owning handle is freed; we copy immediately.
++        Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
++    }
++}
++
++#[pymethods]
++impl Engine {
++    /// `max_examples` bounds libhegel's generate phase (`test_cases`).
++    /// `phases` is a bitwise OR of the `PHASE_*` constants. Health checks
++    /// are always suppressed and the example database always disabled:
++    /// Hypothesis owns both.
++    #[new]
++    #[pyo3(signature = (max_examples, *, seed=None, phases=PHASE_GENERATE, unbounded_choices=false))]
++    fn new(
++        max_examples: u64,
++        seed: Option<u64>,
++        phases: u32,
++        unbounded_choices: bool,
++    ) -> PyResult<Self> {
++        // SAFETY: plain constructor calls; every handle is checked below and
++        // freed in Drop.
++        unsafe {
++            let ctx = sys::hegel_context_new();
++            if ctx.is_null() {
++                return Err(HegelError::new_err("hegel_context_new returned NULL"));
++            }
++            let mut settings: *mut sys::HegelSettings = std::ptr::null_mut();
++            if let Err(e) = check(
++                ctx,
++                sys::hegel_settings_new(ctx, &mut settings),
++                "settings_new",
++            ) {
++                let _ = sys::hegel_context_free(ctx);
++                return Err(e);
++            }
++            let engine = Engine { ctx, settings };
++            check(
++                ctx,
++                sys::hegel_settings_set_test_cases(ctx, settings, max_examples),
++                "set_test_cases",
++            )?;
++            check(
++                ctx,
++                sys::hegel_settings_set_phases(ctx, settings, phases),
++                "set_phases",
++            )?;
++            check(
++                ctx,
++                sys::hegel_settings_set_suppress_health_check(ctx, settings, ALL_HEALTH_CHECKS),
++                "set_suppress_health_check",
++            )?;
++            check(
++                ctx,
++                sys::hegel_settings_set_report_multiple_failures(ctx, settings, false),
++                "set_rmf",
++            )?;
++            check(
++                ctx,
++                sys::hegel_settings_set_unbounded_choices(ctx, settings, unbounded_choices),
++                "set_unbounded_choices",
++            )?;
++            let disabled = CString::new("disabled").unwrap();
++            check(
++                ctx,
++                sys::hegel_settings_set_database(ctx, settings, disabled.as_ptr()),
++                "set_database",
++            )?;
++            check(
++                ctx,
++                sys::hegel_settings_set_seed(ctx, settings, seed.unwrap_or(0), seed.is_some()),
++                "set_seed",
++            )?;
++            Ok(engine)
++        }
++    }
++
++    /// libhegel's own version string.
++    #[staticmethod]
++    fn version() -> PyResult<String> {
++        // SAFETY: hegel_version accepts a NULL context and returns a static string.
++        unsafe {
++            let mut p: *const c_char = std::ptr::null();
++            let r = sys::hegel_version(std::ptr::null_mut(), &mut p);
++            if r != sys::hegel_result_t::HEGEL_OK {
++                return Err(HegelError::new_err(format!("hegel_version: {r:?}")));
++            }
++            Ok(cstr_opt(p).unwrap_or_default())
++        }
++    }
++
++    /// Start a run. Drive it with `Run.next_test_case()` until it returns
++    /// None, then read `Run.result()`.
++    fn start_run(slf: Py<Engine>, py: Python<'_>) -> PyResult<Run> {
++        let (ctx, settings) = {
++            let e = slf.borrow(py);
++            (e.ctx, e.settings)
++        };
++        let mut run: *mut sys::HegelRun = std::ptr::null_mut();
++        // SAFETY: settings is copied by libhegel; the run is freed in Drop.
++        let r =
++            unsafe { sys::hegel_run_start(ctx, settings, None, std::ptr::null_mut(), &mut run) };
++        check(ctx, r, "run_start")?;
++        Ok(Run { engine: slf, run })
++    }
++
++    /// Replay a reproduce blob as a standalone test case (no run loop):
++    /// drive it with the usual draws, then `mark_complete`.
++    fn test_case_from_blob(slf: Py<Engine>, py: Python<'_>, blob: &str) -> PyResult<TestCase> {
++        let (ctx, settings) = {
++            let e = slf.borrow(py);
++            (e.ctx, e.settings)
++        };
++        let blob = CString::new(blob).map_err(|_| HegelError::new_err("blob contains NUL"))?;
++        let mut tc: *mut sys::HegelTestCase = std::ptr::null_mut();
++        // SAFETY: blob is a valid C string for the duration of the call.
++        let r = unsafe {
++            sys::hegel_test_case_from_blob(
++                ctx,
++                settings,
++                blob.as_ptr(),
++                None,
++                std::ptr::null_mut(),
++                &mut tc,
++            )
++        };
++        check(ctx, r, "test_case_from_blob")?;
++        Ok(TestCase {
++            engine: slf,
++            tc,
++            complete: false,
++        })
++    }
++
++    /// A text generator over the codepoint range `[min_codepoint, max_codepoint]`
++    /// (surrogates always removed by libhegel), optionally restricted to an
++    /// explicit character set: `empty_alphabet=True` starts from nothing and
++    /// `include` adds characters; `exclude` removes characters.
++    #[pyo3(signature = (min_size, max_size, *, min_codepoint=0, max_codepoint=u32::MAX, include="", exclude="", empty_alphabet=false))]
++    #[allow(clippy::too_many_arguments)]
++    fn text_generator(
++        slf: Py<Engine>,
++        py: Python<'_>,
++        min_size: u64,
++        max_size: u64,
++        min_codepoint: u32,
++        max_codepoint: u32,
++        include: &str,
++        exclude: &str,
++        empty_alphabet: bool,
++    ) -> PyResult<StringGenerator> {
++        let ctx = slf.borrow(py).ctx;
++        let mut gen: *mut sys::HegelStringGenerator = std::ptr::null_mut();
++        let (categories, categories_len): (*const *const c_char, usize) = if empty_alphabet {
++            // A non-NULL, empty category list means an empty alphabet.
++            (std::ptr::NonNull::<*const c_char>::dangling().as_ptr(), 0)
++        } else {
++            (std::ptr::null(), 0)
++        };
++        // SAFETY: all buffers outlive the call; libhegel copies what it keeps.
++        let r = unsafe {
++            sys::hegel_string_generator_text(
++                ctx,
++                min_size,
++                max_size,
++                std::ptr::null(),
++                min_codepoint,
++                max_codepoint,
++                categories,
++                categories_len,
++                std::ptr::null(),
++                0,
++                include.as_ptr(),
++                include.len(),
++                exclude.as_ptr(),
++                exclude.len(),
++                &mut gen,
++            )
++        };
++        check(ctx, r, "string_generator_text")?;
++        Ok(StringGenerator { engine: slf, gen })
++    }
++}
++
++impl Drop for Engine {
++    fn drop(&mut self) {
++        // SAFETY: handles were created by this Engine and are freed exactly once.
++        unsafe {
++            let _ = sys::hegel_settings_free(self.ctx, self.settings);
++            let _ = sys::hegel_context_free(self.ctx);
++        }
++    }
++}
++
++impl Drop for StringGenerator {
++    fn drop(&mut self) {
++        Python::attach(|py| {
++            let ctx = self.engine.borrow(py).ctx;
++            // SAFETY: freed exactly once, after every draw using it completed
++            // (draws hold the GIL and a borrow of this generator).
++            unsafe {
++                let _ = sys::hegel_string_generator_free(ctx, self.gen);
++            }
++        });
++    }
++}
++
++#[pymethods]
++impl Run {
++    /// The next test case, or None once the run is finished.
++    fn next_test_case(&self, py: Python<'_>) -> PyResult<Option<TestCase>> {
++        let ctx = self.engine.borrow(py).ctx;
++        let mut tc: *mut sys::HegelTestCase = std::ptr::null_mut();
++        // SAFETY: run is live until Drop.
++        let r = unsafe { sys::hegel_next_test_case(ctx, self.run, &mut tc) };
++        check(ctx, r, "next_test_case")?;
++        if tc.is_null() {
++            return Ok(None);
++        }
++        Ok(Some(TestCase {
++            engine: self.engine.clone_ref(py),
++            tc,
++            complete: false,
++        }))
++    }
++
++    /// The finished run's result (raises if the run is not complete).
++    fn result(&self, py: Python<'_>) -> PyResult<RunResult> {
++        let ctx = self.engine.borrow(py).ctx;
++        let mut res: *mut sys::HegelRunResult = std::ptr::null_mut();
++        // SAFETY: the result is a caller-owned copy, freed below.
++        unsafe {
++            check(
++                ctx,
++                sys::hegel_run_result(ctx, self.run, &mut res),
++                "run_result",
++            )?;
++            let mut status = sys::hegel_run_status_t::HEGEL_RUN_STATUS_PASSED;
++            check(
++                ctx,
++                sys::hegel_run_result_status(ctx, res, &mut status),
++                "run_result_status",
++            )?;
++            let mut err: *const c_char = std::ptr::null();
++            check(
++                ctx,
++                sys::hegel_run_result_error(ctx, res, &mut err),
++                "run_result_error",
++            )?;
++            let error = cstr_opt(err);
++            let mut count: usize = 0;
++            check(
++                ctx,
++                sys::hegel_run_result_failure_count(ctx, res, &mut count),
++                "failure_count",
++            )?;
++            let mut failures = Vec::with_capacity(count);
++            for i in 0..count {
++                let mut f: *mut sys::HegelFailure = std::ptr::null_mut();
++                check(
++                    ctx,
++                    sys::hegel_run_result_failure(ctx, res, i, &mut f),
++                    "run_result_failure",
++                )?;
++                let mut origin: *const c_char = std::ptr::null();
++                let mut blob: *const c_char = std::ptr::null();
++                let _ = sys::hegel_failure_origin(ctx, f, &mut origin);
++                let _ = sys::hegel_failure_reproduction_blob(ctx, f, &mut blob);
++                let failure = Failure {
++                    origin: cstr_opt(origin).unwrap_or_default(),
++                    blob: cstr_opt(blob),
++                };
++                let _ = sys::hegel_failure_free(ctx, f);
++                failures.push(Py::new(py, failure)?);
++            }
++            let _ = sys::hegel_run_result_free(ctx, res);
++            Ok(RunResult {
++                status: status as u32,
++                error,
++                failures,
++            })
++        }
++    }
++}
++
++impl Drop for Run {
++    fn drop(&mut self) {
++        Python::attach(|py| {
++            let ctx = self.engine.borrow(py).ctx;
++            // SAFETY: freed exactly once; an in-flight case is completed by libhegel.
++            unsafe {
++                let _ = sys::hegel_run_free(ctx, self.run);
++            }
++        });
++    }
++}
++
++impl TestCase {
++    fn ctx(&self, py: Python<'_>) -> *mut sys::HegelContext {
++        self.engine.borrow(py).ctx
++    }
++}
++
++#[pymethods]
++impl TestCase {
++    #[pyo3(signature = (p, forced=None))]
++    fn draw_boolean(&self, py: Python<'_>, p: f64, forced: Option<bool>) -> PyResult<bool> {
++        let ctx = self.ctx(py);
++        let mut out = false;
++        // SAFETY: tc is live until Drop.
++        let r = unsafe {
++            sys::hegel_generate_boolean(
++                ctx,
++                self.tc,
++                p,
++                forced.unwrap_or(false),
++                forced.is_some(),
++                &mut out,
++            )
++        };
++        check(ctx, r, "generate_boolean")?;
++        Ok(out)
++    }
++
++    /// Inclusive bounds; both required (libhegel has no unbounded draw).
++    fn draw_integer(&self, py: Python<'_>, min_value: i64, max_value: i64) -> PyResult<i64> {
++        let ctx = self.ctx(py);
++        let mut out: i64 = 0;
++        // SAFETY: tc is live until Drop.
++        let r =
++            unsafe { sys::hegel_generate_integer(ctx, self.tc, min_value, max_value, &mut out) };
++        check(ctx, r, "generate_integer")?;
++        Ok(out)
++    }
++
++    /// Bounds and result as two's-complement little-endian bytes, for
++    /// values outside the `int64` range (`int.to_bytes(..., "little", signed=True)`).
++    fn draw_integer_big<'py>(
++        &self,
++        py: Python<'py>,
++        min_value: &[u8],
++        max_value: &[u8],
++    ) -> PyResult<Bound<'py, PyBytes>> {
++        let ctx = self.ctx(py);
++        let cap = min_value.len().max(max_value.len()).max(1);
++        let mut out = vec![0u8; cap];
++        let mut out_len: usize = 0;
++        // SAFETY: buffers are sized per the ABI contract (cap >= max(len, len)).
++        let r = unsafe {
++            sys::hegel_generate_integer_big(
++                ctx,
++                self.tc,
++                min_value.as_ptr(),
++                min_value.len(),
++                max_value.as_ptr(),
++                max_value.len(),
++                out.as_mut_ptr(),
++                cap,
++                &mut out_len,
++            )
++        };
++        check(ctx, r, "generate_integer_big")?;
++        // libhegel sign-fills the whole buffer, so the full `cap` bytes read
++        // back as the value with no sign extension needed.
++        Ok(PyBytes::new(py, &out))
++    }
++
++    #[pyo3(signature = (*, min_value, max_value, allow_nan, allow_infinity, smallest_nonzero_magnitude, width=64))]
++    #[allow(clippy::too_many_arguments)]
++    fn draw_float(
++        &self,
++        py: Python<'_>,
++        min_value: f64,
++        max_value: f64,
++        allow_nan: bool,
++        allow_infinity: bool,
++        smallest_nonzero_magnitude: f64,
++        width: u32,
++    ) -> PyResult<f64> {
++        let ctx = self.ctx(py);
++        let mut out = 0.0f64;
++        // SAFETY: tc is live until Drop.
++        let r = unsafe {
++            sys::hegel_generate_float(
++                ctx,
++                self.tc,
++                width,
++                min_value,
++                max_value,
++                allow_nan,
++                allow_infinity,
++                false,
++                false,
++                smallest_nonzero_magnitude,
++                &mut out,
++            )
++        };
++        check(ctx, r, "generate_float")?;
++        Ok(out)
++    }
++
++    fn draw_bytes<'py>(
++        &self,
++        py: Python<'py>,
++        min_size: u64,
++        max_size: u64,
++    ) -> PyResult<Bound<'py, PyBytes>> {
++        let ctx = self.ctx(py);
++        let mut res = sys::hegel_generate_bytes_result_t {
++            data: std::ptr::null_mut(),
++            len: 0,
++        };
++        // SAFETY: the result buffer is libhegel-allocated and freed right after copying.
++        unsafe {
++            let r = sys::hegel_generate_bytes(ctx, self.tc, min_size, max_size, &mut res);
++            check(ctx, r, "generate_bytes")?;
++            let slice: &[u8] = if res.data.is_null() {
++                &[]
++            } else {
++                std::slice::from_raw_parts(res.data, res.len)
++            };
++            let out = PyBytes::new(py, slice);
++            let _ = sys::hegel_generate_bytes_result_free(ctx, &mut res);
++            Ok(out)
++        }
++    }
++
++    fn draw_string<'py>(
++        &self,
++        py: Python<'py>,
++        generator: &StringGenerator,
++    ) -> PyResult<Bound<'py, PyString>> {
++        let ctx = self.ctx(py);
++        let mut res = sys::hegel_generate_string_result_t {
++            data: std::ptr::null_mut(),
++            len: 0,
++        };
++        // SAFETY: the result buffer is libhegel-allocated UTF-8 and freed right after copying.
++        unsafe {
++            let r = sys::hegel_generate_string(ctx, self.tc, generator.gen, &mut res);
++            check(ctx, r, "generate_string")?;
++            let slice: &[u8] = if res.data.is_null() {
++                &[]
++            } else {
++                std::slice::from_raw_parts(res.data as *const u8, res.len)
++            };
++            let out = String::from_utf8_lossy(slice).into_owned();
++            let _ = sys::hegel_generate_string_result_free(ctx, &mut res);
++            Ok(PyString::new(py, &out))
++        }
++    }
++
++    /// libhegel's collection sizing: call `Collection.more()` until it is
++    /// False, drawing one element per True.
++    fn new_collection(
++        slf: Py<TestCase>,
++        py: Python<'_>,
++        min_size: u64,
++        max_size: u64,
++    ) -> PyResult<Collection> {
++        let (engine, tc) = {
++            let s = slf.borrow(py);
++            (s.engine.clone_ref(py), s.tc)
++        };
++        let ctx = engine.borrow(py).ctx;
++        let mut c: *mut sys::HegelCollection = std::ptr::null_mut();
++        // SAFETY: tc is live; the collection is freed in Drop.
++        let r = unsafe { sys::hegel_new_collection(ctx, tc, min_size, max_size, &mut c) };
++        check(ctx, r, "new_collection")?;
++        Ok(Collection {
++            engine,
++            tc: slf,
++            collection: c,
++        })
++    }
++
++    fn start_span(&self, py: Python<'_>, label: u64) -> PyResult<()> {
++        let ctx = self.ctx(py);
++        // SAFETY: tc is live until Drop.
++        let r = unsafe { sys::hegel_start_span(ctx, self.tc, label) };
++        check(ctx, r, "start_span")
++    }
++
++    fn stop_span(&self, py: Python<'_>, discard: bool) -> PyResult<()> {
++        let ctx = self.ctx(py);
++        // SAFETY: tc is live until Drop.
++        let r = unsafe { sys::hegel_stop_span(ctx, self.tc, discard) };
++        check(ctx, r, "stop_span")
++    }
++
++    /// `status` is one of the `STATUS_*` constants; `origin` identifies the
++    /// failure (only read for `STATUS_INTERESTING`).
++    #[pyo3(signature = (status, origin=None))]
++    fn mark_complete(&mut self, py: Python<'_>, status: u32, origin: Option<&str>) -> PyResult<()> {
++        let ctx = self.ctx(py);
++        let origin_c = match origin {
++            Some(s) => {
++                Some(CString::new(s).map_err(|_| HegelError::new_err("origin contains NUL"))?)
++            }
++            None => None,
++        };
++        let origin_p = origin_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
++        // SAFETY: origin_c outlives the call.
++        let r = unsafe { sys::hegel_mark_complete(ctx, self.tc, status, origin_p) };
++        self.complete = true;
++        check(ctx, r, "mark_complete")
++    }
++
++    #[getter]
++    fn complete(&self) -> bool {
++        self.complete
++    }
++}
++
++impl Drop for TestCase {
++    fn drop(&mut self) {
++        Python::attach(|py| {
++            let ctx = self.engine.borrow(py).ctx;
++            // SAFETY: freed exactly once.
++            unsafe {
++                let _ = sys::hegel_test_case_free(ctx, self.tc);
++            }
++        });
++    }
++}
++
++#[pymethods]
++impl Collection {
++    fn more(&self, py: Python<'_>) -> PyResult<bool> {
++        let ctx = self.engine.borrow(py).ctx;
++        let tc = self.tc.borrow(py).tc;
++        let mut out = false;
++        // SAFETY: both handles are live (held by Py refs).
++        let r = unsafe { sys::hegel_collection_more(ctx, tc, self.collection, &mut out) };
++        check(ctx, r, "collection_more")?;
++        Ok(out)
++    }
++}
++
++impl Drop for Collection {
++    fn drop(&mut self) {
++        Python::attach(|py| {
++            let ctx = self.engine.borrow(py).ctx;
++            // SAFETY: freed exactly once.
++            unsafe {
++                let _ = sys::hegel_collection_free(ctx, self.collection);
++            }
++        });
++    }
++}
++
++#[pyo3::pymodule]
++pub(crate) mod hegel {
++    use pyo3::prelude::*;
++
++    #[pymodule_export]
++    use super::{Collection, Engine, Failure, Run, RunResult, StringGenerator, TestCase};
++
++    #[pymodule_init]
++    fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
++        let py = m.py();
++        m.add("HegelError", py.get_type::<super::HegelError>())?;
++        m.add("StopTestError", py.get_type::<super::StopTestError>())?;
++        m.add("AssumeError", py.get_type::<super::AssumeError>())?;
++        m.add("STATUS_VALID", super::STATUS_VALID)?;
++        m.add("STATUS_INVALID", super::STATUS_INVALID)?;
++        m.add("STATUS_OVERRUN", super::STATUS_OVERRUN)?;
++        m.add("STATUS_INTERESTING", super::STATUS_INTERESTING)?;
++        m.add("PHASE_EXPLICIT", super::PHASE_EXPLICIT)?;
++        m.add("PHASE_REUSE", super::PHASE_REUSE)?;
++        m.add("PHASE_GENERATE", super::PHASE_GENERATE)?;
++        m.add("PHASE_TARGET", super::PHASE_TARGET)?;
++        m.add("PHASE_SHRINK", super::PHASE_SHRINK)?;
++        Ok(())
++    }
++}
+diff --git a/hypothesis/rust/src/internal/mod.rs b/hypothesis/rust/src/internal/mod.rs
+index 4049a063..5300e82d 100644
+--- a/hypothesis/rust/src/internal/mod.rs
++++ b/hypothesis/rust/src/internal/mod.rs
+@@ -10,6 +10,7 @@
+ 
+ mod cathetus;
+ mod floats;
++mod hegel;
+ 
+ #[pyo3::pymodule]
+ pub(crate) mod internal {
+@@ -17,4 +18,6 @@ pub(crate) mod internal {
+     use super::cathetus::cathetus;
+     #[pymodule_export]
+     use super::floats::floats;
++    #[pymodule_export]
++    use super::hegel::hegel;
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,9 @@
+{
+  "repo": "HypothesisWorks/hypothesis",
+  "remote": "https://github.com/HypothesisWorks/hypothesis",
+  "base_branch": "master",
+  "base_sha": "44b82b24cb40c72afd1f6e10c2af7a5d82c6539a",
+  "created": "2026-09-29",
+  "patches": 2,
+  "title": "Link libhegel into hypothesis-native and expose its C ABI to Python"
+}
