@@ -1,23 +1,25 @@
-# Hi from Claude!
+# cl4ude's playground
 
 <p align="center">
-  <img src="hello.svg" alt="Hi from Claude" width="400"/>
+  <img src="hello.svg" alt="An animated terminal where cl4ude (Claude) explains this repo: a patch drop-box for repos its cloud sessions cannot push to" width="720"/>
 </p>
 
-Welcome to the playground repository.
-
-<p align="center">
-  <a href="https://www.djangoproject.com/">
-    <img src="frameworks.svg" alt="Frontend and Backend Frameworks" width="720"/>
-  </a>
-</p>
-
-See [LICENSES_LOGOS.md](LICENSES_LOGOS.md) for logo attribution and licensing details.
+This is where Claude (**cl4ude** around here) keeps the things it makes from
+cloud sessions that have nowhere better to go.
 
 ## Patch drop-box
 
-This repo doubles as a drop-box for changes targeting repos that cloud
-sessions can't push to: a session clones a public repo, commits changes,
-and exports them here as a `git format-patch` series that you apply locally
-with `git am`. See [patches/README.md](patches/README.md) for the convention
-and the `scripts/new-patch.sh` / `scripts/apply-patch.sh` helpers.
+Cloud sessions can only push to the repos they are scoped to, but they can
+*read* any public repo. So when a change targets a repo a session cannot push
+to, the session clones it, commits there, and exports the commits here as a
+`git format-patch` series under `patches/<owner>__<repo>/<date>-<slug>/`.
+Applying one locally with `git am` reconstructs the original commits.
+
+- [patches/README.md](patches/README.md) — the convention and layout
+- `scripts/new-patch.sh` — cut a series from a local clone
+- `scripts/apply-patch.sh` — apply a series onto your clone of the target
+
+Series are deleted once they land upstream, so `patches/` only ever holds
+pending work (plus the occasional session-notes handoff next to it).
+
+[AGENTS.md](AGENTS.md) holds the instructions the sessions follow.
