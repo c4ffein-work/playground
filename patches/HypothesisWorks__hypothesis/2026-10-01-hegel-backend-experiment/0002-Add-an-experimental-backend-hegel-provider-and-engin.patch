@@ -1,4 +1,4 @@
-From 0ce95953378cda5ef73d9cb8def39b50209fb408 Mon Sep 17 00:00:00 2001
+From 79ec8c4dad5e6eb34202a1ef4d6210ab22d19b54 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 29 Sep 2026 16:27:26 +0000
 Subject: [PATCH 2/3] Add an experimental backend="hegel" provider and
@@ -33,10 +33,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
  hypothesis/RELEASE.rst                        |   9 +
- .../internal/conjecture/hegel_provider.py     | 379 ++++++++++++++++++
+ .../internal/conjecture/hegel_provider.py     | 385 ++++++++++++++++++
  .../internal/conjecture/providers.py          |   2 +
  .../tests/conjecture/test_hegel_provider.py   | 205 ++++++++++
- 4 files changed, 595 insertions(+)
+ 4 files changed, 601 insertions(+)
  create mode 100644 hypothesis/RELEASE.rst
  create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
  create mode 100644 hypothesis/tests/conjecture/test_hegel_provider.py
@@ -58,10 +58,10 @@ index 00000000..ed0fbdb9
 +release.
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
 new file mode 100644
-index 00000000..03321254
+index 00000000..0fb80cdf
 --- /dev/null
 +++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,385 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -278,7 +278,9 @@ index 00000000..03321254
 +            if INT64_MIN <= min_value and max_value <= INT64_MAX:
 +                keys, ws = list(weights), list(weights.values())
 +                return self._draw(
-+                    lambda tc: tc.draw_integer_weighted(min_value, max_value, keys, ws)
++                    lambda tc: tc.draw_integer_weighted(
++                        min_value, max_value, keys, ws, shrink_towards
++                    )
 +                )
 +            if self.draw_boolean(sum(weights.values())):
 +                keys = list(weights)
@@ -296,6 +298,10 @@ index 00000000..03321254
 +            lo, hi = min_value, max(UNBOUNDED_MAGNITUDE, 2 * abs(min_value))
 +        else:
 +            lo, hi = min_value, max_value
++        if shrink_towards and INT64_MIN <= lo and hi <= INT64_MAX:
++            # the weighted entry point is the one that carries shrink_towards
++            st = min(max(shrink_towards, lo), hi)
++            return self._draw(lambda tc: tc.draw_integer_weighted(lo, hi, [], [], st))
 +        return self._draw_bounded_integer(lo, hi)
 +
 +    def draw_float(

@@ -1,4 +1,4 @@
-From f41a36063219836c5e9a7e8215c3bfcce450f97e Mon Sep 17 00:00:00 2001
+From 5a295e22065bac3a170e9947d21aad96a45e5c03 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 1 Oct 2026 17:26:08 +0000
 Subject: [PATCH] Add the draws the Hypothesis frontend needs
@@ -23,29 +23,31 @@ tests cover the three.
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
- hegel-c/include/hegel.h                 |  38 ++++
- hegel-c/src/backend.rs                  |  14 ++
- hegel-c/src/lib.rs                      | 103 ++++++++++
- hegel-c/src/native/core/state.rs        |  31 +++
- hegel-c/src/native/data_source.rs       |  12 ++
- hegel-c/src/native/draws/mod.rs         |  92 ++++++++-
- hegel-c/src/native/draws/text.rs        |  21 +++
- hegel-c/tests/c_abi_hypothesis_needs.rs | 239 ++++++++++++++++++++++++
+ hegel-c/include/hegel.h                 |  41 ++++
+ hegel-c/src/backend.rs                  |  16 ++
+ hegel-c/src/lib.rs                      | 107 +++++++++++
+ hegel-c/src/native/core/state.rs        |  32 ++++
+ hegel-c/src/native/data_source.rs       |  20 ++
+ hegel-c/src/native/draws/mod.rs         | 100 +++++++++-
+ hegel-c/src/native/draws/text.rs        |  21 ++
+ hegel-c/tests/c_abi_hypothesis_needs.rs | 244 ++++++++++++++++++++++++
  src/ffi/sys/fns.rs                      |   2 +
- 9 files changed, 547 insertions(+), 5 deletions(-)
+ 9 files changed, 578 insertions(+), 5 deletions(-)
  create mode 100644 hegel-c/tests/c_abi_hypothesis_needs.rs
 
 diff --git a/hegel-c/include/hegel.h b/hegel-c/include/hegel.h
-index a8d7f3e6..a83ab093 100644
+index a8d7f3e6..f529b89d 100644
 --- a/hegel-c/include/hegel.h
 +++ b/hegel-c/include/hegel.h
-@@ -1982,6 +1982,26 @@ hegel_result_t hegel_generate_integer(hegel_context_t *ctx,
+@@ -1982,6 +1982,29 @@ hegel_result_t hegel_generate_integer(hegel_context_t *ctx,
                                        int64_t max_value,
                                        int64_t *out_value);
  
 +/*
 + Parameters:
 + `min_value` / `max_value`: Inclusive bounds. Both required.
++ `shrink_towards`: The value the choice shrinks toward, clamped into the
++   bounds (`hegel_generate_integer` shrinks toward 0).
 + `keys` / `weights`: `len` integers in `[min_value, max_value]` and the
 +   probability of drawing each. Weights must be finite, non-negative and
 +   sum to strictly less than 1; the remaining mass is drawn the way
@@ -58,6 +60,7 @@ index a8d7f3e6..a83ab093 100644
 +                                               hegel_test_case_t *tc,
 +                                               int64_t min_value,
 +                                               int64_t max_value,
++                                               int64_t shrink_towards,
 +                                               const int64_t *keys,
 +                                               const double *weights,
 +                                               size_t len,
@@ -66,7 +69,7 @@ index a8d7f3e6..a83ab093 100644
  /*
   Parameters:
   `min_value` / `max_value`: Inclusive bounds as two's-complement
-@@ -2103,6 +2123,24 @@ hegel_result_t hegel_string_generator_text(hegel_context_t *ctx,
+@@ -2103,6 +2126,24 @@ hegel_result_t hegel_string_generator_text(hegel_context_t *ctx,
                                             size_t exclude_characters_len,
                                             hegel_string_generator_t **out_generator);
  
@@ -92,21 +95,23 @@ index a8d7f3e6..a83ab093 100644
   Parameters:
   `pattern`: The pattern to match, in Python `re` syntax.
 diff --git a/hegel-c/src/backend.rs b/hegel-c/src/backend.rs
-index 01e42353..b5c42851 100644
+index 01e42353..2d74e93c 100644
 --- a/hegel-c/src/backend.rs
 +++ b/hegel-c/src/backend.rs
-@@ -73,6 +73,20 @@ pub trait DataSource: Send + Sync {
+@@ -73,6 +73,22 @@ pub trait DataSource: Send + Sync {
          max_value: &BigInt,
      ) -> Result<BigInt, DataSourceError>;
  
 +    /// Draw an integer from `[min_value, max_value]` where `keys[i]` is
 +    /// drawn with probability `weights[i]` and the rest of the probability
-+    /// mass falls to [`DataSource::generate_integer`]'s distribution. The
-+    /// default ignores the weights; the native engine honours them.
++    /// mass falls to [`DataSource::generate_integer`]'s distribution,
++    /// shrinking toward `shrink_towards`. The default ignores both; the
++    /// native engine honours them.
 +    fn generate_integer_weighted(
 +        &self,
 +        min_value: &BigInt,
 +        max_value: &BigInt,
++        _shrink_towards: &BigInt,
 +        _keys: &[BigInt],
 +        _weights: &[f64],
 +    ) -> Result<BigInt, DataSourceError> {
@@ -117,15 +122,17 @@ index 01e42353..b5c42851 100644
      /// exclusive-bound handling). Errors with `InvalidArgument` for an
      /// invalid spec.
 diff --git a/hegel-c/src/lib.rs b/hegel-c/src/lib.rs
-index 0c150c11..85e94428 100644
+index 0c150c11..2f769bef 100644
 --- a/hegel-c/src/lib.rs
 +++ b/hegel-c/src/lib.rs
-@@ -4196,6 +4196,64 @@ pub unsafe extern "C" fn hegel_generate_integer(
+@@ -4196,6 +4196,68 @@ pub unsafe extern "C" fn hegel_generate_integer(
      }
  }
  
 +/// Parameters:
 +/// `min_value` / `max_value`: Inclusive bounds. Both required.
++/// `shrink_towards`: The value the choice shrinks toward, clamped into the
++///   bounds (`hegel_generate_integer` shrinks toward 0).
 +/// `keys` / `weights`: `len` integers in `[min_value, max_value]` and the
 +///   probability of drawing each. Weights must be finite, non-negative and
 +///   sum to strictly less than 1; the remaining mass is drawn the way
@@ -139,6 +146,7 @@ index 0c150c11..85e94428 100644
 +    tc: *mut HegelTestCase,
 +    min_value: i64,
 +    max_value: i64,
++    shrink_towards: i64,
 +    keys: *const i64,
 +    weights: *const f64,
 +    len: usize,
@@ -168,6 +176,7 @@ index 0c150c11..85e94428 100644
 +                let v = tc.stream.generate_integer_weighted(
 +                    &BigInt::from(min_value),
 +                    &BigInt::from(max_value),
++                    &BigInt::from(shrink_towards),
 +                    &keys,
 +                    weights,
 +                )?;
@@ -185,7 +194,7 @@ index 0c150c11..85e94428 100644
  /// Parameters:
  /// `min_value` / `max_value`: Inclusive bounds as two's-complement
  ///   little-endian signed byte buffers. Both required and must be
-@@ -4642,6 +4700,51 @@ pub unsafe extern "C" fn hegel_string_generator_text(
+@@ -4642,6 +4704,51 @@ pub unsafe extern "C" fn hegel_string_generator_text(
      }
  }
  
@@ -238,10 +247,10 @@ index 0c150c11..85e94428 100644
  /// `pattern`: The pattern to match, in Python `re` syntax.
  /// `fullmatch`: When true, the whole string must match the pattern.
 diff --git a/hegel-c/src/native/core/state.rs b/hegel-c/src/native/core/state.rs
-index 3d64721c..6be2d88c 100644
+index 3d64721c..d583e09d 100644
 --- a/hegel-c/src/native/core/state.rs
 +++ b/hegel-c/src/native/core/state.rs
-@@ -2207,6 +2207,37 @@ impl NativeTestCase {
+@@ -2207,6 +2207,38 @@ impl NativeTestCase {
          ))
      }
  
@@ -253,6 +262,7 @@ index 3d64721c..6be2d88c 100644
 +        &mut self,
 +        min_value: BigInt,
 +        max_value: BigInt,
++        shrink_towards: BigInt,
 +        keys: &[BigInt],
 +        weights: &[f64],
 +    ) -> Result<BigInt, EngineError> {
@@ -263,7 +273,7 @@ index 3d64721c..6be2d88c 100644
 +        let kind = IntegerChoice {
 +            min_value,
 +            max_value,
-+            shrink_towards: BigInt::zero(),
++            shrink_towards,
 +        };
 +        let params = self.family.generation_parameters().integer;
 +        let total: f64 = weights.iter().sum();
@@ -280,10 +290,10 @@ index 3d64721c..6be2d88c 100644
      /// without the boundary-and-distribution shaping of [`Self::draw_integer`].
      /// For draws whose value parameterizes later generation — such as a
 diff --git a/hegel-c/src/native/data_source.rs b/hegel-c/src/native/data_source.rs
-index 788dedfa..3336073c 100644
+index 788dedfa..d968ef64 100644
 --- a/hegel-c/src/native/data_source.rs
 +++ b/hegel-c/src/native/data_source.rs
-@@ -175,6 +175,18 @@ impl DataSource for NativeDataSource {
+@@ -175,6 +175,26 @@ impl DataSource for NativeDataSource {
          self.with_ntc(|ntc| draws::generate_integer(ntc, min_value, max_value))
      }
  
@@ -291,11 +301,19 @@ index 788dedfa..3336073c 100644
 +        &self,
 +        min_value: &BigInt,
 +        max_value: &BigInt,
++        shrink_towards: &BigInt,
 +        keys: &[BigInt],
 +        weights: &[f64],
 +    ) -> Result<BigInt, DataSourceError> {
 +        self.with_ntc(|ntc| {
-+            draws::generate_integer_weighted(ntc, min_value, max_value, keys, weights)
++            draws::generate_integer_weighted(
++                ntc,
++                min_value,
++                max_value,
++                shrink_towards,
++                keys,
++                weights,
++            )
 +        })
 +    }
 +
@@ -303,7 +321,7 @@ index 788dedfa..3336073c 100644
          &self,
          spec: &crate::native::draws::FloatSpec,
 diff --git a/hegel-c/src/native/draws/mod.rs b/hegel-c/src/native/draws/mod.rs
-index d6450955..5f5253bf 100644
+index d6450955..43cc9dfd 100644
 --- a/hegel-c/src/native/draws/mod.rs
 +++ b/hegel-c/src/native/draws/mod.rs
 @@ -85,11 +85,10 @@ pub fn generate_float(ntc: &mut NativeTestCase, spec: &FloatSpec) -> Result<f64,
@@ -322,20 +340,22 @@ index d6450955..5f5253bf 100644
      if spec.allow_infinity && spec.min_value.is_finite() && spec.max_value.is_finite() {
          return Err(EngineError::InvalidArgument(
              "Cannot have allow_infinity=true with both min_value and max_value".to_string(),
-@@ -189,6 +188,50 @@ pub fn generate_integer(
+@@ -189,6 +188,58 @@ pub fn generate_integer(
      })
  }
  
 +/// Draw an integer in `[min_value, max_value]` where each `keys[i]` is
 +/// drawn with probability `weights[i]` and the remaining mass
 +/// (`1 - sum(weights)`, which must be positive) falls to the ordinary
-+/// shaped draw over the whole range. The result is one integer choice,
-+/// shrunk and replayed like any other: the weights only steer fresh
-+/// generation. Port of HypothesisProvider's `weights` handling.
++/// shaped draw over the whole range, shrinking toward `shrink_towards`
++/// (clamped into the range). The result is one integer choice, shrunk and
++/// replayed like any other: the weights only steer fresh generation. Port
++/// of HypothesisProvider's `weights` and `shrink_towards` handling.
 +pub fn generate_integer_weighted(
 +    ntc: &mut NativeTestCase,
 +    min_value: &BigInt,
 +    max_value: &BigInt,
++    shrink_towards: &BigInt,
 +    keys: &[BigInt],
 +    weights: &[f64],
 +) -> Result<BigInt, EngineError> {
@@ -366,14 +386,20 @@ index d6450955..5f5253bf 100644
 +        )));
 +    }
 +    spanned(ntc, LABEL_INTEGER, |ntc| {
-+        ntc.draw_integer_weighted(min_value.clone(), max_value.clone(), keys, weights)
++        ntc.draw_integer_weighted(
++            min_value.clone(),
++            max_value.clone(),
++            shrink_towards.clone(),
++            keys,
++            weights,
++        )
 +    })
 +}
 +
  /// Draw an integer identifier unique within the test case's family,
  /// recorded by value (see [`NativeTestCase::draw_fresh_id`]).
  pub(crate) fn fresh_id(ntc: &mut NativeTestCase) -> Result<i64, EngineError> {
-@@ -292,6 +335,45 @@ impl StringSpec {
+@@ -292,6 +343,45 @@ impl StringSpec {
          })
      }
  
@@ -453,10 +479,10 @@ index c4f73009..4ba6ae03 100644
  fn range_minus_surrogates(min: u32, max: u32) -> Result<IntervalSet, InternalError> {
 diff --git a/hegel-c/tests/c_abi_hypothesis_needs.rs b/hegel-c/tests/c_abi_hypothesis_needs.rs
 new file mode 100644
-index 00000000..64b88a9e
+index 00000000..cc70597e
 --- /dev/null
 +++ b/hegel-c/tests/c_abi_hypothesis_needs.rs
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,244 @@
 +//! In-process exercise of the draws added for the Hypothesis frontend:
 +//! weighted integers, NaN alongside finite float bounds, and text
 +//! generators built from explicit codepoint ranges.
@@ -509,6 +535,7 @@ index 00000000..64b88a9e
 +                    tc,
 +                    0,
 +                    5,
++                    0,
 +                    keys.as_ptr(),
 +                    weights.as_ptr(),
 +                    2,
@@ -524,6 +551,7 @@ index 00000000..64b88a9e
 +                    tc,
 +                    0,
 +                    100,
++                    0,
 +                    keys.as_ptr(),
 +                    heavy.as_ptr(),
 +                    2,
@@ -537,6 +565,7 @@ index 00000000..64b88a9e
 +                    tc,
 +                    0,
 +                    100,
++                    0,
 +                    keys.as_ptr(),
 +                    weights.as_ptr(),
 +                    2,
@@ -549,6 +578,7 @@ index 00000000..64b88a9e
 +                tc,
 +                0,
 +                100,
++                0,
 +                keys.as_ptr(),
 +                weights.as_ptr(),
 +                2,
@@ -566,6 +596,7 @@ index 00000000..64b88a9e
 +                tc,
 +                -3,
 +                3,
++                0,
 +                ptr::null(),
 +                ptr::null(),
 +                0,
@@ -697,14 +728,14 @@ index 00000000..64b88a9e
 +    }
 +}
 diff --git a/src/ffi/sys/fns.rs b/src/ffi/sys/fns.rs
-index c3d78cd7..77a08555 100644
+index c3d78cd7..4228733d 100644
 --- a/src/ffi/sys/fns.rs
 +++ b/src/ffi/sys/fns.rs
 @@ -27,6 +27,7 @@ macro_rules! for_each_hegel_fn {
              fn hegel_generate_float(ctx: *mut HegelContext, tc: *mut HegelTestCase, width: u32, min_value: f64, max_value: f64, allow_nan: bool, allow_infinity: bool, exclude_min: bool, exclude_max: bool, smallest_nonzero_magnitude: f64, out_value: *mut f64) -> hegel_result_t;
              fn hegel_generate_integer(ctx: *mut HegelContext, tc: *mut HegelTestCase, min_value: i64, max_value: i64, out_value: *mut i64) -> hegel_result_t;
              fn hegel_generate_integer_big(ctx: *mut HegelContext, tc: *mut HegelTestCase, min_value: *const u8, min_value_len: usize, max_value: *const u8, max_value_len: usize, out_value: *mut u8, out_value_cap: usize, out_value_len: *mut usize) -> hegel_result_t;
-+            fn hegel_generate_integer_weighted(ctx: *mut HegelContext, tc: *mut HegelTestCase, min_value: i64, max_value: i64, keys: *const i64, weights: *const f64, len: usize, out_value: *mut i64) -> hegel_result_t;
++            fn hegel_generate_integer_weighted(ctx: *mut HegelContext, tc: *mut HegelTestCase, min_value: i64, max_value: i64, shrink_towards: i64, keys: *const i64, weights: *const f64, len: usize, out_value: *mut i64) -> hegel_result_t;
              fn hegel_generate_ipv4(ctx: *mut HegelContext, tc: *mut HegelTestCase, out_bytes: *mut u8) -> hegel_result_t;
              fn hegel_generate_ipv6(ctx: *mut HegelContext, tc: *mut HegelTestCase, out_bytes: *mut u8) -> hegel_result_t;
              fn hegel_generate_string(ctx: *mut HegelContext, tc: *mut HegelTestCase, generator: *const HegelStringGenerator, out_result: *mut hegel_generate_string_result_t) -> hegel_result_t;

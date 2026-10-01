@@ -1,4 +1,4 @@
-From 182d27844aba7d2896f1bd914820489aed39155d Mon Sep 17 00:00:00 2001
+From bb5482aa5486827deff4e7405f8cbe461a9f454a Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 1 Oct 2026 17:26:52 +0000
 Subject: [PATCH 3/3] Add HYPOTHESIS_ENGINE=hegel: libhegel as the engine
@@ -30,10 +30,10 @@ Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
  hypothesis/RELEASE.rst                        |  16 +-
  hypothesis/src/hypothesis/core.py             |   9 +-
- .../internal/conjecture/hegel_runner.py       | 298 ++++++++++++++++++
- .../tests/conjecture/test_hegel_runner.py     | 150 +++++++++
+ .../internal/conjecture/hegel_runner.py       | 354 ++++++++++++++++++
+ .../tests/conjecture/test_hegel_runner.py     | 150 ++++++++
  .../tests/quality/test_discovery_ability.py   |   7 +-
- 5 files changed, 471 insertions(+), 9 deletions(-)
+ 5 files changed, 527 insertions(+), 9 deletions(-)
  create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
  create mode 100644 hypothesis/tests/conjecture/test_hegel_runner.py
 
@@ -89,10 +89,10 @@ index ccab311e..ba3ae825 100644
              random=self.random,
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
 new file mode 100644
-index 00000000..610677fe
+index 00000000..4d538199
 --- /dev/null
 +++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,354 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -134,7 +134,7 @@ index 00000000..610677fe
 +)
 +from hypothesis.errors import (
 +    BackendCannotProceed,
-+    FailedHealthCheck,
++    FlakyFailure,
 +    HypothesisException,
 +    StopTest,
 +)
@@ -155,6 +155,7 @@ index 00000000..610677fe
 +from hypothesis.internal.conjecture.providers import HypothesisProvider
 +from hypothesis.internal.conjecture.shrinker import sort_key
 +from hypothesis.internal.escalation import InterestingOrigin
++from hypothesis.internal.healthcheck import fail_health_check
 +from hypothesis.reporting import base_report
 +
 +
@@ -296,6 +297,9 @@ index 00000000..610677fe
 +            phases=phases,
 +            report_multiple_failures=self.settings.report_multiple_bugs,
 +            suppress_health_check=suppressed,
++            # a test that behaves differently on replay is flaky to
++            # Hypothesis, not something to work around
++            nondeterminism_strictness=_hegel.ND_ERROR,
 +        )
 +        started = time.perf_counter()
 +        run = self._engine.start_run()
@@ -311,16 +315,12 @@ index 00000000..610677fe
 +            }
 +        result = run.result()
 +        self.hegel_failures = [(f.origin, f.blob) for f in result.failures]
-+        if result.error is not None:
-+            if "health" in result.error.lower() or "filter" in result.error.lower():
-+                raise FailedHealthCheck(result.error)
-+            raise HypothesisException(
-+                f"libhegel ended the run with an error: {result.error}"
-+            )
 +        if self.interesting_test_cases or self.call_count < self.settings.max_examples:
 +            self.exit_reason = ExitReason.finished
 +        else:
 +            self.exit_reason = ExitReason.max_examples
++        if result.error is not None:
++            self._translate_run_error(result.error)
 +        self.statistics["stopped-because"] = self.exit_reason.describe(self.settings)
 +        if self.best_observed_targets:
 +            self.statistics["targets"] = dict(self.best_observed_targets)
@@ -329,6 +329,62 @@ index 00000000..610677fe
 +                f"libhegel run complete after {self.call_count} test cases "
 +                f"({self.valid_test_cases} valid) and {self.shrinks} shrinks"
 +            )
++
++    def _translate_run_error(self, error: str) -> None:
++        """libhegel's run-level errors in Hypothesis's terms: an exhausted
++        search space is core.py's Unsatisfiable (exit reason ``finished``
++        with no valid case), its health checks are Hypothesis's, and a
++        nondeterministic test is a flaky one."""
++        lowered = error.lower()
++        if "unsatisfiable" in lowered or "every reachable input" in lowered:
++            self.exit_reason = ExitReason.finished
++            self.statistics["stopped-because"] = self.exit_reason.describe(
++                self.settings
++            )
++            return
++        if "filter" in lowered:
++            fail_health_check(
++                self.settings,
++                "It looks like this test is filtering out a lot of inputs. "
++                f"{self.valid_test_cases} inputs were generated successfully, "
++                f"while {self.invalid_test_cases} inputs were filtered out and "
++                f"{self.overrun_test_cases} overran.\n\nAn input might be "
++                "filtered out by calls to assume(), strategy.filter(...), or "
++                "occasionally by Hypothesis internals. If you expect this many "
++                "inputs to be filtered out during generation, you can disable this "
++                "health check with "
++                "@settings(suppress_health_check=[HealthCheck.filter_too_much]). "
++                f"(libhegel: {error})",
++                HealthCheck.filter_too_much,
++            )
++        if "slow" in lowered:
++            fail_health_check(
++                self.settings,
++                "Data generation is extremely slow: Only produced "
++                f"{self.valid_test_cases} valid examples in the first test cases. "
++                "If you expect input generation to take this long, you can disable "
++                "this health check with "
++                "@settings(suppress_health_check=[HealthCheck.too_slow]). "
++                f"(libhegel: {error})",
++                HealthCheck.too_slow,
++            )
++        if "large" in lowered:
++            fail_health_check(
++                self.settings,
++                f"Generated inputs are too large (libhegel: {error})",
++                HealthCheck.data_too_large,
++            )
++        if "nondeterministic" in lowered or "flaky" in lowered:
++            self.exit_reason = ExitReason.flaky
++            self.statistics["stopped-because"] = self.exit_reason.describe(
++                self.settings
++            )
++            raise FlakyFailure(
++                "Inconsistent results: libhegel saw this test behave differently "
++                f"when replaying the same inputs ({error})",
++                [HypothesisException(error)],
++            )
++        raise HypothesisException(f"libhegel ended the run with an error: {error}")
 +
 +    def _execute(self, tc: Any) -> None:
 +        provider = HegelCaseProvider(self._engine, tc, self._generators)
@@ -367,7 +423,7 @@ index 00000000..610677fe
 +        if data.status >= Status.VALID:
 +            for label, score in data.target_observations.items():
 +                if math.isfinite(score):
-+                    tc.target(str(label), score)
++                    tc.target(str(label).replace("\0", "\\0"), score)
 +                self.best_observed_targets[label] = max(
 +                    self.best_observed_targets.get(label, -math.inf), score
 +                )
