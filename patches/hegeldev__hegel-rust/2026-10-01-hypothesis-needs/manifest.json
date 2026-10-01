@@ -1,0 +1,9 @@
+{
+  "repo": "hegeldev/hegel-rust",
+  "remote": "https://github.com/hegeldev/hegel-rust",
+  "base_branch": "main",
+  "base_sha": "ebfd9d53a3de91522e0c4e5941cf08242aba713b",
+  "created": "2026-10-01",
+  "patches": 1,
+  "title": "Add the draws the Hypothesis frontend needs"
+}

@@ -1,0 +1,577 @@
+From 182d27844aba7d2896f1bd914820489aed39155d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 1 Oct 2026 17:26:52 +0000
+Subject: [PATCH 3/3] Add HYPOTHESIS_ENGINE=hegel: libhegel as the engine
+ behind core.py
+
+With the environment variable set, core.py drives a test with HegelRunner
+instead of ConjectureRunner whenever the backend is the default one. libhegel
+owns the run loop, generation, targeting, shrinking and the choice budget;
+Python keeps ConjectureData as the shim strategies draw from, the test
+execution, interesting-origin bookkeeping and the final report. The runner
+implements the subset of ConjectureRunner that core.py reads (counters,
+interesting test cases, statistics, exit reason, new_conjecture_data) and
+maps settings onto libhegel's: max_examples, phases, report_multiple_bugs,
+suppressed health checks, and the seed from the settings-derived Random.
+
+Each libhegel test case is executed through a draw-level provider bound to
+that case; constant injection is off on this path so that every value the
+test sees is a function of libhegel's draws, which its replays and shrinks
+depend on. Span calls never raise on a case whose budget is spent, so
+freezing an overrun ConjectureData closes its spans cleanly.
+
+Not covered: the example database (libhegel's store is disabled and the
+reuse phase skipped), the explain phase, and Hypothesis's own runner-level
+health checks (libhegel's run instead). The discovery-ability quality tests
+construct the runner directly and honour the flag too.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ hypothesis/RELEASE.rst                        |  16 +-
+ hypothesis/src/hypothesis/core.py             |   9 +-
+ .../internal/conjecture/hegel_runner.py       | 298 ++++++++++++++++++
+ .../tests/conjecture/test_hegel_runner.py     | 150 +++++++++
+ .../tests/quality/test_discovery_ability.py   |   7 +-
+ 5 files changed, 471 insertions(+), 9 deletions(-)
+ create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
+ create mode 100644 hypothesis/tests/conjecture/test_hegel_runner.py
+
+diff --git a/hypothesis/RELEASE.rst b/hypothesis/RELEASE.rst
+index ed0fbdb9..7ce770fd 100644
+--- a/hypothesis/RELEASE.rst
++++ b/hypothesis/RELEASE.rst
+@@ -1,9 +1,11 @@
+ RELEASE_TYPE: minor
+ 
+-This release adds an experimental ``backend="hegel"`` setting, which generates
+-inputs with `libhegel <https://hegel.dev/reference/libhegel>`__, the native
+-engine behind the Hegel family of property-based testing libraries, now linked
+-into Hypothesis's native extension. Shrinking, the database, and everything else
+-stay in Python for now. This is an internal experiment towards sharing one engine
+-(:issue:`4740`), not a supported backend: it may change or disappear in any
+-release.
++This release adds two experiments towards sharing one engine with
++`libhegel <https://hegel.dev/reference/libhegel>`__, the native engine behind
++the Hegel family of property-based testing libraries, now linked into
++Hypothesis's native extension. ``backend="hegel"`` generates inputs with it
++while everything else stays in Python, and setting ``HYPOTHESIS_ENGINE=hegel``
++in the environment hands it the whole run loop, including shrinking and
++targeting, for tests on the default backend. Neither is a supported feature:
++both may change or disappear in any release, and the engine flag ignores the
++example database for now.
+diff --git a/hypothesis/src/hypothesis/core.py b/hypothesis/src/hypothesis/core.py
+index ccab311e..ba3ae825 100644
+--- a/hypothesis/src/hypothesis/core.py
++++ b/hypothesis/src/hypothesis/core.py
+@@ -86,6 +86,7 @@ from hypothesis.internal.conjecture.engine import (
+     ConjectureRunner,
+     ExitReason,
+ )
++from hypothesis.internal.conjecture.hegel_runner import hegel_engine_enabled
+ from hypothesis.internal.conjecture.junkdrawer import (
+     ensure_free_stackframes,
+     gc_cumulative_time,
+@@ -1413,7 +1414,13 @@ class StateForActualGivenExecution:
+             else:
+                 database_key = None
+ 
+-        runner = ConjectureRunner(
++        runner_cls: Any = ConjectureRunner
++        if hegel_engine_enabled() and self.settings.backend == "hypothesis":
++            # EXPERIMENT: libhegel owns the run loop; see hegel_runner.py
++            from hypothesis.internal.conjecture.hegel_runner import HegelRunner
++
++            runner_cls = HegelRunner
++        runner = runner_cls(
+             self._execute_once_for_engine,
+             settings=self.settings,
+             random=self.random,
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
+new file mode 100644
+index 00000000..610677fe
+--- /dev/null
++++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
+@@ -0,0 +1,298 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: libhegel as the engine. ``HYPOTHESIS_ENGINE=hegel`` makes
++``core.py`` drive tests with |HegelRunner| instead of |ConjectureRunner|:
++libhegel owns the run loop, generation, targeting, shrinking and the choice
++budget, while Python keeps |ConjectureData| as the shim strategies draw from,
++the test execution, interesting-origin bookkeeping and the final report.
++
++Not covered yet: the example database (libhegel's store is disabled and
++Hypothesis's reuse phase is skipped), the explain phase, and Hypothesis's own
++runner-level health checks (libhegel's equivalents run instead, mapped from
++``settings.suppress_health_check``).
++"""
++
++import math
++import os
++import time
++from collections.abc import Callable, Sequence
++from contextlib import nullcontext
++from random import Random
++from typing import Any
++
++from hypothesis._native.internal import hegel as _hegel
++from hypothesis._settings import (
++    HealthCheck,
++    Phase,
++    Verbosity,
++    local_settings,
++    settings as Settings,
++)
++from hypothesis.errors import (
++    BackendCannotProceed,
++    FailedHealthCheck,
++    HypothesisException,
++    StopTest,
++)
++from hypothesis.internal.conjecture.choice import ChoiceT, ChoiceTemplate
++from hypothesis.internal.conjecture.data import (
++    ConjectureData,
++    ConjectureResult,
++    DataObserver,
++    Status,
++)
++from hypothesis.internal.conjecture.engine import (
++    CallStats,
++    ExitReason,
++    StatisticsDict,
++)
++from hypothesis.internal.conjecture.hegel_provider import HegelProvider
++from hypothesis.internal.conjecture.junkdrawer import ensure_free_stackframes
++from hypothesis.internal.conjecture.providers import HypothesisProvider
++from hypothesis.internal.conjecture.shrinker import sort_key
++from hypothesis.internal.escalation import InterestingOrigin
++from hypothesis.reporting import base_report
++
++
++def hegel_engine_enabled() -> bool:
++    return os.environ.get("HYPOTHESIS_ENGINE") == "hegel"
++
++
++class HegelCaseProvider(HegelProvider):
++    """The draw-level provider bound to one libhegel test case the runner
++    already holds: no run of its own, no lifecycle, draws only."""
++
++    def __init__(self, engine: Any, tc: Any, generators: dict) -> None:
++        self._cd = None
++        self._engine = engine
++        self._run = None
++        self._tc = tc
++        self._span_depth = 0
++        self._drew = False
++        self._in_context = True
++        self._generators = generators
++        # No constant injection here: libhegel replays and shrinks by its own
++        # choice sequence, so every value the test sees has to be a function
++        # of libhegel's draws. (A real integration would pass constants down
++        # as forced draws instead.)
++        self._random = None
++        self.runs_started = 0
++
++    def _test_case(self) -> Any:
++        return self._tc
++
++    def _complete(self, status: int, origin: str | None = None) -> None:
++        pass
++
++    def per_test_case_context_manager(self) -> Any:
++        return nullcontext()
++
++
++_PHASES = {
++    Phase.reuse: _hegel.PHASE_REUSE,
++    Phase.generate: _hegel.PHASE_GENERATE,
++    Phase.target: _hegel.PHASE_TARGET,
++    Phase.shrink: _hegel.PHASE_SHRINK,
++}
++_HEALTH_CHECKS = {
++    HealthCheck.filter_too_much: _hegel.HC_FILTER_TOO_MUCH,
++    HealthCheck.too_slow: _hegel.HC_TOO_SLOW,
++    HealthCheck.data_too_large: _hegel.HC_TEST_CASES_TOO_LARGE,
++    HealthCheck.large_base_example: _hegel.HC_LARGE_INITIAL_TEST_CASE,
++}
++_STATUS = {
++    Status.VALID: _hegel.STATUS_VALID,
++    Status.INVALID: _hegel.STATUS_INVALID,
++    Status.OVERRUN: _hegel.STATUS_OVERRUN,
++    Status.INTERESTING: _hegel.STATUS_INTERESTING,
++}
++
++
++def _origin_key(origin: InterestingOrigin) -> str:
++    """A stable per-process string naming a failure for libhegel's grouping."""
++    return (
++        f"{origin.exc_type.__qualname__}@{origin.filename}:{origin.lineno}"
++        f"#{hash(origin) & 0xFFFFFFFF:08x}"
++    )
++
++
++class HegelRunner:
++    """The subset of |ConjectureRunner| that ``core.py`` drives, backed by a
++    libhegel run."""
++
++    def __init__(
++        self,
++        test_function: Callable[[ConjectureData], None],
++        *,
++        settings: Settings | None = None,
++        random: Random | None = None,
++        database_key: bytes | None = None,
++        ignore_limits: bool = False,
++        thread_overlap: dict[int, bool] | None = None,
++    ) -> None:
++        self._test_function = test_function
++        self.settings = settings or Settings()
++        self.random = random or Random()
++        self.database_key = database_key
++        self.ignore_limits = ignore_limits
++        self.thread_overlap = {} if thread_overlap is None else thread_overlap
++        self.call_count = 0
++        self.valid_test_cases = 0
++        self.invalid_test_cases = 0
++        self.overrun_test_cases = 0
++        self.shrinks = 0
++        self.interesting_test_cases: dict[InterestingOrigin, ConjectureResult] = {}
++        self.best_observed_targets: dict[str, float] = {}
++        self.statistics: StatisticsDict = {}
++        self.exit_reason: ExitReason | None = None
++        self.provider = HypothesisProvider
++        self._current_phase = "generate"
++        self._verified_by_backend = None
++        self._backend_found_failure = False
++        self._stats: list[CallStats] = []
++        self._generators: dict = {}
++        self._engine: Any = None
++        self.hegel_failures: list[tuple[str, str | None]] = []
++
++    # -- what core.py calls ------------------------------------------------
++
++    def run(self) -> None:
++        with local_settings(self.settings):
++            self._run()
++
++    def new_conjecture_data(
++        self,
++        prefix: Sequence[ChoiceT | ChoiceTemplate | Any],
++        *,
++        observer: DataObserver | None = None,
++        max_choices: int | None = None,
++    ) -> ConjectureData:
++        return ConjectureData(
++            prefix=prefix,
++            observer=observer or DataObserver(),
++            provider=HypothesisProvider,
++            max_choices=max_choices,
++            random=self.random,
++        )
++
++    # -- the loop ------------------------------------------------------------
++
++    def _run(self) -> None:
++        phases = 0
++        for phase, bit in _PHASES.items():
++            if phase in self.settings.phases:
++                phases |= bit
++        suppressed = 0
++        for check, bit in _HEALTH_CHECKS.items():
++            if check in self.settings.suppress_health_check:
++                suppressed |= bit
++        self._engine = _hegel.Engine(
++            self.settings.max_examples,
++            seed=self.random.getrandbits(64),
++            phases=phases,
++            report_multiple_failures=self.settings.report_multiple_bugs,
++            suppress_health_check=suppressed,
++        )
++        started = time.perf_counter()
++        run = self._engine.start_run()
++        try:
++            while (tc := run.next_test_case()) is not None:
++                self._execute(tc)
++        finally:
++            self.statistics["generate-phase"] = {
++                "duration-seconds": time.perf_counter() - started,
++                "test-cases": self._stats,
++                "distinct-failures": len(self.interesting_test_cases),
++                "shrinks-successful": self.shrinks,
++            }
++        result = run.result()
++        self.hegel_failures = [(f.origin, f.blob) for f in result.failures]
++        if result.error is not None:
++            if "health" in result.error.lower() or "filter" in result.error.lower():
++                raise FailedHealthCheck(result.error)
++            raise HypothesisException(
++                f"libhegel ended the run with an error: {result.error}"
++            )
++        if self.interesting_test_cases or self.call_count < self.settings.max_examples:
++            self.exit_reason = ExitReason.finished
++        else:
++            self.exit_reason = ExitReason.max_examples
++        self.statistics["stopped-because"] = self.exit_reason.describe(self.settings)
++        if self.best_observed_targets:
++            self.statistics["targets"] = dict(self.best_observed_targets)
++        if self.settings.verbosity >= Verbosity.debug:
++            base_report(
++                f"libhegel run complete after {self.call_count} test cases "
++                f"({self.valid_test_cases} valid) and {self.shrinks} shrinks"
++            )
++
++    def _execute(self, tc: Any) -> None:
++        provider = HegelCaseProvider(self._engine, tc, self._generators)
++        data = ConjectureData(random=self.random, provider=provider)
++        self.call_count += 1
++        try:
++            with ensure_free_stackframes():
++                try:
++                    self._test_function(data)
++                except StopTest as e:
++                    if e.testcounter != data.testcounter:
++                        raise
++        except BackendCannotProceed:
++            # the provider ran out of libhegel's choice budget mid-draw
++            data.freeze()
++            self.overrun_test_cases += 1
++            tc.mark_complete(_hegel.STATUS_OVERRUN)
++            return
++        except BaseException:
++            # a fatal error or control exception: let libhegel release the
++            # case, then let it propagate
++            tc.mark_complete(_hegel.STATUS_INVALID)
++            raise
++        data.freeze()
++        self._stats.append(
++            {
++                "status": data.status.name.lower(),
++                "runtime": data.finish_time - data.start_time,
++                "drawtime": math.fsum(data.draw_times.values()),
++                "gctime": data.gc_finish_time - data.gc_start_time,
++                "events": sorted(
++                    k if v == "" else f"{k}: {v}" for k, v in data.events.items()
++                ),
++            }
++        )
++        if data.status >= Status.VALID:
++            for label, score in data.target_observations.items():
++                if math.isfinite(score):
++                    tc.target(str(label), score)
++                self.best_observed_targets[label] = max(
++                    self.best_observed_targets.get(label, -math.inf), score
++                )
++        if data.status is Status.VALID:
++            self.valid_test_cases += 1
++        elif data.status is Status.INVALID:
++            self.invalid_test_cases += 1
++        elif data.status is Status.OVERRUN:
++            self.overrun_test_cases += 1
++        origin_key = None
++        if data.status is Status.INTERESTING:
++            origin = data.interesting_origin
++            assert origin is not None
++            origin_key = _origin_key(origin)
++            result = data.as_result()
++            assert isinstance(result, ConjectureResult)
++            existing = self.interesting_test_cases.get(origin)
++            if existing is None:
++                self.interesting_test_cases[origin] = result
++            elif sort_key(result.nodes) < sort_key(existing.nodes):
++                self.shrinks += 1
++                self.interesting_test_cases[origin] = result
++        tc.mark_complete(_STATUS[data.status], origin_key)
+diff --git a/hypothesis/tests/conjecture/test_hegel_runner.py b/hypothesis/tests/conjecture/test_hegel_runner.py
+new file mode 100644
+index 00000000..5f8d4142
+--- /dev/null
++++ b/hypothesis/tests/conjecture/test_hegel_runner.py
+@@ -0,0 +1,150 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: libhegel as the engine (``HYPOTHESIS_ENGINE=hegel``): the run
++loop, generation, shrinking and targeting are libhegel's, Hypothesis keeps
++``ConjectureData``, test execution and reporting.
++"""
++
++import pytest
++
++from hypothesis import (
++    HealthCheck,
++    Phase,
++    example,
++    given,
++    settings,
++    strategies as st,
++    target,
++)
++from hypothesis.errors import FailedHealthCheck
++from hypothesis.internal.compat import ExceptionGroup
++from hypothesis.internal.conjecture.hegel_runner import (
++    HegelRunner,
++    hegel_engine_enabled,
++)
++
++from tests.common.debug import minimal
++
++
++@pytest.fixture(autouse=True)
++def hegel_engine(monkeypatch):
++    monkeypatch.setenv("HYPOTHESIS_ENGINE", "hegel")
++    assert hegel_engine_enabled()
++
++
++def test_runner_is_selected(monkeypatch):
++    seen = []
++    original = HegelRunner.run
++
++    def spy(self):
++        seen.append(self)
++        return original(self)
++
++    monkeypatch.setattr(HegelRunner, "run", spy)
++
++    @settings(database=None, max_examples=5)
++    @given(st.integers())
++    def f(x):
++        pass
++
++    f()
++    assert len(seen) == 1
++    assert seen[0].call_count >= 1
++
++
++@pytest.mark.parametrize(
++    "strategy, condition, expected",
++    [
++        (st.lists(st.integers()), lambda x: sum(x) > 10, [11]),
++        (st.integers(), lambda x: x > 100, 101),
++        (st.text(), lambda s: len(s) >= 3, "000"),
++        (st.floats(), lambda x: x > 1.5, 2.0),
++        (st.binary(), lambda b: len(b) >= 2, b"\x00\x00"),
++        (st.lists(st.integers(), min_size=2, unique=True), lambda x: True, [0, 1]),
++    ],
++)
++def test_libhegel_shrinks_to_the_python_engines_minimum(strategy, condition, expected):
++    assert minimal(strategy, condition) == expected
++
++
++def test_reports_every_bug_when_asked():
++    @settings(database=None, report_multiple_bugs=True)
++    @given(st.integers())
++    def f(x):
++        if x > 100:
++            raise ValueError
++        if x < -100:
++            raise KeyError
++
++    with pytest.raises(ExceptionGroup) as err:
++        f()
++    assert {type(e) for e in err.value.exceptions} == {ValueError, KeyError}
++
++
++def test_filtering_everything_fails_libhegels_health_check():
++    @settings(database=None)
++    @given(st.integers().filter(lambda x: False))
++    def f(x):
++        pass
++
++    with pytest.raises(FailedHealthCheck):
++        f()
++
++
++def test_suppressed_health_check_is_passed_to_libhegel():
++    @settings(
++        database=None,
++        suppress_health_check=[HealthCheck.filter_too_much],
++        max_examples=20,
++    )
++    @given(st.integers().filter(lambda x: x % 7 == 0))
++    def f(x):
++        assert x % 7 == 0
++
++    f()
++
++
++def test_targeting_climbs():
++    best = 0
++
++    @settings(database=None, max_examples=200, deadline=None)
++    @given(st.integers(0, 10**6), st.integers(0, 10**6))
++    def f(a, b):
++        nonlocal best
++        target(float(a + b))
++        best = max(best, a + b)
++
++    f()
++    assert best > 10**6
++
++
++def test_explicit_examples_still_run_before_the_engine():
++    seen = []
++
++    @settings(database=None, phases=[Phase.explicit], max_examples=5)
++    @example(42)
++    @given(st.integers())
++    def f(x):
++        seen.append(x)
++
++    f()
++    assert seen == [42]
++
++
++def test_other_backends_keep_the_python_runner():
++    # the runner flag only applies to the default backend
++    @settings(database=None, backend="hegel", max_examples=5)
++    @given(st.integers())
++    def f(x):
++        pass
++
++    f()
+diff --git a/hypothesis/tests/quality/test_discovery_ability.py b/hypothesis/tests/quality/test_discovery_ability.py
+index 2232bda8..21ca557a 100644
+--- a/hypothesis/tests/quality/test_discovery_ability.py
++++ b/hypothesis/tests/quality/test_discovery_ability.py
+@@ -27,6 +27,10 @@ from hypothesis.control import BuildContext
+ from hypothesis.errors import UnsatisfiedAssumption
+ from hypothesis.internal import reflection
+ from hypothesis.internal.conjecture.engine import ConjectureRunner
++from hypothesis.internal.conjecture.hegel_runner import (
++    HegelRunner,
++    hegel_engine_enabled,
++)
+ from hypothesis.strategies import (
+     binary,
+     booleans,
+@@ -82,7 +86,8 @@ def define_test(specifier, predicate, condition=None, p=0.5, suppress_health_che
+             # We choose the max_examples a bit larger than default so that we
+             # run at least 100 examples outside of the small example generation
+             # part of the generation phase.
+-            runner = ConjectureRunner(
++            runner_cls = HegelRunner if hegel_engine_enabled() else ConjectureRunner
++            runner = runner_cls(
+                 test_function,
+                 settings=Settings(
+                     max_examples=150,
+-- 
+2.43.0
+

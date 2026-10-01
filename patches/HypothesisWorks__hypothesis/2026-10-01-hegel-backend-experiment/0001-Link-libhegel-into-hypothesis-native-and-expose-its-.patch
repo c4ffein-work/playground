@@ -1,7 +1,7 @@
-From 45df447f62422c2f2c1a3370aa10eea0582b3cd8 Mon Sep 17 00:00:00 2001
+From 702442d0b6b97b846ca5e6fa7a6071ef70449e32 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 29 Sep 2026 16:27:26 +0000
-Subject: [PATCH 1/2] Link libhegel into hypothesis-native and expose its C ABI
+Subject: [PATCH 1/3] Link libhegel into hypothesis-native and expose its C ABI
  to Python
 
 libhegel is the native Rust engine behind the Hegel property-based testing
@@ -21,15 +21,15 @@ threads other than the one that created them.
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
- hypothesis/rust/Cargo.lock            | 238 ++++++++-
- hypothesis/rust/Cargo.toml            |   4 +
- hypothesis/rust/src/internal/hegel.rs | 722 ++++++++++++++++++++++++++
+ hypothesis/rust/Cargo.lock            | 236 +++++++-
+ hypothesis/rust/Cargo.toml            |   6 +
+ hypothesis/rust/src/internal/hegel.rs | 811 ++++++++++++++++++++++++++
  hypothesis/rust/src/internal/mod.rs   |   3 +
- 4 files changed, 961 insertions(+), 6 deletions(-)
+ 4 files changed, 1050 insertions(+), 6 deletions(-)
  create mode 100644 hypothesis/rust/src/internal/hegel.rs
 
 diff --git a/hypothesis/rust/Cargo.lock b/hypothesis/rust/Cargo.lock
-index 79dd3ac4..8bce4bef 100644
+index 79dd3ac4..53944da0 100644
 --- a/hypothesis/rust/Cargo.lock
 +++ b/hypothesis/rust/Cargo.lock
 @@ -2,6 +2,18 @@
@@ -89,7 +89,7 @@ index 79dd3ac4..8bce4bef 100644
  [[package]]
  name = "getrandom"
  version = "0.3.4"
-@@ -37,19 +80,44 @@ dependencies = [
+@@ -37,19 +80,42 @@ dependencies = [
   "zerocopy",
  ]
  
@@ -108,8 +108,6 @@ index 79dd3ac4..8bce4bef 100644
 +[[package]]
 +name = "hegeltest-c"
 +version = "0.44.1"
-+source = "registry+https://github.com/rust-lang/crates.io-index"
-+checksum = "3c50379a7e74866dddc1dac3e8efc51f5360c66ed32bc7294c8891193ffdb5e1"
 +dependencies = [
 + "dashu-int",
 + "hashbrown",
@@ -135,7 +133,7 @@ index 79dd3ac4..8bce4bef 100644
  ]
  
  [[package]]
-@@ -58,6 +126,33 @@ version = "0.2.186"
+@@ -58,6 +124,33 @@ version = "0.2.186"
  source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
  
@@ -169,7 +167,7 @@ index 79dd3ac4..8bce4bef 100644
  [[package]]
  name = "once_cell"
  version = "1.21.4"
-@@ -130,7 +225,7 @@ dependencies = [
+@@ -130,7 +223,7 @@ dependencies = [
   "proc-macro2",
   "pyo3-macros-backend",
   "quote",
@@ -178,7 +176,7 @@ index 79dd3ac4..8bce4bef 100644
  ]
  
  [[package]]
-@@ -142,7 +237,7 @@ dependencies = [
+@@ -142,7 +235,7 @@ dependencies = [
   "heck",
   "proc-macro2",
   "quote",
@@ -187,7 +185,7 @@ index 79dd3ac4..8bce4bef 100644
  ]
  
  [[package]]
-@@ -167,7 +262,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -167,7 +260,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
  dependencies = [
   "rand_chacha",
@@ -205,7 +203,7 @@ index 79dd3ac4..8bce4bef 100644
  ]
  
  [[package]]
-@@ -177,7 +281,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -177,7 +279,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
  dependencies = [
   "ppv-lite86",
@@ -214,7 +212,7 @@ index 79dd3ac4..8bce4bef 100644
  ]
  
  [[package]]
-@@ -189,6 +293,66 @@ dependencies = [
+@@ -189,6 +291,66 @@ dependencies = [
   "getrandom",
  ]
  
@@ -281,7 +279,7 @@ index 79dd3ac4..8bce4bef 100644
  [[package]]
  name = "syn"
  version = "2.0.118"
-@@ -200,12 +364,53 @@ dependencies = [
+@@ -200,12 +362,53 @@ dependencies = [
   "unicode-ident",
  ]
  
@@ -335,7 +333,7 @@ index 79dd3ac4..8bce4bef 100644
  [[package]]
  name = "unicode-ident"
  version = "1.0.24"
-@@ -221,6 +426,27 @@ dependencies = [
+@@ -221,6 +424,27 @@ dependencies = [
   "wit-bindgen",
  ]
  
@@ -363,7 +361,7 @@ index 79dd3ac4..8bce4bef 100644
  [[package]]
  name = "wit-bindgen"
  version = "0.57.1"
-@@ -244,5 +470,5 @@ checksum = "4714fd92cf900833d49538023a9b3915155210801d1c1169eba513b2addefd71"
+@@ -244,5 +468,5 @@ checksum = "4714fd92cf900833d49538023a9b3915155210801d1c1169eba513b2addefd71"
  dependencies = [
   "proc-macro2",
   "quote",
@@ -371,26 +369,28 @@ index 79dd3ac4..8bce4bef 100644
 + "syn 2.0.118",
  ]
 diff --git a/hypothesis/rust/Cargo.toml b/hypothesis/rust/Cargo.toml
-index f67c9db4..255537ad 100644
+index f67c9db4..c640b4c4 100644
 --- a/hypothesis/rust/Cargo.toml
 +++ b/hypothesis/rust/Cargo.toml
-@@ -10,6 +10,10 @@ crate-type = ["cdylib"]
+@@ -10,6 +10,12 @@ crate-type = ["cdylib"]
  
  [dependencies]
  pyo3 = "0.29.2"
 +# EXPERIMENT: libhegel, Hegel's native property-based testing engine, linked
 +# statically and driven through its C ABI (the hegel_* extern "C" functions)
 +# from src/internal/hegel.rs.
-+hegeltest-c = { version = "=0.44.1", default-features = false, features = ["std"] }
++# Pinned to the local fork carrying the engine additions Hypothesis needs
++# (weighted integers, NaN with finite bounds, codepoint-range alphabets).
++hegeltest-c = { path = "../../../hegel-rust/hegel-c", default-features = false, features = ["std"] }
  
  [features]
  abi3 = ["pyo3/abi3-py310"]
 diff --git a/hypothesis/rust/src/internal/hegel.rs b/hypothesis/rust/src/internal/hegel.rs
 new file mode 100644
-index 00000000..16f67c58
+index 00000000..cd7992ff
 --- /dev/null
 +++ b/hypothesis/rust/src/internal/hegel.rs
-@@ -0,0 +1,722 @@
+@@ -0,0 +1,811 @@
 +// This file is part of Hypothesis, which may be found at
 +// https://github.com/HypothesisWorks/hypothesis/
 +//
@@ -503,10 +503,15 @@ index 00000000..16f67c58
 +pub(crate) const PHASE_TARGET: u32 = sys::hegel_phase_t::HEGEL_PHASE_TARGET as u32;
 +pub(crate) const PHASE_SHRINK: u32 = sys::hegel_phase_t::HEGEL_PHASE_SHRINK as u32;
 +
-+const ALL_HEALTH_CHECKS: u32 = sys::hegel_health_check_t::HEGEL_HC_FILTER_TOO_MUCH as u32
-+    | sys::hegel_health_check_t::HEGEL_HC_TOO_SLOW as u32
-+    | sys::hegel_health_check_t::HEGEL_HC_TEST_CASES_TOO_LARGE as u32
-+    | sys::hegel_health_check_t::HEGEL_HC_LARGE_INITIAL_TEST_CASE as u32;
++pub(crate) const HC_FILTER_TOO_MUCH: u32 =
++    sys::hegel_health_check_t::HEGEL_HC_FILTER_TOO_MUCH as u32;
++pub(crate) const HC_TOO_SLOW: u32 = sys::hegel_health_check_t::HEGEL_HC_TOO_SLOW as u32;
++pub(crate) const HC_TEST_CASES_TOO_LARGE: u32 =
++    sys::hegel_health_check_t::HEGEL_HC_TEST_CASES_TOO_LARGE as u32;
++pub(crate) const HC_LARGE_INITIAL_TEST_CASE: u32 =
++    sys::hegel_health_check_t::HEGEL_HC_LARGE_INITIAL_TEST_CASE as u32;
++const ALL_HEALTH_CHECKS: u32 =
++    HC_FILTER_TOO_MUCH | HC_TOO_SLOW | HC_TEST_CASES_TOO_LARGE | HC_LARGE_INITIAL_TEST_CASE;
 +
 +/// Turn a `hegel_result_t` into a Python exception, reading the context's
 +/// last error message for the detail.
@@ -546,16 +551,19 @@ index 00000000..16f67c58
 +#[pymethods]
 +impl Engine {
 +    /// `max_examples` bounds libhegel's generate phase (`test_cases`).
-+    /// `phases` is a bitwise OR of the `PHASE_*` constants. Health checks
-+    /// are always suppressed and the example database always disabled:
-+    /// Hypothesis owns both.
++    /// `phases` is a bitwise OR of the `PHASE_*` constants and
++    /// `suppress_health_check` of the `HC_*` constants (all by default: a
++    /// draw-level backend leaves health checks to Hypothesis). The example
++    /// database is always disabled.
 +    #[new]
-+    #[pyo3(signature = (max_examples, *, seed=None, phases=PHASE_GENERATE, unbounded_choices=false))]
++    #[pyo3(signature = (max_examples, *, seed=None, phases=PHASE_GENERATE, unbounded_choices=false, report_multiple_failures=false, suppress_health_check=ALL_HEALTH_CHECKS))]
 +    fn new(
 +        max_examples: u64,
 +        seed: Option<u64>,
 +        phases: u32,
 +        unbounded_choices: bool,
++        report_multiple_failures: bool,
++        suppress_health_check: u32,
 +    ) -> PyResult<Self> {
 +        // SAFETY: plain constructor calls; every handle is checked below and
 +        // freed in Drop.
@@ -586,12 +594,16 @@ index 00000000..16f67c58
 +            )?;
 +            check(
 +                ctx,
-+                sys::hegel_settings_set_suppress_health_check(ctx, settings, ALL_HEALTH_CHECKS),
++                sys::hegel_settings_set_suppress_health_check(ctx, settings, suppress_health_check),
 +                "set_suppress_health_check",
 +            )?;
 +            check(
 +                ctx,
-+                sys::hegel_settings_set_report_multiple_failures(ctx, settings, false),
++                sys::hegel_settings_set_report_multiple_failures(
++                    ctx,
++                    settings,
++                    report_multiple_failures,
++                ),
 +                "set_rmf",
 +            )?;
 +            check(
@@ -669,6 +681,34 @@ index 00000000..16f67c58
 +            tc,
 +            complete: false,
 +        })
++    }
++
++    /// A text generator over an explicit alphabet: sorted, disjoint,
++    /// inclusive codepoint ranges, exactly as Hypothesis's `IntervalSet`
++    /// holds them (surrogates removed by libhegel).
++    fn text_generator_ranges(
++        slf: Py<Engine>,
++        py: Python<'_>,
++        min_size: u64,
++        max_size: u64,
++        ranges: Vec<(u32, u32)>,
++    ) -> PyResult<StringGenerator> {
++        let ctx = slf.borrow(py).ctx;
++        let flat: Vec<u32> = ranges.iter().flat_map(|&(lo, hi)| [lo, hi]).collect();
++        let mut gen: *mut sys::HegelStringGenerator = std::ptr::null_mut();
++        // SAFETY: flat outlives the call; libhegel copies the ranges.
++        let r = unsafe {
++            sys::hegel_string_generator_text_ranges(
++                ctx,
++                min_size,
++                max_size,
++                flat.as_ptr(),
++                ranges.len(),
++                &mut gen,
++            )
++        };
++        check(ctx, r, "string_generator_text_ranges")?;
++        Ok(StringGenerator { engine: slf, gen })
 +    }
 +
 +    /// A text generator over the codepoint range `[min_codepoint, max_codepoint]`
@@ -872,6 +912,38 @@ index 00000000..16f67c58
 +        Ok(out)
 +    }
 +
++    /// `keys[i]` is drawn with probability `weights[i]`; the remaining mass
++    /// is drawn like `draw_integer`. One integer choice either way.
++    fn draw_integer_weighted(
++        &self,
++        py: Python<'_>,
++        min_value: i64,
++        max_value: i64,
++        keys: Vec<i64>,
++        weights: Vec<f64>,
++    ) -> PyResult<i64> {
++        let ctx = self.ctx(py);
++        if keys.len() != weights.len() {
++            return Err(HegelError::new_err("keys and weights differ in length"));
++        }
++        let mut out: i64 = 0;
++        // SAFETY: tc is live until Drop; the slices outlive the call.
++        let r = unsafe {
++            sys::hegel_generate_integer_weighted(
++                ctx,
++                self.tc,
++                min_value,
++                max_value,
++                keys.as_ptr(),
++                weights.as_ptr(),
++                keys.len(),
++                &mut out,
++            )
++        };
++        check(ctx, r, "generate_integer_weighted")?;
++        Ok(out)
++    }
++
 +    /// Bounds and result as two's-complement little-endian bytes, for
 +    /// values outside the `int64` range (`int.to_bytes(..., "little", signed=True)`).
 +    fn draw_integer_big<'py>(
@@ -1013,6 +1085,16 @@ index 00000000..16f67c58
 +        })
 +    }
 +
++    /// A targeting observation: libhegel steers later cases toward higher
++    /// values of `label` (needs `PHASE_TARGET`). Finite `value` only.
++    fn target(&self, py: Python<'_>, label: &str, value: f64) -> PyResult<()> {
++        let ctx = self.ctx(py);
++        let label = CString::new(label).map_err(|_| HegelError::new_err("label contains NUL"))?;
++        // SAFETY: tc is live until Drop; label outlives the call.
++        let r = unsafe { sys::hegel_target(ctx, self.tc, value, label.as_ptr()) };
++        check(ctx, r, "target")
++    }
++
 +    fn start_span(&self, py: Python<'_>, label: u64) -> PyResult<()> {
 +        let ctx = self.ctx(py);
 +        // SAFETY: tc is live until Drop.
@@ -1110,6 +1192,13 @@ index 00000000..16f67c58
 +        m.add("PHASE_GENERATE", super::PHASE_GENERATE)?;
 +        m.add("PHASE_TARGET", super::PHASE_TARGET)?;
 +        m.add("PHASE_SHRINK", super::PHASE_SHRINK)?;
++        m.add("HC_FILTER_TOO_MUCH", super::HC_FILTER_TOO_MUCH)?;
++        m.add("HC_TOO_SLOW", super::HC_TOO_SLOW)?;
++        m.add("HC_TEST_CASES_TOO_LARGE", super::HC_TEST_CASES_TOO_LARGE)?;
++        m.add(
++            "HC_LARGE_INITIAL_TEST_CASE",
++            super::HC_LARGE_INITIAL_TEST_CASE,
++        )?;
 +        Ok(())
 +    }
 +}

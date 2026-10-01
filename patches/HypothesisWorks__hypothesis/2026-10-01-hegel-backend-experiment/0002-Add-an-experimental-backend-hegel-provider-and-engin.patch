@@ -1,7 +1,7 @@
-From 7bcbed552b8b3a373c531f27c5d3843812924018 Mon Sep 17 00:00:00 2001
+From 0ce95953378cda5ef73d9cb8def39b50209fb408 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 29 Sep 2026 16:27:26 +0000
-Subject: [PATCH 2/2] Add an experimental backend="hegel" provider and
+Subject: [PATCH 2/3] Add an experimental backend="hegel" provider and
  engine-equivalence tests
 
 settings(backend="hegel") routes every generate-phase draw to libhegel while
@@ -33,10 +33,10 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
  hypothesis/RELEASE.rst                        |   9 +
- .../internal/conjecture/hegel_provider.py     | 419 ++++++++++++++++++
+ .../internal/conjecture/hegel_provider.py     | 379 ++++++++++++++++++
  .../internal/conjecture/providers.py          |   2 +
- .../tests/conjecture/test_hegel_provider.py   | 184 ++++++++
- 4 files changed, 614 insertions(+)
+ .../tests/conjecture/test_hegel_provider.py   | 205 ++++++++++
+ 4 files changed, 595 insertions(+)
  create mode 100644 hypothesis/RELEASE.rst
  create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
  create mode 100644 hypothesis/tests/conjecture/test_hegel_provider.py
@@ -58,10 +58,10 @@ index 00000000..ed0fbdb9
 +release.
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
 new file mode 100644
-index 00000000..c0ab3c7b
+index 00000000..03321254
 --- /dev/null
 +++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,379 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -90,7 +90,6 @@ index 00000000..c0ab3c7b
 +
 +import base64
 +import contextlib
-+import itertools
 +import math
 +import random
 +import struct
@@ -123,9 +122,6 @@ index 00000000..c0ab3c7b
 +# libhegel's generate-phase budget per run. Hypothesis decides when a test
 +# function is done; when libhegel's budget runs out we simply start a new run.
 +RUN_TEST_CASES = 10**9
-+# Alphabets with at most this many characters (or gaps) are handed to
-+# libhegel's text generator as an explicit character list.
-+SMALL_ALPHABET = 256
 +SURROGATES = (0xD800, 0xDFFF)
 +
 +
@@ -140,22 +136,8 @@ index 00000000..c0ab3c7b
 +    return n.to_bytes(n.bit_length() // 8 + 1, "little", signed=True)
 +
 +
-+def _merge_surrogate_gap(intervals: IntervalSet) -> list[tuple[int, int]]:
-+    """libhegel always removes surrogates from a text alphabet, so two
-+    intervals separated by exactly the surrogate block are one range to it."""
-+    merged: list[tuple[int, int]] = []
-+    for lo, hi in intervals.intervals:
-+        if merged and merged[-1][1] == SURROGATES[0] - 1 and lo == SURROGATES[1] + 1:
-+            merged[-1] = (merged[-1][0], hi)
-+        else:
-+            merged.append((lo, hi))
-+    return merged
-+
-+
-+def _contains_surrogates(intervals: IntervalSet) -> bool:
-+    return any(
-+        lo <= SURROGATES[1] and hi >= SURROGATES[0] for lo, hi in intervals.intervals
-+    )
++def _is_surrogate_range(lo: int, hi: int) -> bool:
++    return SURROGATES[0] <= lo and hi <= SURROGATES[1]
 +
 +
 +class HegelProvider(PrimitiveProvider):
@@ -276,13 +258,11 @@ index 00000000..c0ab3c7b
 +        weights: dict[int, float] | None = None,
 +        shrink_towards: int = 0,
 +    ) -> int:
-+        """libhegel has neither unbounded nor weighted integer draws.
-+
-+        Unbounded and half-bounded ranges are clamped the way
-+        HypothesisProvider clamps them (2**128 around the bound / origin).
-+        Weights are emulated as HypothesisProvider does, with one deviation:
-+        the weighted keys are picked uniformly rather than by their relative
-+        weight. Every result is still permitted by the constraints.
++        """libhegel has no unbounded integer draw: unbounded and half-bounded
++        ranges are clamped the way HypothesisProvider clamps them (2**128
++        around the bound / origin). Weights go to libhegel's weighted draw
++        when the bounds fit int64; past that they are emulated as
++        HypothesisProvider does, with the keys picked uniformly.
 +        """
 +        constraints = {
 +            "min_value": min_value,
@@ -295,6 +275,11 @@ index 00000000..c0ab3c7b
 +        if weights is not None:
 +            assert min_value is not None
 +            assert max_value is not None
++            if INT64_MIN <= min_value and max_value <= INT64_MAX:
++                keys, ws = list(weights), list(weights.values())
++                return self._draw(
++                    lambda tc: tc.draw_integer_weighted(min_value, max_value, keys, ws)
++                )
 +            if self.draw_boolean(sum(weights.values())):
 +                keys = list(weights)
 +                return keys[self._draw_bounded_integer(0, len(keys) - 1)]
@@ -333,9 +318,7 @@ index 00000000..c0ab3c7b
 +            lambda tc: tc.draw_float(
 +                min_value=min_value,
 +                max_value=max_value,
-+                # libhegel refuses NaN alongside a finite bound; Hypothesis
-+                # permits it. Bounded-with-NaN draws never produce NaN here.
-+                allow_nan=allow_nan and math.isinf(min_value) and math.isinf(max_value),
++                allow_nan=allow_nan,
 +                # Hypothesis says "infinity allowed" through an infinite bound;
 +                # libhegel wants the flag too, and rejects it with finite bounds.
 +                allow_infinity=math.isinf(min_value) or math.isinf(max_value),
@@ -346,42 +329,17 @@ index 00000000..c0ab3c7b
 +    def _text_generator(
 +        self, intervals: IntervalSet, min_size: int, max_size: int
 +    ) -> Any:
-+        """A libhegel text generator for ``intervals``, or None when the
-+        alphabet cannot be expressed as a codepoint range plus a small
-+        include / exclude list."""
++        """A libhegel text generator over exactly ``intervals`` (libhegel
++        drops surrogates), or None when the alphabet is nothing but
++        surrogates, which only the per-character fallback can draw."""
 +        key = (intervals, min_size, max_size)
 +        if key in self._generators:
 +            return self._generators[key]
 +        gen = None
-+        ranges = _merge_surrogate_gap(intervals)
-+        if not _contains_surrogates(intervals):
-+            if len(ranges) == 1:
-+                ((lo, hi),) = ranges
-+                gen = self._engine.text_generator(
-+                    min_size, max_size, min_codepoint=lo, max_codepoint=hi
-+                )
-+            elif len(intervals) <= SMALL_ALPHABET:
-+                gen = self._engine.text_generator(
-+                    min_size,
-+                    max_size,
-+                    include="".join(map(chr, intervals)),
-+                    empty_alphabet=True,
-+                )
-+            else:
-+                lo, hi = ranges[0][0], ranges[-1][1]
-+                gaps = [
-+                    chr(cp)
-+                    for (_, a), (b, _) in itertools.pairwise(ranges)
-+                    for cp in range(a + 1, b)
-+                ]
-+                if len(gaps) <= SMALL_ALPHABET:
-+                    gen = self._engine.text_generator(
-+                        min_size,
-+                        max_size,
-+                        min_codepoint=lo,
-+                        max_codepoint=hi,
-+                        exclude="".join(gaps),
-+                    )
++        if any(not _is_surrogate_range(lo, hi) for lo, hi in intervals.intervals):
++            gen = self._engine.text_generator_ranges(
++                min_size, max_size, list(intervals.intervals)
++            )
 +        self._generators[key] = gen
 +        return gen
 +
@@ -392,11 +350,10 @@ index 00000000..c0ab3c7b
 +        min_size: int = 0,
 +        max_size: int = COLLECTION_DEFAULT_MAX_SIZE,
 +    ) -> str:
-+        """Alphabets expressible as a libhegel text generator are drawn as one
-+        libhegel string choice. Others (many disjoint ranges, or surrogates)
-+        fall back to libhegel's collection sizing plus one character index per
-+        element, picked as HypothesisProvider picks them (from its own PRNG,
-+        not the choice sequence: the string is one choice either way)."""
++        """One libhegel string choice over the exact alphabet. An alphabet of
++        nothing but surrogates (which libhegel cannot hold in a string) falls
++        back to libhegel's collection sizing plus one character index per
++        element, picked as HypothesisProvider picks them."""
 +        if len(intervals) == 0:
 +            return ""
 +        constraints = {
@@ -450,14 +407,17 @@ index 00000000..c0ab3c7b
 +            # takes as an exhausted search space and ends the run on.
 +            return
 +        self._span_depth += 1
-+        self._draw(lambda tc: tc.start_span(label & LABEL_MASK))
++        with contextlib.suppress(BackendCannotProceed):
++            self._draw(lambda tc: tc.start_span(label & LABEL_MASK))
 +
 +    def span_end(self, discard: bool, /) -> None:
-+        # Closing a discarded span can spend choice budget too (libhegel
-+        # retries from before the span), so it gets the same error mapping.
++        # A span call on a case whose budget is spent (a discarded span's
++        # retry, or spans closed while freezing an overrun case) reports
++        # the exhaustion too; the next draw raises it, a span never does.
 +        if self._span_depth > 0:
 +            self._span_depth -= 1
-+            self._draw(lambda tc: tc.stop_span(discard))
++            with contextlib.suppress(BackendCannotProceed):
++                self._draw(lambda tc: tc.stop_span(discard))
 +
 +
 +def encode_choices(choices: list[ChoiceT]) -> str:
@@ -496,10 +456,10 @@ index d84ecece..1b944018 100644
  CacheKeyT: TypeAlias = tuple[ChoiceTypeT, tuple[Any, ...]]
 diff --git a/hypothesis/tests/conjecture/test_hegel_provider.py b/hypothesis/tests/conjecture/test_hegel_provider.py
 new file mode 100644
-index 00000000..ccff4529
+index 00000000..5165f44b
 --- /dev/null
 +++ b/hypothesis/tests/conjecture/test_hegel_provider.py
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,205 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -626,33 +586,54 @@ index 00000000..ccff4529
 +
 +
 +@st.composite
++def integer_weights(draw, lo, hi):
++    """A Hypothesis ``weights`` mapping over ``[lo, hi]``: a few keys whose
++    probabilities sum to strictly less than one."""
++    keys = draw(st.lists(st.integers(lo, hi), min_size=1, max_size=4, unique=True))
++    raw = draw(st.lists(st.floats(0.01, 1), min_size=len(keys), max_size=len(keys)))
++    total = draw(st.floats(0.05, 0.9))
++    return {k: w / sum(raw) * total for k, w in zip(keys, raw, strict=True)}
++
++
++@st.composite
 +def direct_nodes(draw):
 +    """Choice nodes whose draw maps one-to-one onto a libhegel primitive:
-+    integers without weights, booleans, floats, bytes, and strings over a
-+    single surrogate-free codepoint range."""
++    every kind of choice, with weights (within int64 bounds, where
++    libhegel's weighted draw applies), NaN alongside finite bounds, and
++    multi-range alphabets (any character that is not a surrogate, which a
++    libhegel string cannot hold)."""
 +    kind = draw(st.sampled_from(["integer", "boolean", "float", "bytes", "string"]))
 +    if kind == "integer":
 +        lo = draw(st.none() | st.integers(-(2**70), 2**70))
 +        hi = draw(st.none() | st.integers(lo if lo is not None else -(2**70), 2**70))
-+        constraints = integer_constr(lo, hi)
++        weights = None
++        if lo is not None and hi is not None and -(2**63) <= lo and hi < 2**63:
++            weights = draw(st.none() | integer_weights(lo, hi))
++        constraints = integer_constr(lo, hi, weights=weights)
 +    elif kind == "boolean":
 +        constraints = {"p": draw(st.floats(0, 1))}
 +    elif kind == "float":
 +        lo = draw(st.floats(allow_nan=False))
 +        hi = draw(st.floats(min_value=lo, allow_nan=False))
-+        # Known difference: Hypothesis permits NaN with finite bounds, libhegel
-+        # does not, so the provider only allows NaN on unbounded draws.
-+        allow_nan = draw(st.booleans()) and (math.isinf(lo) or math.isinf(hi))
-+        constraints = float_constr(lo, hi, allow_nan=allow_nan)
++        constraints = float_constr(lo, hi, allow_nan=draw(st.booleans()))
 +    elif kind == "bytes":
 +        lo = draw(st.integers(0, 10))
 +        constraints = {"min_size": lo, "max_size": draw(st.integers(lo, 20))}
 +    else:
-+        lo = draw(st.integers(0, 0xD7FF))
-+        hi = draw(st.integers(lo, 0xD7FF))
++        # Ranges never straddle the surrogate block: a lone surrogate is a
++        # valid Hypothesis string character but libhegel drops it.
++        low = sorted(draw(st.sets(st.integers(0, 0xD7FF), max_size=6)))
++        high = sorted(draw(st.sets(st.integers(0xE000, 0x10FFFF), max_size=6)))
++        ranges = [
++            (a, b)
++            for side in (low, high)
++            for a, b in zip(side[::2], side[1::2], strict=False)
++        ]
++        if not ranges:
++            ranges = [(97, 122)]
 +        size = draw(st.integers(0, 10))
 +        constraints = string_constr(
-+            IntervalSet([(lo, hi)]),
++            IntervalSet(ranges),
 +            min_size=size,
 +            max_size=draw(st.integers(size, 20)),
 +        )
