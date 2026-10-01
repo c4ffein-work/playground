@@ -1,193 +1,185 @@
-# Hypothesis on libhegel: the draw-level experiment
+# Hypothesis on libhegel: from a draw-level backend to a runner-level engine
 
-Session notes for the two-patch series in this directory (cut against
-Hypothesis master 44b82b24, v6.168.3, with libhegel / hegeltest-c 0.44.1).
-The question was: can Hypothesis's Python-to-Rust engine migration
-(HypothesisWorks/hypothesis issue #4740) be solved by consuming Hegel's
-native engine instead of porting module by module, and how would one check
-equivalence? This is the cheapest real step: libhegel linked into
-`hypothesis._native`, exposed as `settings(backend="hegel")`, and measured.
+Session notes for two patch series: this one against Hypothesis master
+(44b82b24, v6.168.3) and `patches/hegeldev__hegel-rust/2026-10-01-hypothesis-needs`
+against hegel-rust main (ebfd9d53, hegeltest 0.48.1 / libhegel 0.44.1).
+The question was whether Hypothesis's Python-to-Rust engine migration
+(HypothesisWorks/hypothesis issue #4740) can be solved by consuming Hegel's
+native engine, and how to check equivalence. Two rounds:
 
-## What the patches do
+1. **Draw level** (2026-09-29): libhegel linked into `hypothesis._native`
+   and exposed as `settings(backend="hegel")`; Hypothesis keeps the loop.
+2. **Engine level** (2026-10-01): three additions to libhegel itself, then
+   `HYPOTHESIS_ENGINE=hegel` hands libhegel the whole run loop (generation,
+   shrinking, targeting, the choice budget) while Python keeps
+   `ConjectureData`, test execution and reporting.
 
-1. **Link libhegel into hypothesis-native.** `hegeltest-c` (the crate behind
-   the `libhegel` shared library) is a normal Rust dependency of the PyO3
-   extension, statically linked, and driven through its `hegel_*` C ABI
-   functions from Rust, exactly as hegel-rust's `static-engine` mode does.
-   `hypothesis._native.internal.hegel` wraps Engine (context + settings),
-   Run (`next_test_case`), TestCase (typed draws, spans, collection sizing,
-   `mark_complete`), StringGenerator, run results with reproduce blobs, and
-   `test_case_from_blob` for replay. No ctypes, no per-draw marshalling
-   beyond the Python call itself.
-2. **`backend="hegel"`.** A `PrimitiveProvider` whose `draw_*` go to
-   libhegel's generate phase. Hypothesis keeps the run loop, database,
-   health checks and shrinking (shrinking replays the recorded choices
-   through the Python provider, as for any alternative backend). libhegel
-   runs with only its generate phase enabled, a huge `test_cases` budget,
-   no database and all health checks suppressed. Plus an equivalence test
-   file and a `RELEASE.rst` (minor) in case anyone wants to upstream it.
+## The patches
 
-To try it: apply the series (`scripts/apply-patch.sh`), then in
-`hypothesis/` run `maturin develop` (or `pip install -e hypothesis/`,
-which needs cargo and crates.io) and use `settings(backend="hegel")` or
-`HYPOTHESIS_PROFILE=hegel` for the test suite.
+hegel-rust, one commit:
 
-## Equivalence checks that now exist
+- `hegel_generate_integer_weighted(min, max, shrink_towards, keys, weights)`:
+  one plain integer choice whose fresh draws take `keys[i]` with probability
+  `weights[i]` and shrink toward `shrink_towards`. Replay and shrinking never
+  consult the weights. (HypothesisProvider's `weights` and `shrink_towards`;
+  the existing `hegel_generate_integer` always shrinks toward 0.)
+- `allow_nan` alongside finite float bounds is accepted: NaN comes with the
+  usual NaN probability, in-range values otherwise (Hypothesis's rule).
+- `hegel_string_generator_text_ranges`: an alphabet given as explicit sorted,
+  disjoint codepoint ranges, i.e. Hypothesis's `IntervalSet` as it is.
+- Header and frontend FFI list regenerated; C ABI tests for the three.
 
-| Check | Result |
-|---|---|
-| Provider contract: every libhegel draw is permitted by the Hypothesis constraints (`tests/conjecture/test_hegel_provider.py`, stressed to 3000 sequences) | passes, 0 overruns |
-| Replay semantics: a Hypothesis choice sequence encoded as a libhegel reproduce blob (base64 of `0x00` + `serialize_choices`) replays through libhegel value for value for the same draw calls (3000 sequences, ~19.6k draws over integers, booleans, floats, bytes, single-range strings) | passes |
-| NaN, -0.0, inf round-trip through a blob | passes |
-| Pipeline: `minimal()` reaches the same minimal example as the Python engine for lists, integers, text, floats, bytes | passes |
-| Hypothesis `tests/cover` (about 4000 tests) with `HYPOTHESIS_PROFILE=hegel` | 3971 passed, 13 failed (was 22 before the fixes below) |
-| Hypothesis `tests/quality` under the hegel backend | 254 passed, 15 failed; see the section at the end |
+Hypothesis, three commits:
 
-The replay result is the one that matters for the migration: the two
-engines agree on what a choice sequence means, so databases and
-`reproduce_failure` blobs would be portable across a runner swap.
+1. Link `hegeltest-c` (a path dependency on the fork) into the PyO3 extension
+   and expose the pieces of its C ABI a runner needs: engine and settings
+   (phases, health checks, seed, multiple failures, nondeterminism
+   strictness), the run loop, typed draws including the new ones, spans,
+   collection sizing, targeting, completion, results with blobs, blob replay.
+2. `backend="hegel"`: a `PrimitiveProvider` whose `draw_*` go to libhegel,
+   now one-to-one with the new primitives. Replay-equivalence tests.
+3. `HYPOTHESIS_ENGINE=hegel`: `core.py` builds a `HegelRunner` instead of
+   `ConjectureRunner` for tests on the default backend. It implements what
+   `core.py` reads (counters, interesting cases, statistics, exit reason,
+   `new_conjecture_data`), maps settings onto libhegel's, executes each
+   libhegel case through the draw-level provider bound to that case, and
+   translates libhegel's run errors (exhausted space, health checks, a
+   nondeterministic test) into Hypothesis's `Unsatisfiable`,
+   `FailedHealthCheck` and `FlakyFailure`.
 
-## Where the two engines differ (found by the tests)
+To try: apply both series (`scripts/apply-patch.sh`), build hegel-rust's
+`hegel-c` once (the Hypothesis crate points at it by path), `maturin develop`
+in `hypothesis/`, then `settings(backend="hegel")`, `HYPOTHESIS_PROFILE=hegel`
+for the suite, or `HYPOTHESIS_ENGINE=hegel` for the engine flag.
 
-Vocabulary differences, all mapped in the provider and documented on it:
+## Equivalence checks
 
-- libhegel has no unbounded or half-bounded integer draw. The provider
-  clamps to 2**128 around the bound or origin, as HypothesisProvider does.
-- libhegel has no weighted integer draw. Emulated with a boolean plus an
-  index; the weighted keys are picked uniformly, not by relative weight.
-- libhegel wants `allow_infinity` spelled out and rejects it with finite
-  bounds; Hypothesis expresses it only through an infinite bound.
-- libhegel refuses `allow_nan` together with a finite bound; Hypothesis
-  permits NaN regardless of bounds. Bounded-with-NaN draws never produce
-  NaN under the hegel backend.
-- libhegel's text generator takes a codepoint range, categories and
-  include / exclude character lists, not an arbitrary interval set. Single
-  ranges, ranges split only by the surrogate block, and sets with at most
-  256 characters or gaps map directly; anything else (735-range `\W`
-  classes, surrogates) falls back to libhegel's collection sizing plus one
-  character index per element.
-- `hegel_stop_span` on a discarded span can spend choice budget and return
-  `HEGEL_E_STOP_TEST`; a provider has to treat span calls like draws.
-- Constant injection (5% of integer / string / bytes draws and 15% of float
-  draws come from a pool mined from the user's source) is a frontend
-  feature, not an engine one. Without it the datetimes tests could not find
-  the 2038 rollover; the provider now does it in Python with a private PRNG.
-- Hypothesis's `derandomize` / `seed` do not reach libhegel; only that PRNG
-  is fixed. A real integration would pass the seed through.
-- PyO3 `unsendable` wrappers break under Hypothesis's threading tests,
-  which drop providers from other threads; the wrappers are `Send + Sync`
-  on the strength of libhegel's internal locking plus the GIL.
-- A provider with `test_function` lifetime only learns about test-case
-  boundaries from `per_test_case_context_manager`, which `core.py` calls
-  but a directly driven `ConjectureRunner` (all of `tests/quality`) never
-  does. Without a boundary every Hypothesis test case kept drawing from one
-  never-completed libhegel case, and the whole quality suite failed. The
-  provider now takes the first top-level span after draws as the next case
-  when it is outside the context manager. Related: a choice-less completed
-  case makes libhegel end the run as an exhausted search space, so spans
-  are only forwarded once a case has drawn.
+| Check | Draw level | Engine level |
+|---|---|---|
+| Provider contract: every libhegel draw permitted by its constraints (3000 random sequences) | passes | same provider |
+| Replay: a Hypothesis choice sequence encoded as a libhegel blob replays through libhegel value for value, now for every kind of choice: weights, NaN with finite bounds, multi-range alphabets (3000 sequences, ~17k draws, 383 weighted, 1724 bounded-NaN, 2241 multi-range strings) | passes | same |
+| `minimal()` reaches the Python engine's minimum for lists, integers, text, floats, bytes, unique lists | passes (Hypothesis shrinks) | passes (libhegel shrinks) |
+| `tests/cover` (3985 tests) | 3967 passed, 17 failed | 3938 passed, 46 failed |
+| `tests/quality` | 254 passed, 15 failed | 240 passed, 30 failed |
 
-Distribution differences (generation only, 2000 examples each, derandomized;
-these are libhegel's choices, not mapping artefacts, except the unbounded
-integer row which is the 2**128 clamp meeting libhegel's bounded draw):
+The replay result is the one that makes an engine swap checkable: both
+engines agree on what a choice sequence means, so databases and reproduce
+blobs are portable across them, and the quality suite can compare shrinkers
+on equal terms.
 
-| strategy | statistic | hypothesis | hegel |
-|---|---|---|---|
-| integers() | == 0 | 0.1% | 6.0% |
-| integers() | abs > 2**32 | 21.9% | 71.3% |
-| integers(0, 10**6) | <= 10 | 0.5% | 15.7% |
-| floats() | == 0 | 0.1% | 14.8% |
-| floats() | finite, abs <= 1e3 | 25.5% | 52.8% |
-| floats(0, 1) | == 0 / == 1 | 0.1% / 0.1% | 14.7% / 4.2% |
-| text() | empty | 0.1% | 13.3% |
-| text() | ascii only | 9.1% | 48.4% |
-| text() | distinct values | 2000 | 820 |
-| lists(integers()) | empty | 0.1% | 10.3% |
-| binary() | empty | 0.1% | 15.0% |
+## What the engine-level flag taught
 
-libhegel is much more biased towards the simplest values than the current
-Python engine, which moved to smooth distributions in 2025-26. Neither is
-"right", but the quality suite (below) measures which finds bugs.
+- **Faithful replay is the whole contract.** The first runner build shrank
+  `floats() > 1.5` to 1e7 instead of 2.0. The cause was Hypothesis's constant
+  injection in the provider: a replayed integer draw could come back as a
+  constant instead of libhegel's recorded value, so libhegel saw the test as
+  nondeterministic and fell into its bounded, confirmation-heavy handling.
+  With constants off on this path libhegel shrinks to 2.0, as both engines'
+  own tests expect. A real integration passes constants down as forced draws.
+- **`shrink_towards` must reach the engine.** Without it datetimes shrank to
+  year 6 instead of 2000. Now carried by the weighted entry point.
+- **A choice-less completed case means "exhausted" to libhegel** and ends the
+  run; the provider must not forward spans before a case has drawn.
+- **libhegel's errors map cleanly**: its exhausted-space error is `core.py`'s
+  `Unsatisfiable` path (exit reason finished, no valid case), its health
+  checks are Hypothesis's `fail_health_check`, nondeterminism strictness
+  `Error` gives Hypothesis's flaky semantics. That took the runner from 61 to
+  46 cover failures.
+- **Targeting works through the engine** (3 of 6 targeting-quality tests now
+  pass; none did at the draw level) but libhegel's hill climb is weaker than
+  Hypothesis's optimiser on the "threshold bug" cases.
 
-Speed, generation only (2000 examples, ms per example, Python provider
-versus hegel backend): integers 0.47 vs 0.87, text 0.63 vs 0.60, lists of
-integers 1.15 vs 1.48, floats 0.56 vs 0.60, dicts 1.98 vs 2.34. A draw-level
-backend cannot be faster than the Python provider: every draw still costs a
-Python call, plus the PyO3 hop. The performance case for the migration only
-exists at the runner level, where the engine loop, the choice tree and the
-shrinker leave Python.
+## Speed
 
-## The 13 remaining `tests/cover` failures, by cause
+Whole loop, seconds and test-function calls, Python engine versus libhegel
+runner (2000 examples; find + shrink with 500):
 
-- **Search-space exhaustion is an engine feature the draw level cannot
-  see** (5): `test_notes_exhausted_search_space_in_unsatisfiable_error`,
-  `test_unsatisfiable_explicit_filteredstrategy_sampled`,
-  `test_unsat_filtered_sampling_in_rejection_stage`,
-  `test_raises_unsatisfiable_if_all_false_in_finite_set`,
-  `test_given_usable_inline_on_lambdas` (expects `booleans()` to stop after
-  2 examples). The Python engine's DataTree knows the space is exhausted;
-  libhegel has the same knowledge internally but a provider never sees it.
-  Two of these are already `xfail_on_crosshair`.
-- **Alternative-backend semantics in the engine** (6): the flakiness and
-  slippage tests (`test_fails_differently_is_flaky`,
-  `test_gives_flaky_error_if_assumption_is_flaky`,
-  `test_flaky_stateful_reports_steps`,
-  `test_handles_flaky_tests_where_only_one_is_flaky`, `test_flaky_exit`) and
-  `test_error_is_in_finally`. With any backend other than "hypothesis" the
-  engine re-executes a failure through its own provider before trusting it,
-  which changes execution counts and turns a `finally: raise` that masks a
-  StopTest into a `FlakyBackendFailure`. crosshair carries the same marks.
-- **By design** (1): `test_find_uses_provided_random` (the provided Random
-  is not the source of libhegel's entropy; also xfail on crosshair).
-- **Distribution / discovery** (1): `test_triangular_modes` (needs both
-  sides of 0.5 from `randoms()` within one run). Two similar tests
-  (`test_fullmatch_generates_example[[ab]*]`,
-  `test_generates_unix_rollover_adjacent_times`) failed on one of three
-  runs: "did 100 examples hit X" is flaky under libhegel's bias towards
-  simplest values.
+| case | python | libhegel runner |
+|---|---|---|
+| generation, integers | 0.63 ms/ex | 0.94 ms/ex |
+| generation, text | 0.73 ms/ex | 0.74 ms/ex |
+| generation, lists of ints | 1.36 ms/ex | 2.05 ms/ex |
+| generation, dicts(text, floats) | 2.49 ms/ex | 2.84 ms/ex |
+| find + shrink `sum(list) > 1000` | 0.08 s, 55 calls | 0.26 s, 194 calls |
+| find + shrink text with 'a', len 10 | 0.21 s, 137 calls | 0.60 s, 702 calls |
+| find + shrink dict with 3 keys | 0.18 s, 50 calls | 5.3 s, 1440 calls |
 
-Nothing in the remaining list is a wrong value or a crash.
+Generation is not faster because every draw still crosses into Python and
+the test body dominates. Shrinking is slower by calls: Hypothesis's shrinker
+caches results by choice sequence and orders its passes aggressively;
+libhegel re-executes more candidates (the full cover suite takes 15 minutes
+under the runner against 3.5 under the Python engine, almost all of it in
+shrink-heavy tests). The remaining performance case for the migration is in
+the engine's own work per call, which is small next to Python test execution.
 
-## What this says about the migration plan
+## Remaining failures, engine level (46 in `tests/cover`)
 
-- The draw-level flag works, is cheap, and is a good differential-testing
-  harness. It is not a migration path: the things that would make the
-  engine swap worthwhile (the run loop, the tree and exhaustion tracking,
-  shrinking, the database, targeting) all sit above the draw boundary.
-- The next experiment is the runner-level flag: substitute
-  `ConjectureRunner` (constructed in one place, `core.py`) with a
-  libhegel-driven runner, keep `ConjectureData` as the shim strategies draw
-  from, and keep the Python runner selected whenever `settings.backend` is
-  not "hypothesis" until libhegel grows a delegating backend for CrossHair.
-  The replay-blob test above is the seam that makes this checkable.
-- Things libhegel would need first: a seed / derandomize hand-off, NaN with
-  finite bounds (or an agreed rule), weighted integers, an arbitrary
-  codepoint-set text generator (or a way to pass Hypothesis's category
-  queries), and an `explain`-phase equivalent or an agreement that it stays
-  in Python.
-- The distribution gap is a product decision, not a bug: the Python
-  engine's smooth distributions are recent and deliberate; libhegel is a
-  port of the older shape. The quality suite is where that argument should
-  be had.
+- **Database** (11): libhegel's store is disabled and Hypothesis's reuse
+  phase skipped, so saving, replaying and `.hypothesis/` layout tests fail.
+  By design for this round; a real integration has to choose between
+  teaching libhegel Hypothesis's database interface and keeping reuse in
+  Python around the engine.
+- **Flaky-test semantics** (12): Hypothesis distinguishes "failed once then
+  passed", deadline flakiness and precondition flakiness with specific
+  messages and exception types; libhegel reports one nondeterminism error.
+- **Health-check wording and timing** (9): libhegel's slow-generation check
+  fires on a different budget, and the seed / health-check report tests
+  match Hypothesis's exact messages.
+- **Explain phase** (6): comments such as "or any other generated value"
+  come from the Python explain phase, which the runner does not run.
+- **Engine-internal expectations** (5): shrink counts, the very-slow-shrinking
+  warning, "runs the failing example twice", `booleans()` stopping after two
+  examples.
+- **Discovery** (3): two regex alphabet tests and
+  `test_class_with_negative_category_and_positive_members` need characters
+  libhegel's string distribution rarely picks within 100 examples.
 
-## tests/quality under the hegel backend
+Draw level (17): the same 13 as before (exhaustion the draw level cannot
+see, alternative-backend verification semantics, one by design) plus four
+distribution-flaky discovery tests.
 
-Run per file with `HYPOTHESIS_PROFILE=hegel` (254 passed, 15 failed):
+## Remaining failures, engine level (30 in `tests/quality`)
 
 | file | result | what fails |
 |---|---|---|
-| test_discovery_ability | 84 passed, 6 failed | the four `large_factorial` variants (integers beyond 20! from `integers()`: the 2**128 clamp meets libhegel's bounded-range distribution, which is not the Python engine's size-bucketed unbounded draw), `test_can_produce_below_large_factorial_negative`, and `test_long_duplicates_strings` (duplicated substrings come from the Python engine's mutation of earlier examples, which alternative backends never get) |
-| test_shrink_quality | 87 passed, 3 failed | `test_lowering_together_{positive,negative,mixed}`: `mixed` never finds `x[0] + gap == x[1]` in 500 examples; the other two find it but the shrinker, starting from libhegel-shaped choices, stops at a non-minimal pair. The starting example's shape affects Hypothesis's shrink outcome |
-| test_targeting_quality | 6 failed | `target()` reaches ~12k where 50k is required: targeting mutates recorded choices and replays them through the Python provider, but every fresh example still comes from libhegel, so the hill climb keeps restarting from libhegel's distribution rather than Hypothesis's |
-| test_poisoned_lists, test_poisoned_trees, test_float_shrinking, test_widening_shrinks, test_zig_zagging, test_integers, test_deferred_strategies | all 80 passed | shrinking is Hypothesis's own; generation only has to reach a poisoned example |
+| test_widening_shrinks | 3 passed, 16 failed | widening is a Hypothesis shrinker pass (rewrite a value into a nicer one from another alternative); libhegel's shrinker has no equivalent |
+| test_shrink_quality | 85 passed, 5 failed | the three `lowering_together` cases (also fail at the draw level), `test_duplicate_containment`, `test_minimize_duplicated_characters_within_a_choice`: Hypothesis shrinker passes that libhegel lacks |
+| test_targeting_quality | 3 passed, 3 failed | hill climbing reaches the moderate score but not the threshold bug with a large budget |
+| test_discovery_ability | 84 passed, 6 failed | the four `large_factorial` cases (integers beyond 20! under the 2**128 clamp) and duplicate strings, unchanged from the draw level |
+| poisoned lists and trees, float shrinking, widening-free files | 80 passed | shrink outcomes match where both shrinkers have the pass |
 
-Before the boundary fix above, discovery failed 66 of 90 and both poisoned
-files failed or timed out, all from one integration bug rather than the
-engine, which is a good argument for keeping these suites as the
-acceptance test of any engine swap.
+## Where the two engines differ
 
-Reading: the quality suite is dominated by "can the generator find X", and
-the remaining failures are all distribution or mutation (targeting,
-duplication) features of the Python engine that a draw-level backend cannot
-reach. A runner-level integration would give libhegel's own targeting and
-mutation a fair run at these.
+Vocabulary, closed by the hegel-rust patch: unbounded integers (still
+clamped to 2**128 like HypothesisProvider), weights, `shrink_towards`, NaN
+with finite bounds, arbitrary alphabets. Still open: strings cannot hold
+lone surrogates in libhegel; `allow_infinity` has to be spelled out; the
+engine ABI has no forced integer draw (needed to pass constants down).
+
+Distribution, measured on 2000 examples: libhegel is far more biased to the
+simplest values (6% zero integers versus 0.1%, 13% empty strings versus
+0.1%, 846 distinct strings versus 2000); after the alphabet patch the `\W_`
+case matches (1.9% versus 2.1% underscores). Neither is "right"; the quality
+suite is where to argue it.
+
+Shrinker: libhegel reaches the same minimum on the common cases and on the
+poisoned corpora, lacks widening and the duplicate-aware passes, and spends
+more calls.
+
+## What a real integration still needs
+
+1. A forced-draw entry point in the C ABI, so Hypothesis's constant
+   injection and `@example` replay can go through libhegel's choice
+   sequence rather than around it.
+2. A database story: either libhegel calls back into Hypothesis's
+   `ExampleDatabase` (it is public API with third-party implementations),
+   or reuse stays in Python with the blob codec above as the bridge.
+3. The explain phase and the flaky / health-check reporting kept in Python
+   around the engine, with libhegel's run errors mapped as the runner does.
+4. The widening and duplicate-aware shrinker passes ported into libhegel if
+   the quality suite is to stay green, and a result cache by choice sequence
+   to close the call-count gap.
+5. A delegating backend in libhegel for CrossHair (issue #4823), so the
+   runner flag can apply to every `settings.backend`.
+6. Governance: libhegel is MIT under an Antithesis-funded org; the license
+   is fine, the dependency is a decision to make explicitly.
