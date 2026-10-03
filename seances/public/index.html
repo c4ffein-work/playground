@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Séances</title>
+  <meta name="color-scheme" content="dark">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>Séances</h1>
+    <div class="top-right">
+      <button id="refresh" class="ghost" title="Re-scrape UGC">↻ <span id="refresh-label">refresh</span></button>
+      <button id="me-btn" class="pill">…</button>
+    </div>
+  </header>
+
+  <main id="app">
+    <p class="muted">Loading…</p>
+  </main>
+
+  <dialog id="me-dialog">
+    <form method="dialog" id="me-form">
+      <h2>You</h2>
+      <label>Name <input name="name" maxlength="40" placeholder="How friends know you" required></label>
+      <label>Email <input name="email" type="email" placeholder="optional"></label>
+      <label>Phone <input name="phone" type="tel" placeholder="optional"></label>
+      <p class="hint">Link an email or phone so you can pick up your votes from another device. Nothing is sent to it.</p>
+      <p id="me-error" class="error" hidden></p>
+      <div class="row">
+        <button type="button" class="ghost" id="me-cancel">Cancel</button>
+        <button type="submit" class="primary">Save</button>
+      </div>
+    </form>
+    <form method="dialog" id="login-form">
+      <h3>Already voted from another device?</h3>
+      <label>Your linked email or phone <input name="contact" placeholder="ana@example.com or 06…" required></label>
+      <p id="login-error" class="error" hidden></p>
+      <div class="row"><button type="submit" class="ghost">Switch to that member</button></div>
+    </form>
+  </dialog>
+
+  <template id="t-setup">
+    <section class="card setup">
+      <h2>Where do you go to the movies?</h2>
+      <p class="muted">Pick your city, the UGC cinemas there are fetched and their programme scraped.</p>
+      <select id="city-select"><option value="">— city —</option></select>
+    </section>
+  </template>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

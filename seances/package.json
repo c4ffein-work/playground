@@ -1,0 +1,12 @@
+{
+  "name": "seances",
+  "private": true,
+  "type": "module",
+  "description": "Private movie-night planner: UGC showtimes + friends' votes. Bun + SQLite, zero dependencies.",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch run src/server.ts",
+    "scrape": "bun run src/scrape.ts",
+    "test": "bun test"
+  }
+}
