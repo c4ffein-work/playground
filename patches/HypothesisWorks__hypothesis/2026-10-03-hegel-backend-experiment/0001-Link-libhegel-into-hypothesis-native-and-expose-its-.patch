@@ -1,7 +1,7 @@
 From 30655997d20de7af8bb17d69882bba501da255ce Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 29 Sep 2026 16:27:26 +0000
-Subject: [PATCH 1/3] Link libhegel into hypothesis-native and expose its C ABI
+Subject: [PATCH 1/4] Link libhegel into hypothesis-native and expose its C ABI
  to Python
 
 libhegel is the native Rust engine behind the Hegel property-based testing

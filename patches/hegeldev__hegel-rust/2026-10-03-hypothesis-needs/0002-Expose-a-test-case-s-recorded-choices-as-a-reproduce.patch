@@ -1,0 +1,299 @@
+From e27d3768534bbe914f9fe968b7de118b89443372 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 22:31:25 +0000
+Subject: [PATCH 2/4] Expose a test case's recorded choices as a reproduce blob
+
+hegel_test_case_choices returns the base64 blob of the choices a live test
+case has made so far, encoded exactly as a failure's reproduction blob, so
+a frontend that generates whole values natively (and so never sees the
+individual draws) can learn which choices the case made and replay it
+through hegel_test_case_from_blob. Backed by a new `choices_blob` on the
+backend trait, native-only, built from the case's nodes with the raw
+prefix.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ hegel-c/include/hegel.h                 | 43 +++++++++++-----
+ hegel-c/src/backend.rs                  |  8 +++
+ hegel-c/src/lib.rs                      | 34 +++++++++++++
+ hegel-c/src/native/blob.rs              | 11 ++++
+ hegel-c/src/native/data_source.rs       |  8 +++
+ hegel-c/tests/c_abi_hypothesis_needs.rs | 67 ++++++++++++++++++++++---
+ src/ffi/sys/fns.rs                      |  1 +
+ 7 files changed, 153 insertions(+), 19 deletions(-)
+
+diff --git a/hegel-c/include/hegel.h b/hegel-c/include/hegel.h
+index f529b89d..87b9ed21 100644
+--- a/hegel-c/include/hegel.h
++++ b/hegel-c/include/hegel.h
+@@ -606,19 +606,6 @@ typedef struct hegel_test_case_t hegel_test_case_t;
+  */
+ typedef void (*hegel_output_callback_t)(void *user_data, const char *line, size_t len);
+ 
+-/*
+- An engine-allocated byte buffer returned by `hegel_generate_bytes`.
+-
+- The caller owns the buffer and must release it with
+- `hegel_generate_bytes_result_free` (freeing through any other allocator
+- is undefined behaviour). `data` is never NULL after a successful draw,
+- even for `len == 0`.
+- */
+-typedef struct {
+-    uint8_t *data;
+-    size_t len;
+-} hegel_generate_bytes_result_t;
+-
+ /*
+  An engine-allocated string buffer returned by `hegel_generate_string`.
+ 
+@@ -635,6 +622,19 @@ typedef struct {
+     size_t len;
+ } hegel_generate_string_result_t;
+ 
++/*
++ An engine-allocated byte buffer returned by `hegel_generate_bytes`.
++
++ The caller owns the buffer and must release it with
++ `hegel_generate_bytes_result_free` (freeing through any other allocator
++ is undefined behaviour). `data` is never NULL after a successful draw,
++ even for `len == 0`.
++ */
++typedef struct {
++    uint8_t *data;
++    size_t len;
++} hegel_generate_bytes_result_t;
++
+ /*
+  A drawn proleptic Gregorian calendar date: `year` in
+  `[-999999, 999999]` (bounded by the range passed to
+@@ -1982,6 +1982,23 @@ hegel_result_t hegel_generate_integer(hegel_context_t *ctx,
+                                       int64_t max_value,
+                                       int64_t *out_value);
+ 
++/*
++ Parameters:
++ `out_result`: Receives a libhegel-allocated `{char *data; size_t len;}`
++   holding the base64 reproduce blob of the choices this test case has
++   recorded so far, exactly as `hegel_failure_reproduction_blob` would
++   encode them. Release with `hegel_generate_string_result_free`.
++
++ Returns `HEGEL_OK`.
++
++ A frontend that generates whole values natively uses this to learn,
++ after the fact, which choices a case made, for its own bookkeeping and
++ for replaying the case through `hegel_test_case_from_blob`.
++ */
++hegel_result_t hegel_test_case_choices(hegel_context_t *ctx,
++                                       hegel_test_case_t *tc,
++                                       hegel_generate_string_result_t *out_result);
++
+ /*
+  Parameters:
+  `min_value` / `max_value`: Inclusive bounds. Both required.
+diff --git a/hegel-c/src/backend.rs b/hegel-c/src/backend.rs
+index 2d74e93c..7ee8e3b9 100644
+--- a/hegel-c/src/backend.rs
++++ b/hegel-c/src/backend.rs
+@@ -89,6 +89,14 @@ pub trait DataSource: Send + Sync {
+         self.generate_integer(min_value, max_value)
+     }
+ 
++    /// The choices this test case has recorded so far, as a reproduce blob
++    /// (`hegel_test_case_from_blob` replays it). The default has none.
++    fn choices_blob(&self) -> Result<String, DataSourceError> {
++        Err(DataSourceError::InvalidArgument(
++            "this data source does not expose its choices".into(),
++        ))
++    }
++
+     /// Draw a float according to `spec` (bounds, width, NaN/infinity policy,
+     /// exclusive-bound handling). Errors with `InvalidArgument` for an
+     /// invalid spec.
+diff --git a/hegel-c/src/lib.rs b/hegel-c/src/lib.rs
+index 2f769bef..71a20cf5 100644
+--- a/hegel-c/src/lib.rs
++++ b/hegel-c/src/lib.rs
+@@ -4196,6 +4196,40 @@ pub unsafe extern "C" fn hegel_generate_integer(
+     }
+ }
+ 
++/// Parameters:
++/// `out_result`: Receives a libhegel-allocated `{char *data; size_t len;}`
++///   holding the base64 reproduce blob of the choices this test case has
++///   recorded so far, exactly as `hegel_failure_reproduction_blob` would
++///   encode them. Release with `hegel_generate_string_result_free`.
++///
++/// Returns `HEGEL_OK`.
++///
++/// A frontend that generates whole values natively uses this to learn,
++/// after the fact, which choices a case made, for its own bookkeeping and
++/// for replaying the case through `hegel_test_case_from_blob`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn hegel_test_case_choices(
++    ctx: *mut HegelContext,
++    tc: *mut HegelTestCase,
++    out_result: *mut hegel_generate_string_result_t,
++) -> hegel_result_t {
++    unsafe {
++        typed_draw(
++            ctx,
++            tc,
++            "hegel_test_case_choices",
++            out_result.is_null(),
++            |tc| tc.stream.choices_blob(),
++            |v| {
++                let boxed = v.into_bytes().into_boxed_slice();
++                let len = boxed.len();
++                let data = Box::into_raw(boxed) as *mut c_char;
++                *out_result = hegel_generate_string_result_t { data, len };
++            },
++        )
++    }
++}
++
+ /// Parameters:
+ /// `min_value` / `max_value`: Inclusive bounds. Both required.
+ /// `shrink_towards`: The value the choice shrinks toward, clamped into the
+diff --git a/hegel-c/src/native/blob.rs b/hegel-c/src/native/blob.rs
+index f24c0187..8997428a 100644
+--- a/hegel-c/src/native/blob.rs
++++ b/hegel-c/src/native/blob.rs
+@@ -96,6 +96,17 @@ const MAX_DECOMPRESSED_LEN: usize = 64 << 20;
+ /// for a sequence [`serialize_choices`] rejects (clone values nested deeper
+ /// than [`MAX_CLONE_DEPTH`](crate::native::core::MAX_CLONE_DEPTH)), which no
+ /// blob could represent.
++/// Encode a live test case's recorded nodes as a raw (uncompressed) blob of
++/// their values, in the same format as [`encode_failure`]: what a frontend
++/// needs to know, mid-run, which choices a case has made so far.
++pub fn encode_nodes(nodes: &[crate::native::core::ChoiceNode]) -> Option<String> {
++    let raw = crate::native::database::serialize_nodes(nodes)?;
++    let mut payload = Vec::with_capacity(raw.len() + 1);
++    payload.push(PREFIX_RAW);
++    payload.extend_from_slice(&raw);
++    Some(base64_encode(&payload))
++}
++
+ pub fn encode_failure(choices: &[ChoiceValue]) -> Option<String> {
+     let raw = serialize_choices(choices)?;
+     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, ZLIB_LEVEL);
+diff --git a/hegel-c/src/native/data_source.rs b/hegel-c/src/native/data_source.rs
+index d968ef64..749dfcc1 100644
+--- a/hegel-c/src/native/data_source.rs
++++ b/hegel-c/src/native/data_source.rs
+@@ -195,6 +195,14 @@ impl DataSource for NativeDataSource {
+         })
+     }
+ 
++    fn choices_blob(&self) -> Result<String, DataSourceError> {
++        self.with_ntc(|ntc| {
++            crate::native::blob::encode_nodes(&ntc.nodes).ok_or_else(|| {
++                EngineError::InvalidArgument("choices nest too deeply to encode".into())
++            })
++        })
++    }
++
+     fn generate_float(
+         &self,
+         spec: &crate::native::draws::FloatSpec,
+diff --git a/hegel-c/tests/c_abi_hypothesis_needs.rs b/hegel-c/tests/c_abi_hypothesis_needs.rs
+index cc70597e..c3dd3985 100644
+--- a/hegel-c/tests/c_abi_hypothesis_needs.rs
++++ b/hegel-c/tests/c_abi_hypothesis_needs.rs
+@@ -1,16 +1,17 @@
+ //! In-process exercise of the draws added for the Hypothesis frontend:
+-//! weighted integers, NaN alongside finite float bounds, and text
+-//! generators built from explicit codepoint ranges.
++//! weighted integers, NaN alongside finite float bounds, text generators
++//! built from explicit codepoint ranges, and a case's choices as a blob.
+ mod common;
+ 
+ use common::{last_error, make_settings_no_db, next_case, ok, start};
+ use hegel_c::hegel_result_t::*;
+ use hegel_c::{
+     HegelContext, HegelStringGenerator, HegelTestCase, hegel_context_free, hegel_context_new,
+-    hegel_generate_float, hegel_generate_integer_weighted, hegel_generate_string,
+-    hegel_generate_string_result_free, hegel_generate_string_result_t, hegel_mark_complete,
+-    hegel_run_free, hegel_settings_free, hegel_settings_set_test_cases, hegel_status_t,
+-    hegel_string_generator_free, hegel_string_generator_text_ranges,
++    hegel_generate_float, hegel_generate_integer, hegel_generate_integer_weighted,
++    hegel_generate_string, hegel_generate_string_result_free, hegel_generate_string_result_t,
++    hegel_mark_complete, hegel_run_free, hegel_settings_free, hegel_settings_set_test_cases,
++    hegel_status_t, hegel_string_generator_free, hegel_string_generator_text_ranges,
++    hegel_test_case_choices, hegel_test_case_from_blob,
+ };
+ use std::ptr;
+ 
+@@ -242,3 +243,57 @@ fn text_ranges_draw_only_from_the_given_ranges() {
+         ok(hegel_context_free(ctx));
+     }
+ }
++
++#[test]
++fn a_cases_choices_replay_through_their_blob() {
++    let ctx = hegel_context_new();
++    unsafe {
++        let s = make_settings_no_db(ctx);
++        ok(hegel_settings_set_test_cases(ctx, s, 20));
++        let run = start(ctx, s);
++        loop {
++            let tc = next_case(ctx, run);
++            if tc.is_null() {
++                break;
++            }
++            let mut drawn = Vec::new();
++            for _ in 0..3 {
++                let mut v = 0i64;
++                ok(hegel_generate_integer(ctx, tc, -1000, 1000, &mut v));
++                drawn.push(v);
++                let mut res = hegel_generate_string_result_t {
++                    data: ptr::null_mut(),
++                    len: 0,
++                };
++                ok(hegel_test_case_choices(ctx, tc, &mut res));
++                let bytes = std::slice::from_raw_parts(res.data as *const u8, res.len);
++                let blob = std::ffi::CString::new(bytes).unwrap();
++                ok(hegel_generate_string_result_free(ctx, &mut res));
++                // the blob so far replays exactly the draws so far
++                let mut replay: *mut HegelTestCase = ptr::null_mut();
++                ok(hegel_test_case_from_blob(
++                    ctx,
++                    s,
++                    blob.as_ptr(),
++                    None,
++                    ptr::null_mut(),
++                    &mut replay,
++                ));
++                for &expected in &drawn {
++                    let mut got = 0i64;
++                    ok(hegel_generate_integer(ctx, replay, -1000, 1000, &mut got));
++                    assert_eq!(got, expected);
++                }
++                complete_valid(ctx, replay);
++            }
++            assert_eq!(
++                hegel_test_case_choices(ctx, tc, ptr::null_mut()),
++                HEGEL_E_INVALID_ARG
++            );
++            complete_valid(ctx, tc);
++        }
++        ok(hegel_run_free(ctx, run));
++        ok(hegel_settings_free(ctx, s));
++        ok(hegel_context_free(ctx));
++    }
++}
+diff --git a/src/ffi/sys/fns.rs b/src/ffi/sys/fns.rs
+index 4228733d..f0138b03 100644
+--- a/src/ffi/sys/fns.rs
++++ b/src/ffi/sys/fns.rs
+@@ -130,6 +130,7 @@ macro_rules! for_each_hegel_fn {
+             fn hegel_string_generator_url(ctx: *mut HegelContext, out_generator: *mut *mut HegelStringGenerator) -> hegel_result_t;
+             fn hegel_target(ctx: *mut HegelContext, tc: *mut HegelTestCase, value: f64, label: *const c_char) -> hegel_result_t;
+             fn hegel_test_case_block(ctx: *mut HegelContext, tc: *const HegelTestCase, indent: u64, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
++            fn hegel_test_case_choices(ctx: *mut HegelContext, tc: *mut HegelTestCase, out_result: *mut hegel_generate_string_result_t) -> hegel_result_t;
+             fn hegel_test_case_clone(ctx: *mut HegelContext, tc: *const HegelTestCase, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
+             fn hegel_test_case_free(ctx: *mut HegelContext, tc: *mut HegelTestCase) -> hegel_result_t;
+             fn hegel_test_case_from_blob(ctx: *mut HegelContext, s: *const HegelSettings, blob: *const c_char, callback: hegel_output_callback_t, user_data: *mut c_void, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
+-- 
+2.43.0
+

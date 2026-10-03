@@ -1,7 +1,7 @@
-From 5a295e22065bac3a170e9947d21aad96a45e5c03 Mon Sep 17 00:00:00 2001
+From 6b90e671cd6d01c1bc3197d483a5fc3e1c83d3f9 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 1 Oct 2026 17:26:08 +0000
-Subject: [PATCH] Add the draws the Hypothesis frontend needs
+Subject: [PATCH 1/4] Add the draws the Hypothesis frontend needs
 
 Three additions to libhegel's generate vocabulary, found by driving it as
 a Hypothesis backend:
@@ -30,9 +30,10 @@ Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
  hegel-c/src/native/data_source.rs       |  20 ++
  hegel-c/src/native/draws/mod.rs         | 100 +++++++++-
  hegel-c/src/native/draws/text.rs        |  21 ++
+ hegel-c/tests/c_abi_generate.rs         |  32 ++--
  hegel-c/tests/c_abi_hypothesis_needs.rs | 244 ++++++++++++++++++++++++
  src/ffi/sys/fns.rs                      |   2 +
- 9 files changed, 578 insertions(+), 5 deletions(-)
+ 10 files changed, 593 insertions(+), 22 deletions(-)
  create mode 100644 hegel-c/tests/c_abi_hypothesis_needs.rs
 
 diff --git a/hegel-c/include/hegel.h b/hegel-c/include/hegel.h
@@ -477,6 +478,49 @@ index c4f73009..4ba6ae03 100644
  /// Build an [`IntervalSet`] containing `[min, max]` with the surrogate block
  /// `[0xD800, 0xDFFF]` removed.
  fn range_minus_surrogates(min: u32, max: u32) -> Result<IntervalSet, InternalError> {
+diff --git a/hegel-c/tests/c_abi_generate.rs b/hegel-c/tests/c_abi_generate.rs
+index 1e511639..b1b969ea 100644
+--- a/hegel-c/tests/c_abi_generate.rs
++++ b/hegel-c/tests/c_abi_generate.rs
+@@ -488,23 +488,21 @@ fn float_draws_respect_spec_and_validate_arguments() {
+                 HEGEL_E_INVALID_ARG
+             );
+             assert!(last_error(ctx).contains("NaN"));
+-            assert_eq!(
+-                hegel_generate_float(
+-                    ctx,
+-                    tc,
+-                    64,
+-                    0.0,
+-                    1.0,
+-                    true,
+-                    false,
+-                    false,
+-                    false,
+-                    f64::from_bits(1),
+-                    &mut out,
+-                ),
+-                HEGEL_E_INVALID_ARG
+-            );
+-            assert!(last_error(ctx).contains("allow_nan=true"));
++            // NaN alongside finite bounds: NaN or an in-range value
++            ok(hegel_generate_float(
++                ctx,
++                tc,
++                64,
++                0.0,
++                1.0,
++                true,
++                false,
++                false,
++                false,
++                f64::from_bits(1),
++                &mut out,
++            ));
++            assert!(out.is_nan() || (0.0..=1.0).contains(&out), "{out}");
+             assert_eq!(
+                 hegel_generate_float(
+                     ctx,
 diff --git a/hegel-c/tests/c_abi_hypothesis_needs.rs b/hegel-c/tests/c_abi_hypothesis_needs.rs
 new file mode 100644
 index 00000000..cc70597e

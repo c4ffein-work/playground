@@ -1,0 +1,81 @@
+From c454eaa4154abe67e2fd513ae1a0f0feee14ffcb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 22:31:25 +0000
+Subject: [PATCH 3/4] Build the diffuse integer category only when it is
+ selected
+
+biguint_sample_in_range built its diffuse pool (up to 256 bignum powers of
+two, sorted and deduplicated) on every draw over a range wider than i128,
+although that category is picked a small fraction of the time; the
+interesting category was already built lazily. Doing the same for the
+diffuse one takes an unbounded integer draw from ~160 us to ~3 us, with
+the same RNG consumption and so the same values.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ hegel-c/src/native/core/state.rs | 41 +++++++++++++++++---------------
+ 1 file changed, 22 insertions(+), 19 deletions(-)
+
+diff --git a/hegel-c/src/native/core/state.rs b/hegel-c/src/native/core/state.rs
+index d583e09d..fefa26ca 100644
+--- a/hegel-c/src/native/core/state.rs
++++ b/hegel-c/src/native/core/state.rs
+@@ -834,23 +834,6 @@ fn biguint_sample_in_range(
+         }
+     }
+ 
+-    // Diffuse category: powers of two spanning the range magnitude.
+-    let mut diffuse: Vec<BigInt> = Vec::new();
+-    {
+-        let mut push_diffuse = |v: BigInt| {
+-            if &v >= min && &v <= max {
+-                diffuse.push(v);
+-            }
+-        };
+-        for k in 1..=bits.min(128) {
+-            let p2 = BigInt::from(BigUint::from(1u32) << (k as usize));
+-            push_diffuse(-p2.clone());
+-            push_diffuse(p2);
+-        }
+-    }
+-    diffuse.sort();
+-    diffuse.dedup();
+-
+     // One shared draw selects the category by cumulative weight; an empty
+     // category is skipped so its mass flows to the next (finally the middle). A
+     // range beyond `i128` always has non-empty endpoints.
+@@ -875,8 +858,28 @@ fn biguint_sample_in_range(
+         }
+     }
+     acc += params.diffuse_probability;
+-    if u < acc && !diffuse.is_empty() {
+-        return diffuse[rng.random_range(0..diffuse.len())].clone();
++    if u < acc {
++        // Diffuse category (built only when selected, like the interesting
++        // one: it is up to 256 bignums): powers of two spanning the range
++        // magnitude.
++        let mut diffuse: Vec<BigInt> = Vec::new();
++        {
++            let mut push_diffuse = |v: BigInt| {
++                if &v >= min && &v <= max {
++                    diffuse.push(v);
++                }
++            };
++            for k in 1..=bits.min(128) {
++                let p2 = BigInt::from(BigUint::from(1u32) << (k as usize));
++                push_diffuse(-p2.clone());
++                push_diffuse(p2);
++            }
++        }
++        diffuse.sort();
++        diffuse.dedup();
++        if !diffuse.is_empty() {
++            return diffuse[rng.random_range(0..diffuse.len())].clone();
++        }
+     }
+ 
+     min + BigInt::from(sample_biguint_at_most(&span, rng))
+-- 
+2.43.0
+

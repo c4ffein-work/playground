@@ -1,7 +1,7 @@
 From 79ec8c4dad5e6eb34202a1ef4d6210ab22d19b54 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 29 Sep 2026 16:27:26 +0000
-Subject: [PATCH 2/3] Add an experimental backend="hegel" provider and
+Subject: [PATCH 2/4] Add an experimental backend="hegel" provider and
  engine-equivalence tests
 
 settings(backend="hegel") routes every generate-phase draw to libhegel while

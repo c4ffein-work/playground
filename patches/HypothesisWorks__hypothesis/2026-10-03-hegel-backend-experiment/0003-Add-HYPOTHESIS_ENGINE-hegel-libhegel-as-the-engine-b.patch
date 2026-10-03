@@ -1,7 +1,7 @@
 From bb5482aa5486827deff4e7405f8cbe461a9f454a Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Thu, 1 Oct 2026 17:26:52 +0000
-Subject: [PATCH 3/3] Add HYPOTHESIS_ENGINE=hegel: libhegel as the engine
+Subject: [PATCH 3/4] Add HYPOTHESIS_ENGINE=hegel: libhegel as the engine
  behind core.py
 
 With the environment variable set, core.py drives a test with HegelRunner

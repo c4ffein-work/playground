@@ -1,0 +1,1929 @@
+From be75190cd398aecfbf079eb3015b2539527cae40 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 3 Oct 2026 22:44:41 +0000
+Subject: [PATCH 4/4] Generate whole strategies natively under
+ HYPOTHESIS_ENGINE=hegel
+
+Under the engine flag every draw still crossed into Python one primitive
+at a time. Most built-in strategies are data, not code: their draw is a
+function of their attributes and of the values drawn so far. hegel_ir.py
+compiles that declarative core (integers, floats, booleans, binary, text,
+lists, tuples, fixed dictionaries, one_of, sampled_from, just, map,
+builds, shared, filter) into a tree mirroring each do_draw, and
+hegel_gen.rs interprets it against the live libhegel case: spans, the
+`many` continuation protocol, forced draws, the fixed-dictionary shuffle,
+the filter and map retry rules, all as Hypothesis makes them, so the
+choice sequence libhegel records is the one the Python engine would have
+recorded. Anything else (composite, data, unique lists, recursion,
+stateful, filtered sampled_from, optional keys, strategies that run
+Python) is an opaque leaf: the interpreter hands it back to
+ConjectureData.draw, which runs it interactively against the same case,
+batching again underneath it. ConjectureData.draw consults the provider's
+`draw_strategy` before a strategy's own do_draw, records the choices the
+interpreter made, and lets a provider see the draws Hypothesis forces
+(`draw_forced`, libhegel's new forced integer entry point) so the two
+sequences stay aligned. The case's nodes are taken from libhegel's own
+record. HYPOTHESIS_HEGEL_BATCH=0 keeps every draw interactive for
+comparison.
+
+The equivalence check: for each kind of strategy, a value generated
+natively is exactly what the Python engine draws when it replays
+libhegel's recorded choices through its own do_draw code.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ hypothesis/RELEASE.rst                        |   3 +-
+ hypothesis/rust/src/internal/hegel.rs         |  59 +-
+ hypothesis/rust/src/internal/hegel_gen.rs     | 923 ++++++++++++++++++
+ hypothesis/rust/src/internal/mod.rs           |   1 +
+ .../hypothesis/internal/conjecture/data.py    |  61 ++
+ .../internal/conjecture/hegel_ir.py           | 249 +++++
+ .../internal/conjecture/hegel_provider.py     |  96 +-
+ .../internal/conjecture/hegel_runner.py       |  88 +-
+ hypothesis/tests/conjecture/test_hegel_ir.py  | 161 +++
+ 9 files changed, 1619 insertions(+), 22 deletions(-)
+ create mode 100644 hypothesis/rust/src/internal/hegel_gen.rs
+ create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
+ create mode 100644 hypothesis/tests/conjecture/test_hegel_ir.py
+
+diff --git a/hypothesis/RELEASE.rst b/hypothesis/RELEASE.rst
+index 7ce770fd..6b927c0e 100644
+--- a/hypothesis/RELEASE.rst
++++ b/hypothesis/RELEASE.rst
+@@ -6,6 +6,7 @@ the Hegel family of property-based testing libraries, now linked into
+ Hypothesis's native extension. ``backend="hegel"`` generates inputs with it
+ while everything else stays in Python, and setting ``HYPOTHESIS_ENGINE=hegel``
+ in the environment hands it the whole run loop, including shrinking and
+-targeting, for tests on the default backend. Neither is a supported feature:
++targeting, for tests on the default backend, generating whole values of the
++built-in strategies natively where it can. Neither is a supported feature:
+ both may change or disappear in any release, and the engine flag ignores the
+ example database for now.
+diff --git a/hypothesis/rust/src/internal/hegel.rs b/hypothesis/rust/src/internal/hegel.rs
+index fa1120d0..690de380 100644
+--- a/hypothesis/rust/src/internal/hegel.rs
++++ b/hypothesis/rust/src/internal/hegel.rs
+@@ -39,8 +39,9 @@ pyo3::create_exception!(hegel, AssumeError, HegelError);
+ /// outlives every handle created from it.
+ #[pyclass(module = "hypothesis._native.internal.hegel")]
+ pub(crate) struct Engine {
+-    ctx: *mut sys::HegelContext,
++    pub(crate) ctx: *mut sys::HegelContext,
+     settings: *mut sys::HegelSettings,
++    pub(crate) text_gens: super::hegel_gen::TextGenCache,
+ }
+ 
+ // SAFETY: see the module docs. libhegel handles are internally locked and
+@@ -65,7 +66,7 @@ pub(crate) struct Run {
+ #[pyclass(module = "hypothesis._native.internal.hegel")]
+ pub(crate) struct TestCase {
+     engine: Py<Engine>,
+-    tc: *mut sys::HegelTestCase,
++    pub(crate) tc: *mut sys::HegelTestCase,
+     complete: bool,
+ }
+ 
+@@ -128,7 +129,11 @@ const ALL_HEALTH_CHECKS: u32 =
+ 
+ /// Turn a `hegel_result_t` into a Python exception, reading the context's
+ /// last error message for the detail.
+-fn check(ctx: *mut sys::HegelContext, r: sys::hegel_result_t, what: &str) -> PyResult<()> {
++pub(crate) fn check(
++    ctx: *mut sys::HegelContext,
++    r: sys::hegel_result_t,
++    what: &str,
++) -> PyResult<()> {
+     use sys::hegel_result_t as R;
+     if r == R::HEGEL_OK {
+         return Ok(());
+@@ -196,7 +201,11 @@ impl Engine {
+                 let _ = sys::hegel_context_free(ctx);
+                 return Err(e);
+             }
+-            let engine = Engine { ctx, settings };
++            let engine = Engine {
++                ctx,
++                settings,
++                text_gens: Default::default(),
++            };
+             check(
+                 ctx,
+                 sys::hegel_settings_set_test_cases(ctx, settings, max_examples),
+@@ -387,6 +396,7 @@ impl Engine {
+ 
+ impl Drop for Engine {
+     fn drop(&mut self) {
++        self.text_gens.free_all(self.ctx);
+         // SAFETY: handles were created by this Engine and are freed exactly once.
+         unsafe {
+             let _ = sys::hegel_settings_free(self.ctx, self.settings);
+@@ -526,8 +536,24 @@ impl TestCase {
+     }
+ 
+     /// Inclusive bounds; both required (libhegel has no unbounded draw).
+-    fn draw_integer(&self, py: Python<'_>, min_value: i64, max_value: i64) -> PyResult<i64> {
++    /// `forced` records that value as a forced choice instead of drawing.
++    #[pyo3(signature = (min_value, max_value, forced=None))]
++    fn draw_integer(
++        &self,
++        py: Python<'_>,
++        min_value: i64,
++        max_value: i64,
++        forced: Option<i64>,
++    ) -> PyResult<i64> {
+         let ctx = self.ctx(py);
++        if let Some(v) = forced {
++            // SAFETY: tc is live until Drop.
++            let r = unsafe {
++                sys::hegel_generate_integer_forced(ctx, self.tc, min_value, max_value, v)
++            };
++            check(ctx, r, "generate_integer_forced")?;
++            return Ok(v);
++        }
+         let mut out: i64 = 0;
+         // SAFETY: tc is live until Drop.
+         let r =
+@@ -759,6 +785,27 @@ impl TestCase {
+     fn complete(&self) -> bool {
+         self.complete
+     }
++
++    /// Generate one whole value for a compiled strategy against this case
++    /// (see hegel_gen.rs). `data` is the ConjectureData whose
++    /// `_hegel_record_many` receives the draws; `shared` its
++    /// `_shared_strategy_draws`.
++    fn generate<'py>(
++        &self,
++        py: Python<'py>,
++        compiled: &super::hegel_gen::CompiledStrategy,
++        data: Bound<'py, PyAny>,
++        shared: Bound<'py, pyo3::types::PyDict>,
++    ) -> PyResult<Bound<'py, PyAny>> {
++        let engine = self.engine.borrow(py);
++        super::hegel_gen::generate(py, self, &engine, compiled, data, shared)
++    }
++
++    /// The choices this case has recorded so far, as a reproduce blob.
++    fn choices_blob<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyString>> {
++        let engine = self.engine.borrow(py);
++        super::hegel_gen::choices_blob(py, &engine, self)
++    }
+ }
+ 
+ impl Drop for TestCase {
+@@ -802,6 +849,8 @@ impl Drop for Collection {
+ pub(crate) mod hegel {
+     use pyo3::prelude::*;
+ 
++    #[pymodule_export]
++    use super::super::hegel_gen::CompiledStrategy;
+     #[pymodule_export]
+     use super::{Collection, Engine, Failure, Run, RunResult, StringGenerator, TestCase};
+ 
+diff --git a/hypothesis/rust/src/internal/hegel_gen.rs b/hypothesis/rust/src/internal/hegel_gen.rs
+new file mode 100644
+index 00000000..a6d6ac6b
+--- /dev/null
++++ b/hypothesis/rust/src/internal/hegel_gen.rs
+@@ -0,0 +1,923 @@
++// This file is part of Hypothesis, which may be found at
++// https://github.com/HypothesisWorks/hypothesis/
++//
++// Copyright the Hypothesis Authors.
++// Individual contributors are listed in AUTHORS.rst and the git log.
++//
++// This Source Code Form is subject to the terms of the Mozilla Public License,
++// v. 2.0. If a copy of the MPL was not distributed with this file, You can
++// obtain one at https://mozilla.org/MPL/2.0/.
++
++//! EXPERIMENT: a strategy interpreter over libhegel's primitives.
++//!
++//! `hegel_ir.py` compiles the declarative part of a strategy object graph
++//! (integers, floats, booleans, text, bytes, lists, tuples, one_of,
++//! sampled_from, just, map, builds, shared, filter, fixed dictionaries) into
++//! a small tree; [`generate`] walks that tree against one libhegel test
++//! case, mirroring each Hypothesis strategy's `do_draw` draw for draw, and
++//! builds the Python value on this side of the boundary. Strategies it
++//! cannot express stay Python: an `Opaque` node hands the strategy back to
++//! `ConjectureData.draw`, which runs it interactively against the same
++//! libhegel case, so a declarative tree may contain opaque leaves and an
++//! opaque strategy may draw declarative subtrees.
++//!
++//! The interpreter records every primitive draw it makes as `(kind, value)`
++//! pairs and flushes them into the `ConjectureData` around each opaque
++//! call-back and at the end, so the Python side keeps a value-faithful node
++//! list in draw order.
++
++use std::collections::HashMap;
++use std::ffi::{c_char, CString};
++use std::sync::Mutex;
++
++use hegel_c as sys;
++use pyo3::prelude::*;
++use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple, PyType};
++
++use super::hegel::{check, Engine, HegelError, TestCase};
++
++pub(crate) struct IntNode {
++    /// bounds as two's-complement little-endian bytes (the big path)
++    lo: Vec<u8>,
++    hi: Vec<u8>,
++    /// the same bounds when they fit int64 (the fast path, with weights)
++    lo64: Option<i64>,
++    hi64: Option<i64>,
++    shrink_towards: i64,
++    keys: Vec<i64>,
++    weights: Vec<f64>,
++}
++
++pub(crate) enum Node {
++    Int(IntNode, u64),
++    Float {
++        min: f64,
++        max: f64,
++        allow_nan: bool,
++        snm: f64,
++        label: u64,
++    },
++    Bool {
++        p: f64,
++        label: u64,
++    },
++    Bytes {
++        min: u64,
++        max: u64,
++        label: u64,
++    },
++    Text {
++        ranges: Vec<(u32, u32)>,
++        min: u64,
++        max: u64,
++        label: u64,
++    },
++    /// a string built from a non-character element strategy: a list, joined
++    TextList {
++        elem: Box<Node>,
++        min: u64,
++        max: u64,
++        p_continue: f64,
++        label: u64,
++    },
++    EmptyList {
++        label: u64,
++    },
++    List {
++        elem: Box<Node>,
++        min: u64,
++        max: u64,
++        p_continue: f64,
++        label: u64,
++    },
++    Tuple {
++        children: Vec<Node>,
++        label: u64,
++    },
++    FixedDict {
++        keys: Vec<Py<PyAny>>,
++        children: Vec<Node>,
++        dict_type: Py<PyAny>,
++        label: u64,
++    },
++    OneOf {
++        children: Vec<Node>,
++        inner_label: u64,
++        label: u64,
++    },
++    Sampled {
++        elements: Py<PyAny>,
++        n: i64,
++        maps: Vec<Py<PyAny>>,
++        label: u64,
++    },
++    Just {
++        value: Py<PyAny>,
++        maps: Vec<Py<PyAny>>,
++        label: u64,
++    },
++    Map {
++        inner: Box<Node>,
++        pack: Py<PyAny>,
++        label: u64,
++    },
++    Builds {
++        target: Py<PyAny>,
++        args: Vec<Node>,
++        names: Vec<Py<PyAny>>,
++        kwargs: Vec<Node>,
++        label: u64,
++    },
++    Shared {
++        key: Py<PyAny>,
++        strategy: Py<PyAny>,
++        inner: Box<Node>,
++        label: u64,
++    },
++    Filter {
++        inner: Box<Node>,
++        conditions: Vec<Py<PyAny>>,
++        repr: String,
++        label: u64,
++    },
++    /// a strategy the compiler could not express: `data.draw(strategy)`
++    Opaque(Py<PyAny>),
++}
++
++fn item<'py>(t: &Bound<'py, PyTuple>, i: usize) -> PyResult<Bound<'py, PyAny>> {
++    t.get_item(i)
++}
++
++fn parse_children(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Node>> {
++    obj.try_iter()?.map(|c| Node::from_py(&c?)).collect()
++}
++
++impl Node {
++    pub(crate) fn from_py(obj: &Bound<'_, PyAny>) -> PyResult<Node> {
++        let t = obj.cast::<PyTuple>()?;
++        let tag: String = item(t, 0)?.extract()?;
++        Ok(match tag.as_str() {
++            "int" => Node::Int(
++                IntNode {
++                    lo: item(t, 1)?.extract()?,
++                    hi: item(t, 2)?.extract()?,
++                    lo64: item(t, 3)?.extract()?,
++                    hi64: item(t, 4)?.extract()?,
++                    shrink_towards: item(t, 5)?.extract()?,
++                    keys: item(t, 6)?.extract()?,
++                    weights: item(t, 7)?.extract()?,
++                },
++                item(t, 8)?.extract()?,
++            ),
++            "float" => Node::Float {
++                min: item(t, 1)?.extract()?,
++                max: item(t, 2)?.extract()?,
++                allow_nan: item(t, 3)?.extract()?,
++                snm: item(t, 4)?.extract()?,
++                label: item(t, 5)?.extract()?,
++            },
++            "bool" => Node::Bool {
++                p: item(t, 1)?.extract()?,
++                label: item(t, 2)?.extract()?,
++            },
++            "bytes" => Node::Bytes {
++                min: item(t, 1)?.extract()?,
++                max: item(t, 2)?.extract()?,
++                label: item(t, 3)?.extract()?,
++            },
++            "text" => Node::Text {
++                ranges: item(t, 1)?.extract()?,
++                min: item(t, 2)?.extract()?,
++                max: item(t, 3)?.extract()?,
++                label: item(t, 4)?.extract()?,
++            },
++            "text_list" => Node::TextList {
++                elem: Box::new(Node::from_py(&item(t, 1)?)?),
++                min: item(t, 2)?.extract()?,
++                max: item(t, 3)?.extract()?,
++                p_continue: item(t, 4)?.extract()?,
++                label: item(t, 5)?.extract()?,
++            },
++            "empty_list" => Node::EmptyList {
++                label: item(t, 1)?.extract()?,
++            },
++            "list" => Node::List {
++                elem: Box::new(Node::from_py(&item(t, 1)?)?),
++                min: item(t, 2)?.extract()?,
++                max: item(t, 3)?.extract()?,
++                p_continue: item(t, 4)?.extract()?,
++                label: item(t, 5)?.extract()?,
++            },
++            "tuple" => Node::Tuple {
++                children: parse_children(&item(t, 1)?)?,
++                label: item(t, 2)?.extract()?,
++            },
++            "fixeddict" => Node::FixedDict {
++                keys: item(t, 1)?
++                    .try_iter()?
++                    .map(|k| Ok(k?.unbind()))
++                    .collect::<PyResult<_>>()?,
++                children: parse_children(&item(t, 2)?)?,
++                dict_type: item(t, 3)?.unbind(),
++                label: item(t, 4)?.extract()?,
++            },
++            "one_of" => Node::OneOf {
++                children: parse_children(&item(t, 1)?)?,
++                inner_label: item(t, 2)?.extract()?,
++                label: item(t, 3)?.extract()?,
++            },
++            "sampled" => {
++                let elements = item(t, 1)?;
++                Node::Sampled {
++                    n: elements.len()? as i64,
++                    elements: elements.unbind(),
++                    maps: item(t, 2)?
++                        .try_iter()?
++                        .map(|m| Ok(m?.unbind()))
++                        .collect::<PyResult<_>>()?,
++                    label: item(t, 3)?.extract()?,
++                }
++            }
++            "just" => Node::Just {
++                value: item(t, 1)?.unbind(),
++                maps: item(t, 2)?
++                    .try_iter()?
++                    .map(|m| Ok(m?.unbind()))
++                    .collect::<PyResult<_>>()?,
++                label: item(t, 3)?.extract()?,
++            },
++            "map" => Node::Map {
++                inner: Box::new(Node::from_py(&item(t, 1)?)?),
++                pack: item(t, 2)?.unbind(),
++                label: item(t, 3)?.extract()?,
++            },
++            "builds" => Node::Builds {
++                target: item(t, 1)?.unbind(),
++                args: parse_children(&item(t, 2)?)?,
++                names: item(t, 3)?
++                    .try_iter()?
++                    .map(|k| Ok(k?.unbind()))
++                    .collect::<PyResult<_>>()?,
++                kwargs: parse_children(&item(t, 4)?)?,
++                label: item(t, 5)?.extract()?,
++            },
++            "shared" => Node::Shared {
++                key: item(t, 1)?.unbind(),
++                strategy: item(t, 2)?.unbind(),
++                inner: Box::new(Node::from_py(&item(t, 3)?)?),
++                label: item(t, 4)?.extract()?,
++            },
++            "filter" => Node::Filter {
++                inner: Box::new(Node::from_py(&item(t, 1)?)?),
++                conditions: item(t, 2)?
++                    .try_iter()?
++                    .map(|c| Ok(c?.unbind()))
++                    .collect::<PyResult<_>>()?,
++                repr: item(t, 3)?.extract()?,
++                label: item(t, 4)?.extract()?,
++            },
++            "opaque" => Node::Opaque(item(t, 1)?.unbind()),
++            other => return Err(HegelError::new_err(format!("unknown IR node {other:?}"))),
++        })
++    }
++}
++
++/// The compiled form of one strategy: the tree plus the span labels the
++/// interpreter shares with Hypothesis's own `many`, filter and map draws.
++#[pyclass(module = "hypothesis._native.internal.hegel")]
++pub(crate) struct CompiledStrategy {
++    root: Node,
++    one_from_many: u64,
++    filtered: u64,
++    mapped: u64,
++}
++
++// SAFETY: every Py<PyAny> inside is only touched with the GIL held.
++unsafe impl Send for CompiledStrategy {}
++unsafe impl Sync for CompiledStrategy {}
++
++#[pymethods]
++impl CompiledStrategy {
++    #[new]
++    fn new(
++        desc: &Bound<'_, PyAny>,
++        one_from_many: u64,
++        filtered: u64,
++        mapped: u64,
++    ) -> PyResult<Self> {
++        Ok(CompiledStrategy {
++            root: Node::from_py(desc)?,
++            one_from_many,
++            filtered,
++            mapped,
++        })
++    }
++}
++
++/// Cached per engine: libhegel text generators by alphabet and size bounds.
++type TextGenKey = (Vec<(u32, u32)>, u64, u64);
++
++#[derive(Default)]
++pub(crate) struct TextGenCache {
++    gens: Mutex<HashMap<TextGenKey, usize>>,
++}
++
++impl TextGenCache {
++    fn get(
++        &self,
++        ctx: *mut sys::HegelContext,
++        ranges: &[(u32, u32)],
++        min: u64,
++        max: u64,
++    ) -> PyResult<*mut sys::HegelStringGenerator> {
++        let key = (ranges.to_vec(), min, max);
++        let mut gens = self.gens.lock().unwrap();
++        if let Some(&p) = gens.get(&key) {
++            return Ok(p as *mut sys::HegelStringGenerator);
++        }
++        let flat: Vec<u32> = ranges.iter().flat_map(|&(lo, hi)| [lo, hi]).collect();
++        let mut gen: *mut sys::HegelStringGenerator = std::ptr::null_mut();
++        // SAFETY: flat outlives the call; libhegel copies the ranges.
++        let r = unsafe {
++            sys::hegel_string_generator_text_ranges(
++                ctx,
++                min,
++                max,
++                flat.as_ptr(),
++                ranges.len(),
++                &mut gen,
++            )
++        };
++        check(ctx, r, "string_generator_text_ranges")?;
++        gens.insert(key, gen as usize);
++        Ok(gen)
++    }
++
++    pub(crate) fn free_all(&self, ctx: *mut sys::HegelContext) {
++        let mut gens = self.gens.lock().unwrap();
++        for (_, p) in gens.drain() {
++            // SAFETY: each generator is freed exactly once, after all draws.
++            unsafe {
++                let _ = sys::hegel_string_generator_free(ctx, p as *mut sys::HegelStringGenerator);
++            }
++        }
++    }
++}
++
++struct Gen<'a, 'py> {
++    py: Python<'py>,
++    ctx: *mut sys::HegelContext,
++    tc: *mut sys::HegelTestCase,
++    engine: &'a Engine,
++    compiled: &'a CompiledStrategy,
++    data: Bound<'py, PyAny>,
++    data_draw: Bound<'py, PyAny>,
++    record_many: Bound<'py, PyAny>,
++    shared: Bound<'py, PyDict>,
++    unsatisfied: Bound<'py, PyType>,
++    int_from_bytes: Bound<'py, PyAny>,
++    recorded: Vec<(&'static str, Py<PyAny>)>,
++}
++
++impl<'a, 'py> Gen<'a, 'py> {
++    fn flush(&mut self) -> PyResult<()> {
++        if self.recorded.is_empty() {
++            return Ok(());
++        }
++        let items: Vec<Bound<'py, PyAny>> = self
++            .recorded
++            .drain(..)
++            .map(|(kind, v)| {
++                PyTuple::new(
++                    self.py,
++                    [
++                        PyString::new(self.py, kind).into_any(),
++                        v.into_bound(self.py),
++                    ],
++                )
++                .map(|t| t.into_any())
++            })
++            .collect::<PyResult<_>>()?;
++        let list = PyList::new(self.py, items)?;
++        self.record_many.call1((list,))?;
++        Ok(())
++    }
++
++    fn record(&mut self, kind: &'static str, v: &Bound<'py, PyAny>) {
++        self.recorded.push((kind, v.clone().unbind()));
++    }
++
++    fn start_span(&self, label: u64) -> PyResult<()> {
++        // SAFETY: tc is live for the whole generate call.
++        let r = unsafe { sys::hegel_start_span(self.ctx, self.tc, label) };
++        check(self.ctx, r, "start_span")
++    }
++
++    fn stop_span(&self, discard: bool) {
++        // SAFETY: as above. A failure here means the case is already over.
++        let _ = unsafe { sys::hegel_stop_span(self.ctx, self.tc, discard) };
++    }
++
++    fn spanned<T>(&mut self, label: u64, f: impl FnOnce(&mut Self) -> PyResult<T>) -> PyResult<T> {
++        self.start_span(label)?;
++        let out = f(self);
++        self.stop_span(false);
++        out
++    }
++
++    fn draw_bool(&mut self, p: f64, forced: Option<bool>) -> PyResult<bool> {
++        let mut out = false;
++        // SAFETY: tc is live.
++        let r = unsafe {
++            sys::hegel_generate_boolean(
++                self.ctx,
++                self.tc,
++                p,
++                forced.unwrap_or(false),
++                forced.is_some(),
++                &mut out,
++            )
++        };
++        check(self.ctx, r, "generate_boolean")?;
++        let v = out.into_pyobject(self.py)?.to_owned().into_any();
++        self.record("boolean", &v);
++        Ok(out)
++    }
++
++    /// A plain bounded index draw (`data.draw_integer(lo, hi)`), as the
++    /// collection strategies make them: no weights, no span of its own.
++    fn draw_index(&mut self, lo: i64, hi: i64) -> PyResult<i64> {
++        self.draw_int(&IntNode {
++            lo: vec![],
++            hi: vec![],
++            lo64: Some(lo),
++            hi64: Some(hi),
++            shrink_towards: 0,
++            keys: vec![],
++            weights: vec![],
++        })?
++        .extract()
++    }
++
++    fn draw_int(&mut self, n: &IntNode) -> PyResult<Bound<'py, PyAny>> {
++        let v = if let (Some(lo), Some(hi)) = (n.lo64, n.hi64) {
++            let mut out: i64 = 0;
++            // SAFETY: tc is live; slices outlive the call.
++            let r = unsafe {
++                sys::hegel_generate_integer_weighted(
++                    self.ctx,
++                    self.tc,
++                    lo,
++                    hi,
++                    n.shrink_towards,
++                    n.keys.as_ptr(),
++                    n.weights.as_ptr(),
++                    n.keys.len(),
++                    &mut out,
++                )
++            };
++            check(self.ctx, r, "generate_integer_weighted")?;
++            out.into_pyobject(self.py)?.into_any()
++        } else {
++            let cap = n.lo.len().max(n.hi.len()).max(1);
++            let mut out = vec![0u8; cap];
++            let mut out_len = 0usize;
++            // SAFETY: buffers sized per the ABI contract.
++            let r = unsafe {
++                sys::hegel_generate_integer_big(
++                    self.ctx,
++                    self.tc,
++                    n.lo.as_ptr(),
++                    n.lo.len(),
++                    n.hi.as_ptr(),
++                    n.hi.len(),
++                    out.as_mut_ptr(),
++                    cap,
++                    &mut out_len,
++                )
++            };
++            check(self.ctx, r, "generate_integer_big")?;
++            {
++                let kw = PyDict::new(self.py);
++                kw.set_item("signed", true)?;
++                self.int_from_bytes
++                    .call((PyBytes::new(self.py, &out), "little"), Some(&kw))?
++            }
++        };
++        self.record("integer", &v);
++        Ok(v)
++    }
++
++    fn draw_float(
++        &mut self,
++        min: f64,
++        max: f64,
++        allow_nan: bool,
++        snm: f64,
++    ) -> PyResult<Bound<'py, PyAny>> {
++        let mut out = 0.0f64;
++        // SAFETY: tc is live.
++        let r = unsafe {
++            sys::hegel_generate_float(
++                self.ctx,
++                self.tc,
++                64,
++                min,
++                max,
++                allow_nan,
++                min.is_infinite() || max.is_infinite(),
++                false,
++                false,
++                snm,
++                &mut out,
++            )
++        };
++        check(self.ctx, r, "generate_float")?;
++        let v = out.into_pyobject(self.py)?.into_any();
++        self.record("float", &v);
++        Ok(v)
++    }
++
++    fn draw_bytes(&mut self, min: u64, max: u64) -> PyResult<Bound<'py, PyAny>> {
++        let mut res = sys::hegel_generate_bytes_result_t {
++            data: std::ptr::null_mut(),
++            len: 0,
++        };
++        // SAFETY: result buffer is libhegel-allocated and freed right after copying.
++        let v = unsafe {
++            let r = sys::hegel_generate_bytes(self.ctx, self.tc, min, max, &mut res);
++            check(self.ctx, r, "generate_bytes")?;
++            let slice: &[u8] = if res.data.is_null() {
++                &[]
++            } else {
++                std::slice::from_raw_parts(res.data, res.len)
++            };
++            let v = PyBytes::new(self.py, slice).into_any();
++            let _ = sys::hegel_generate_bytes_result_free(self.ctx, &mut res);
++            v
++        };
++        self.record("bytes", &v);
++        Ok(v)
++    }
++
++    fn draw_text(
++        &mut self,
++        ranges: &[(u32, u32)],
++        min: u64,
++        max: u64,
++    ) -> PyResult<Bound<'py, PyAny>> {
++        let gen = self.engine.text_gens.get(self.ctx, ranges, min, max)?;
++        let mut res = sys::hegel_generate_string_result_t {
++            data: std::ptr::null_mut(),
++            len: 0,
++        };
++        // SAFETY: as draw_bytes; the buffer is UTF-8.
++        let v = unsafe {
++            let r = sys::hegel_generate_string(self.ctx, self.tc, gen, &mut res);
++            check(self.ctx, r, "generate_string")?;
++            let slice: &[u8] = if res.data.is_null() {
++                &[]
++            } else {
++                std::slice::from_raw_parts(res.data as *const u8, res.len)
++            };
++            let s = String::from_utf8_lossy(slice).into_owned();
++            let _ = sys::hegel_generate_string_result_free(self.ctx, &mut res);
++            PyString::new(self.py, &s).into_any()
++        };
++        self.record("string", &v);
++        Ok(v)
++    }
++
++    /// Hypothesis's `many`: the continue decisions, forced below `min` and
++    /// above `max`, each inside a `one more from many()` span.
++    fn many(
++        &mut self,
++        min: u64,
++        max: u64,
++        p_continue: f64,
++        mut body: impl FnMut(&mut Self) -> PyResult<Bound<'py, PyAny>>,
++    ) -> PyResult<Vec<Bound<'py, PyAny>>> {
++        let mut out = Vec::new();
++        let mut count: u64 = 0;
++        let label = self.compiled.one_from_many;
++        loop {
++            self.start_span(label)?;
++            let more = if min == max {
++                count < min
++            } else {
++                let forced = if count < min {
++                    Some(true)
++                } else if count >= max {
++                    Some(false)
++                } else {
++                    None
++                };
++                self.draw_bool(p_continue, forced)?
++            };
++            if !more {
++                self.stop_span(false);
++                return Ok(out);
++            }
++            count += 1;
++            let v = body(self);
++            self.stop_span(false);
++            out.push(v?);
++        }
++    }
++
++    fn apply_maps(
++        &mut self,
++        mut v: Bound<'py, PyAny>,
++        maps: &[Py<PyAny>],
++    ) -> PyResult<Bound<'py, PyAny>> {
++        for m in maps {
++            v = m.bind(self.py).call1((v,))?;
++        }
++        Ok(v)
++    }
++
++    fn gen(&mut self, node: &Node) -> PyResult<Bound<'py, PyAny>> {
++        match node {
++            Node::Int(n, label) => self.spanned(*label, |g| g.draw_int(n)),
++            Node::Float {
++                min,
++                max,
++                allow_nan,
++                snm,
++                label,
++            } => self.spanned(*label, |g| g.draw_float(*min, *max, *allow_nan, *snm)),
++            Node::Bool { p, label } => self.spanned(*label, |g| {
++                Ok(g.draw_bool(*p, None)?
++                    .into_pyobject(g.py)?
++                    .to_owned()
++                    .into_any())
++            }),
++            Node::Bytes { min, max, label } => self.spanned(*label, |g| g.draw_bytes(*min, *max)),
++            Node::Text {
++                ranges,
++                min,
++                max,
++                label,
++            } => self.spanned(*label, |g| g.draw_text(ranges, *min, *max)),
++            Node::TextList {
++                elem,
++                min,
++                max,
++                p_continue,
++                label,
++            } => self.spanned(*label, |g| {
++                let parts = g.many(*min, *max, *p_continue, |g| g.gen(elem))?;
++                let mut s = String::new();
++                for p in parts {
++                    s.push_str(&p.extract::<String>()?);
++                }
++                Ok(PyString::new(g.py, &s).into_any())
++            }),
++            Node::EmptyList { label } => {
++                self.spanned(*label, |g| Ok(PyList::empty(g.py).into_any()))
++            }
++            Node::List {
++                elem,
++                min,
++                max,
++                p_continue,
++                label,
++            } => self.spanned(*label, |g| {
++                let items = g.many(*min, *max, *p_continue, |g| g.gen(elem))?;
++                Ok(PyList::new(g.py, items)?.into_any())
++            }),
++            Node::Tuple { children, label } => self.spanned(*label, |g| {
++                let items: Vec<_> = children.iter().map(|c| g.gen(c)).collect::<PyResult<_>>()?;
++                Ok(PyTuple::new(g.py, items)?.into_any())
++            }),
++            Node::FixedDict {
++                keys,
++                children,
++                dict_type,
++                label,
++            } => self.spanned(*label, |g| {
++                let mut pairs: Vec<Bound<'py, PyAny>> = keys
++                    .iter()
++                    .zip(children)
++                    .map(|(k, c)| {
++                        let v = g.gen(c)?;
++                        Ok(PyTuple::new(g.py, [k.bind(g.py).clone(), v])?.into_any())
++                    })
++                    .collect::<PyResult<_>>()?;
++                // FixedDictStrategy varies the iteration order with a reversed
++                // Fisher-Yates shuffle (cu.fisher_yates_shuffle)
++                let n = pairs.len();
++                for i in 0..n.saturating_sub(1) {
++                    let j = g.draw_index(i as i64, (n - 1) as i64)?;
++                    pairs.swap(i, j as usize);
++                }
++                dict_type.bind(g.py).call1((PyList::new(g.py, pairs)?,))
++            }),
++            Node::OneOf {
++                children,
++                inner_label,
++                label,
++            } => self.spanned(*label, |g| {
++                if children.len() == 1 {
++                    return g.gen(&children[0]);
++                }
++                let n = children.len() as i64;
++                let i: i64 = g
++                    .spanned(*inner_label, |g| {
++                        g.draw_int(&IntNode {
++                            lo: vec![],
++                            hi: vec![],
++                            lo64: Some(0),
++                            hi64: Some(n - 1),
++                            shrink_towards: 0,
++                            keys: vec![],
++                            weights: vec![],
++                        })
++                    })?
++                    .extract()?;
++                g.gen(&children[i as usize])
++            }),
++            Node::Sampled {
++                elements,
++                n,
++                maps,
++                label,
++            } => self.spanned(*label, |g| {
++                let i: i64 = g
++                    .draw_int(&IntNode {
++                        lo: vec![],
++                        hi: vec![],
++                        lo64: Some(0),
++                        hi64: Some(n - 1),
++                        shrink_towards: 0,
++                        keys: vec![],
++                        weights: vec![],
++                    })?
++                    .extract()?;
++                let v = elements.bind(g.py).get_item(i)?;
++                g.apply_maps(v, maps)
++            }),
++            Node::Just { value, maps, label } => {
++                self.spanned(*label, |g| g.apply_maps(value.bind(g.py).clone(), maps))
++            }
++            Node::Map { inner, pack, label } => self.spanned(*label, |g| {
++                let mapped = g.compiled.mapped;
++                let mut last_err = None;
++                for _ in 0..3 {
++                    g.start_span(mapped)?;
++                    let x = g.gen(inner)?;
++                    match pack.bind(g.py).call1((x,)) {
++                        Ok(v) => {
++                            g.stop_span(false);
++                            return Ok(v);
++                        }
++                        Err(e) if e.is_instance(g.py, &g.unsatisfied) => {
++                            g.stop_span(true);
++                            last_err = Some(e);
++                        }
++                        Err(e) => {
++                            g.stop_span(false);
++                            return Err(e);
++                        }
++                    }
++                }
++                Err(last_err.unwrap())
++            }),
++            Node::Builds {
++                target,
++                args,
++                names,
++                kwargs,
++                label,
++            } => self.spanned(*label, |g| {
++                let a: Vec<_> = args.iter().map(|c| g.gen(c)).collect::<PyResult<_>>()?;
++                let kw = PyDict::new(g.py);
++                for (name, c) in names.iter().zip(kwargs) {
++                    let v = g.gen(c)?;
++                    kw.set_item(name.bind(g.py), v)?;
++                }
++                target.bind(g.py).call(PyTuple::new(g.py, a)?, Some(&kw))
++            }),
++            Node::Shared {
++                key,
++                strategy,
++                inner,
++                label,
++            } => self.spanned(*label, |g| {
++                let k = key.bind(g.py);
++                if let Some(entry) = g.shared.get_item(k)? {
++                    return entry.get_item(0);
++                }
++                let v = g.gen(inner)?;
++                g.shared.set_item(
++                    k,
++                    PyTuple::new(g.py, [v.clone(), strategy.bind(g.py).clone()])?,
++                )?;
++                Ok(v)
++            }),
++            Node::Filter {
++                inner,
++                conditions,
++                repr,
++                label,
++            } => self.spanned(*label, |g| {
++                let filtered = g.compiled.filtered;
++                for _ in 0..3 {
++                    g.start_span(filtered)?;
++                    let v = g.gen(inner)?;
++                    let mut ok = true;
++                    for cond in conditions {
++                        if !cond.bind(g.py).call1((v.clone(),))?.is_truthy()? {
++                            ok = false;
++                            break;
++                        }
++                    }
++                    if ok {
++                        g.stop_span(false);
++                        return Ok(v);
++                    }
++                    g.stop_span(true);
++                }
++                g.flush()?;
++                g.data.call_method1(
++                    "mark_invalid",
++                    (format!("Aborted test because unable to satisfy {repr}"),),
++                )?;
++                Err(HegelError::new_err("mark_invalid returned"))
++            }),
++            Node::Opaque(strategy) => {
++                self.flush()?;
++                self.data_draw.call1((strategy.bind(self.py),))
++            }
++        }
++    }
++}
++
++/// Generate one value tree for `compiled` against `tc`, recording draws
++/// into `data` (a `ConjectureData` with `_hegel_record_many`) and sharing
++/// `shared` (its `_shared_strategy_draws`).
++pub(crate) fn generate<'py>(
++    py: Python<'py>,
++    tc: &TestCase,
++    engine: &Engine,
++    compiled: &CompiledStrategy,
++    data: Bound<'py, PyAny>,
++    shared: Bound<'py, PyDict>,
++) -> PyResult<Bound<'py, PyAny>> {
++    let errors = py.import("hypothesis.errors")?;
++    let unsatisfied = errors
++        .getattr("UnsatisfiedAssumption")?
++        .cast_into::<PyType>()?;
++    let int_from_bytes = py
++        .import("builtins")?
++        .getattr("int")?
++        .getattr("from_bytes")?;
++    let mut g = Gen {
++        py,
++        ctx: engine.ctx,
++        tc: tc.tc,
++        engine,
++        compiled,
++        data_draw: data.getattr("draw")?,
++        record_many: data.getattr("_hegel_record_many")?,
++        data,
++        shared,
++        unsatisfied,
++        int_from_bytes,
++        recorded: Vec::new(),
++    };
++    let out = g.gen(&compiled.root);
++    // keep what was recorded even when the draw failed (overrun, filters)
++    let flushed = g.flush();
++    let v = out?;
++    flushed?;
++    Ok(v)
++}
++
++pub(crate) fn choices_blob<'py>(
++    py: Python<'py>,
++    engine: &Engine,
++    tc: &TestCase,
++) -> PyResult<Bound<'py, PyString>> {
++    let ctx = engine.ctx;
++    let mut res = sys::hegel_generate_string_result_t {
++        data: std::ptr::null_mut(),
++        len: 0,
++    };
++    // SAFETY: the buffer is libhegel-allocated ASCII and freed right after copying.
++    unsafe {
++        let r = sys::hegel_test_case_choices(ctx, tc.tc, &mut res);
++        check(ctx, r, "test_case_choices")?;
++        let slice: &[u8] = if res.data.is_null() {
++            &[]
++        } else {
++            std::slice::from_raw_parts(res.data as *const u8, res.len)
++        };
++        let s = String::from_utf8_lossy(slice).into_owned();
++        let _ = sys::hegel_generate_string_result_free(ctx, &mut res);
++        Ok(PyString::new(py, &s))
++    }
++}
++
++#[allow(dead_code)]
++fn _unused(_: *const c_char, _: CString) {}
+diff --git a/hypothesis/rust/src/internal/mod.rs b/hypothesis/rust/src/internal/mod.rs
+index 5300e82d..187b5c38 100644
+--- a/hypothesis/rust/src/internal/mod.rs
++++ b/hypothesis/rust/src/internal/mod.rs
+@@ -11,6 +11,7 @@
+ mod cathetus;
+ mod floats;
+ mod hegel;
++mod hegel_gen;
+ 
+ #[pyo3::pymodule]
+ pub(crate) mod internal {
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/data.py b/hypothesis/src/hypothesis/internal/conjecture/data.py
+index 3b0fb12b..30686b3a 100644
+--- a/hypothesis/src/hypothesis/internal/conjecture/data.py
++++ b/hypothesis/src/hypothesis/internal/conjecture/data.py
+@@ -10,6 +10,7 @@
+ 
+ import datetime
+ import math
++import sys
+ import time
+ import types
+ import weakref
+@@ -115,6 +116,29 @@ MisalignedAt: TypeAlias = tuple[int, ChoiceTypeT, ChoiceConstraintsT, ChoiceT |
+ TOP_LABEL = calc_label_from_name("top")
+ MAX_DEPTH = 100
+ 
++_NOT_BATCHED = object()
++_PERMISSIVE_CONSTRAINTS: dict[str, Any] = {
++    "integer": {
++        "min_value": None,
++        "max_value": None,
++        "weights": None,
++        "shrink_towards": 0,
++    },
++    "float": {
++        "min_value": -math.inf,
++        "max_value": math.inf,
++        "allow_nan": True,
++        "smallest_nonzero_magnitude": SMALLEST_SUBNORMAL,
++    },
++    "string": {
++        "intervals": IntervalSet(((0, sys.maxunicode),)),
++        "min_size": 0,
++        "max_size": COLLECTION_DEFAULT_MAX_SIZE,
++    },
++    "bytes": {"min_size": 0, "max_size": COLLECTION_DEFAULT_MAX_SIZE},
++    "boolean": {"p": 0.5},
++}
++
+ threadlocal = ThreadLocal(global_test_counter=int)
+ 
+ 
+@@ -879,6 +903,10 @@ class ConjectureData:
+             value = self._pop_choice(choice_type, constraints, forced=forced)
+         elif forced is None:
+             value = getattr(self.provider, f"draw_{choice_type}")(**constraints)
++        elif observe and (draw_forced := getattr(self.provider, "draw_forced", None)):
++            # EXPERIMENT (libhegel): a provider that keeps its own choice
++            # sequence has to see the draws Hypothesis forces too
++            draw_forced(choice_type, constraints, forced)
+ 
+         if forced is not None:
+             value = forced
+@@ -1211,6 +1239,26 @@ class ConjectureData:
+         self.index += 1
+         return choice
+ 
++    def _hegel_record_many(self, drawn: list[tuple[ChoiceTypeT, ChoiceT]]) -> None:
++        """EXPERIMENT: append the choices a native generator made, in order,
++        as nodes with maximally permissive constraints (their values are
++        libhegel's, which owns replay and shrinking on that path)."""
++        nodes = []
++        for choice_type, value in drawn:
++            if choice_type == "float" and math.isnan(value):
++                value = int_to_float(float_to_int(value))
++            nodes.append(
++                ChoiceNode(
++                    type=choice_type,
++                    value=value,
++                    constraints=_PERMISSIVE_CONSTRAINTS[choice_type],
++                    was_forced=False,
++                    index=len(self.nodes) + len(nodes),
++                )
++            )
++        self.nodes += tuple(nodes)
++        self.length += choices_size([n.value for n in nodes])
++
+     def as_result(self) -> ConjectureResult | _Overrun:
+         """Convert the result of running this test into
+         either an Overrun object or a ConjectureResult."""
+@@ -1282,6 +1330,19 @@ class ConjectureData:
+             label = unwrapped.label
+             assert isinstance(label, int)
+ 
++        # EXPERIMENT: a provider that generates whole strategies natively
++        # (hegel_runner.HegelCaseProvider) takes the draw here; it records
++        # the choices it made through _hegel_record_many.
++        draw_strategy = getattr(self.provider, "draw_strategy", None)
++        if draw_strategy is not None and self.prefix is None:
++            batched = draw_strategy(unwrapped, self)
++            if batched is not _NOT_BATCHED:
++                if at_top_level:
++                    assert start_time is not None
++                    key = observe_as or f"generate:unlabeled_{len(self.draw_times)}"
++                    self.draw_times[key] = time.perf_counter() - start_time
++                return batched
++
+         # If the next prefix element is a ValueHole, we are the strategy being
+         # asked to re-encode its value: replace the hole with our inversion of
+         # it, and let do_draw consume those choices (under our own constraints)
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
+new file mode 100644
+index 00000000..477c6e39
+--- /dev/null
++++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
+@@ -0,0 +1,249 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: compile the declarative part of a strategy object graph into the
++tree the libhegel interpreter (``hegel_gen.rs``) walks.
++
++Most strategies are data, not code: a strategy's draw is a function of its
++attributes and of the values drawn so far, and for the built-in ones that
++function is known here. Those become IR nodes mirroring each ``do_draw``.
++Anything else (composite, flatmap, data, recursion, stateful, filters on
++sampled_from, optional fixed-dictionary keys, strategies drawing from Python
++state) becomes an ``opaque`` leaf: the interpreter hands it back to
++``ConjectureData.draw`` to run interactively against the same libhegel case.
++A compiled root that is itself opaque is reported as not batchable.
++"""
++
++import math
++from typing import Any
++
++from hypothesis._native.internal import hegel as _hegel
++from hypothesis.internal.conjecture.hegel_provider import (
++    INT64_MAX,
++    INT64_MIN,
++    SURROGATES,
++    UNBOUNDED_MAGNITUDE,
++    _signed_bytes,
++)
++from hypothesis.internal.conjecture.providers import COLLECTION_DEFAULT_MAX_SIZE
++from hypothesis.internal.conjecture.utils import ONE_FROM_MANY_LABEL, _calc_p_continue
++from hypothesis.strategies._internal.collections import (
++    FixedDictStrategy,
++    ListStrategy,
++    TupleStrategy,
++)
++from hypothesis.strategies._internal.core import BuildsStrategy
++from hypothesis.strategies._internal.lazy import unwrap_strategies
++from hypothesis.strategies._internal.misc import BooleansStrategy, JustStrategy
++from hypothesis.strategies._internal.numbers import FloatStrategy, IntegersStrategy
++from hypothesis.strategies._internal.shared import SharedStrategy
++from hypothesis.strategies._internal.strategies import (
++    FILTERED_SEARCH_STRATEGY_DO_DRAW_LABEL,
++    MAPPED_SEARCH_STRATEGY_DO_DRAW_LABEL,
++    FilteredStrategy,
++    MappedStrategy,
++    OneOfStrategy,
++    SampledFromStrategy,
++    SearchStrategy,
++)
++from hypothesis.strategies._internal.strings import (
++    BytesStrategy,
++    OneCharStringStrategy,
++    TextStrategy,
++)
++
++NOT_BATCHABLE = object()
++_CACHE_ATTR = "_hegel_compiled"
++MAX_COMPILE_DEPTH = 32
++
++
++def _size(n: Any) -> int:
++    if n is None or n == math.inf:
++        return COLLECTION_DEFAULT_MAX_SIZE
++    return int(n)
++
++
++def _int_node(start: int | None, end: int | None, label: int) -> tuple:
++    """Mirror IntegersStrategy.do_draw plus the provider's bound clamping."""
++    weights: dict[int, float] | None = None
++    if start is not None and end is not None and end - start > 127:
++        weights = {start: 2 / 128, start + 1: 1 / 128, end - 1: 1 / 128, end: 2 / 128}
++    if start is None and end is None:
++        lo, hi = -UNBOUNDED_MAGNITUDE, UNBOUNDED_MAGNITUDE
++    elif start is None:
++        assert end is not None
++        lo, hi = -max(UNBOUNDED_MAGNITUDE, 2 * abs(end)), end
++    elif end is None:
++        lo, hi = start, max(UNBOUNDED_MAGNITUDE, 2 * abs(start))
++    else:
++        lo, hi = start, end
++    fits = INT64_MIN <= lo and hi <= INT64_MAX
++    keys = list(weights) if (weights and fits) else []
++    ws = list(weights.values()) if (weights and fits) else []
++    return (
++        "int",
++        _signed_bytes(lo),
++        _signed_bytes(hi),
++        lo if fits else None,
++        hi if fits else None,
++        0,
++        keys,
++        ws,
++        label,
++    )
++
++
++def _compile(s: SearchStrategy, stack: set[int], depth: int) -> tuple:
++    s = unwrap_strategies(s)
++    label = s.label
++    if id(s) in stack or depth > MAX_COMPILE_DEPTH:
++        return ("opaque", s)
++    stack = stack | {id(s)}
++
++    def child(c: SearchStrategy) -> tuple:
++        return _compile(c, stack, depth + 1)
++
++    if isinstance(s, IntegersStrategy):
++        return _int_node(s.start, s.end, label)
++    if isinstance(s, FloatStrategy):
++        return (
++            "float",
++            float(s.min_value),
++            float(s.max_value),
++            s.allow_nan,
++            s.smallest_nonzero_magnitude,
++            label,
++        )
++    if isinstance(s, BooleansStrategy):
++        return ("bool", 0.5, label)
++    if isinstance(s, BytesStrategy):
++        return ("bytes", s.min_size, _size(s.max_size), label)
++    if isinstance(s, OneCharStringStrategy):
++        return _text_node(s.intervals, 1, 1, label)
++    if isinstance(s, TextStrategy):
++        elems = unwrap_strategies(s.element_strategy)
++        if isinstance(elems, OneCharStringStrategy):
++            return _text_node(elems.intervals, s.min_size, _size(s.max_size), label)
++        if elems.is_empty:
++            return ("just", "", [], label)
++        return (
++            "text_list",
++            child(s.element_strategy),
++            s.min_size,
++            _size(s.max_size),
++            _calc_p_continue(s.average_size - s.min_size, s.max_size - s.min_size),
++            label,
++        )
++    if type(s) is ListStrategy:
++        if s.element_strategy.is_empty:
++            return ("empty_list", label)
++        return (
++            "list",
++            child(s.element_strategy),
++            s.min_size,
++            _size(s.max_size),
++            _calc_p_continue(s.average_size - s.min_size, s.max_size - s.min_size),
++            label,
++        )
++    if type(s) is TupleStrategy:
++        return ("tuple", [child(c) for c in s.element_strategies], label)
++    if type(s) is FixedDictStrategy and s.optional is None:
++        keys = list(s.mapping)
++        return (
++            "fixeddict",
++            keys,
++            [child(s.mapping[k]) for k in keys],
++            type(s.mapping),
++            label,
++        )
++    if type(s) is OneOfStrategy:
++        branches = s.element_strategies
++        if not branches:
++            return ("opaque", s)
++        inner = FilteredStrategy(SampledFromStrategy(branches), conditions=()).label
++        return ("one_of", [child(c) for c in branches], inner, label)
++    if type(s) is JustStrategy:
++        if any(kind == "filter" for kind, _, _ in s._transformations):
++            return ("opaque", s)
++        return ("just", s.value, [f for _, f, _ in s._transformations], label)
++    if type(s) is SampledFromStrategy:
++        if any(kind == "filter" for kind, _, _ in s._transformations):
++            return ("opaque", s)
++        return (
++            "sampled",
++            list(s.elements),
++            [f for _, f, _ in s._transformations],
++            label,
++        )
++    if type(s) is MappedStrategy:
++        return ("map", child(s.mapped_strategy), s.pack, label)
++    if type(s) is BuildsStrategy:
++        return (
++            "builds",
++            s.target,
++            [child(c) for c in s.args],
++            list(s.kwargs),
++            [child(s.kwargs[k]) for k in s.kwargs],
++            label,
++        )
++    if type(s) is SharedStrategy:
++        return ("shared", s.key or s, s, child(s.base), label)
++    if type(s) is FilteredStrategy:
++        return (
++            "filter",
++            child(s.filtered_strategy),
++            list(s.flat_conditions),
++            repr(s),
++            label,
++        )
++    return ("opaque", s)
++
++
++def _text_node(intervals: Any, min_size: int, max_size: int, label: int) -> tuple:
++    ranges = list(intervals.intervals)
++    if not ranges:
++        return ("just", "", [], label)
++    if all(SURROGATES[0] <= lo and hi <= SURROGATES[1] for lo, hi in ranges):
++        # libhegel cannot hold lone surrogates in a string
++        return ("opaque", _ONE_CHAR_FALLBACK(intervals, min_size, max_size))
++    return ("text", ranges, min_size, max_size, label)
++
++
++def _ONE_CHAR_FALLBACK(intervals: Any, min_size: int, max_size: int) -> SearchStrategy:
++    from hypothesis.strategies._internal.strings import TextStrategy
++
++    return TextStrategy(OneCharStringStrategy(intervals), min_size, max_size)
++
++
++def compile_strategy(strategy: SearchStrategy) -> Any:
++    """The compiled form of ``strategy`` (cached on it), or NOT_BATCHABLE
++    when its root is opaque."""
++    try:
++        cached = strategy.__dict__.get(_CACHE_ATTR)
++    except AttributeError:
++        return NOT_BATCHABLE
++    if cached is not None:
++        return cached
++    desc = _compile(strategy, set(), 0)
++    if desc[0] == "opaque":
++        compiled: Any = NOT_BATCHABLE
++    else:
++        compiled = _hegel.CompiledStrategy(
++            desc,
++            ONE_FROM_MANY_LABEL,
++            FILTERED_SEARCH_STRATEGY_DO_DRAW_LABEL,
++            MAPPED_SEARCH_STRATEGY_DO_DRAW_LABEL,
++        )
++    try:
++        strategy.__dict__[_CACHE_ATTR] = compiled
++    except AttributeError:
++        pass
++    return compiled
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
+index 0fb80cdf..452b1c92 100644
+--- a/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
++++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
+@@ -29,6 +29,7 @@ import contextlib
+ import math
+ import random
+ import struct
++import zlib
+ from collections.abc import Callable, Iterator
+ from functools import cached_property
+ from typing import Any, TypeVar
+@@ -179,6 +180,40 @@ class HegelProvider(PrimitiveProvider):
+     def draw_boolean(self, p: float = 0.5) -> bool:
+         return self._draw(lambda tc: tc.draw_boolean(p))
+ 
++    def draw_forced(
++        self, choice_type: str, constraints: dict[str, Any], value: Any
++    ) -> None:
++        """A draw whose value Hypothesis decided itself (``forced=``):
++        record it in libhegel's choice sequence so the two stay aligned.
++        Hypothesis forces only booleans and integers; an integer past int64
++        cannot be recorded yet and is skipped."""
++        if choice_type == "boolean":
++            self._draw(lambda tc: tc.draw_boolean(constraints["p"], forced=value))
++        elif choice_type == "integer":
++            lo, hi = self._integer_bounds(
++                constraints["min_value"],
++                constraints["max_value"],
++                constraints["shrink_towards"],
++            )
++            if INT64_MIN <= lo and hi <= INT64_MAX:
++                self._draw(lambda tc: tc.draw_integer(lo, hi, forced=value))
++
++    @staticmethod
++    def _integer_bounds(
++        min_value: int | None, max_value: int | None, shrink_towards: int
++    ) -> tuple[int, int]:
++        if min_value is None and max_value is None:
++            return (
++                shrink_towards - UNBOUNDED_MAGNITUDE,
++                shrink_towards + UNBOUNDED_MAGNITUDE,
++            )
++        if min_value is None:
++            assert max_value is not None
++            return -max(UNBOUNDED_MAGNITUDE, 2 * abs(max_value)), max_value
++        if max_value is None:
++            return min_value, max(UNBOUNDED_MAGNITUDE, 2 * abs(min_value))
++        return min_value, max_value
++
+     def _draw_bounded_integer(self, lo: int, hi: int) -> int:
+         if INT64_MIN <= lo and hi <= INT64_MAX:
+             return self._draw(lambda tc: tc.draw_integer(lo, hi))
+@@ -213,27 +248,17 @@ class HegelProvider(PrimitiveProvider):
+             assert max_value is not None
+             if INT64_MIN <= min_value and max_value <= INT64_MAX:
+                 keys, ws = list(weights), list(weights.values())
++                st = min(max(shrink_towards, min_value), max_value)
+                 return self._draw(
+                     lambda tc: tc.draw_integer_weighted(
+-                        min_value, max_value, keys, ws, shrink_towards
++                        min_value, max_value, keys, ws, st
+                     )
+                 )
+             if self.draw_boolean(sum(weights.values())):
+                 keys = list(weights)
+                 return keys[self._draw_bounded_integer(0, len(keys) - 1)]
+             return self._draw_bounded_integer(min_value, max_value)
+-        if min_value is None and max_value is None:
+-            lo, hi = (
+-                shrink_towards - UNBOUNDED_MAGNITUDE,
+-                shrink_towards + UNBOUNDED_MAGNITUDE,
+-            )
+-        elif min_value is None:
+-            assert max_value is not None
+-            lo, hi = -max(UNBOUNDED_MAGNITUDE, 2 * abs(max_value)), max_value
+-        elif max_value is None:
+-            lo, hi = min_value, max(UNBOUNDED_MAGNITUDE, 2 * abs(min_value))
+-        else:
+-            lo, hi = min_value, max_value
++        lo, hi = self._integer_bounds(min_value, max_value, shrink_towards)
+         if shrink_towards and INT64_MIN <= lo and hi <= INT64_MAX:
+             # the weighted entry point is the one that carries shrink_towards
+             st = min(max(shrink_towards, lo), hi)
+@@ -362,6 +387,51 @@ class HegelProvider(PrimitiveProvider):
+                 self._draw(lambda tc: tc.stop_span(discard))
+ 
+ 
++def decode_choices(blob: str) -> list[ChoiceT]:
++    """Inverse of |encode_choices| for the raw and zlib blob forms."""
++    payload = base64.b64decode(blob)
++    body = payload[1:]
++    if payload[:1] == b"\x01":
++        body = zlib.decompress(body)
++    elif payload[:1] != b"\x00":
++        raise ValueError(f"unsupported blob prefix {payload[:1]!r}")
++    pos = 4
++    (count,) = struct.unpack_from("<I", body, 0)
++    out: list[ChoiceT] = []
++    for _ in range(count):
++        tag = body[pos]
++        pos += 1
++        if tag == 0:
++            sub = body[pos]
++            pos += 1
++            assert sub == 10, sub
++            (n,) = struct.unpack_from("<I", body, pos)
++            pos += 4
++            out.append(int.from_bytes(body[pos : pos + n], "little", signed=True))
++            pos += n
++        elif tag == 1:
++            out.append(bool(body[pos]))
++            pos += 1
++        elif tag == 2:
++            (f,) = struct.unpack_from("<d", body, pos)
++            pos += 8
++            out.append(f)
++        elif tag == 3:
++            (n,) = struct.unpack_from("<I", body, pos)
++            pos += 4
++            out.append(bytes(body[pos : pos + n]))
++            pos += n
++        elif tag == 4:
++            (n,) = struct.unpack_from("<I", body, pos)
++            pos += 4
++            cps = struct.unpack_from(f"<{n}I", body, pos)
++            pos += 4 * n
++            out.append("".join(map(chr, cps)))
++        else:  # pragma: no cover
++            raise ValueError(f"unsupported choice tag {tag}")
++    return out
++
++
+ def encode_choices(choices: list[ChoiceT]) -> str:
+     """Encode a Hypothesis choice sequence as a libhegel reproduce blob
+     (``base64(0x00 ++ serialize_choices)``, libhegel's raw blob form), so a
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
+index 4d538199..df3eda8f 100644
+--- a/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
++++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
+@@ -43,8 +43,10 @@ from hypothesis.errors import (
+     HypothesisException,
+     StopTest,
+ )
+-from hypothesis.internal.conjecture.choice import ChoiceT, ChoiceTemplate
++from hypothesis.internal.conjecture.choice import ChoiceNode, ChoiceT, ChoiceTemplate
+ from hypothesis.internal.conjecture.data import (
++    _NOT_BATCHED,
++    _PERMISSIVE_CONSTRAINTS,
+     ConjectureData,
+     ConjectureResult,
+     DataObserver,
+@@ -55,7 +57,13 @@ from hypothesis.internal.conjecture.engine import (
+     ExitReason,
+     StatisticsDict,
+ )
+-from hypothesis.internal.conjecture.hegel_provider import HegelProvider
++from hypothesis.internal.conjecture.hegel_ir import NOT_BATCHABLE, compile_strategy
++from hypothesis.internal.conjecture.hegel_provider import (
++    HegelOverrun,
++    HegelProvider,
++    decode_choices,
++    encode_choices,
++)
+ from hypothesis.internal.conjecture.junkdrawer import ensure_free_stackframes
+ from hypothesis.internal.conjecture.providers import HypothesisProvider
+ from hypothesis.internal.conjecture.shrinker import sort_key
+@@ -68,9 +76,19 @@ def hegel_engine_enabled() -> bool:
+     return os.environ.get("HYPOTHESIS_ENGINE") == "hegel"
+ 
+ 
++def hegel_batching_enabled() -> bool:
++    # HYPOTHESIS_HEGEL_BATCH=0 keeps every draw interactive (for comparison)
++    return os.environ.get("HYPOTHESIS_HEGEL_BATCH", "1") != "0"
++
++
+ class HegelCaseProvider(HegelProvider):
+     """The draw-level provider bound to one libhegel test case the runner
+-    already holds: no run of its own, no lifecycle, draws only."""
++    already holds: no run of its own, no lifecycle, draws only. Whole
++    strategies that compile to the native interpreter are generated in one
++    call (``draw_strategy``, consulted by ``ConjectureData.draw``)."""
++
++    batched_draws = 0
++    interactive_draws = 0
+ 
+     def __init__(self, engine: Any, tc: Any, generators: dict) -> None:
+         self._cd = None
+@@ -91,6 +109,24 @@ class HegelCaseProvider(HegelProvider):
+     def _test_case(self) -> Any:
+         return self._tc
+ 
++    def draw_strategy(self, strategy: Any, data: Any) -> Any:
++        if not hegel_batching_enabled():
++            return _NOT_BATCHED
++        compiled = compile_strategy(strategy)
++        if compiled is NOT_BATCHABLE:
++            HegelCaseProvider.interactive_draws += 1
++            return _NOT_BATCHED
++        HegelCaseProvider.batched_draws += 1
++        try:
++            return self._tc.generate(compiled, data, data._shared_strategy_draws)
++        except _hegel.StopTestError:
++            raise HegelOverrun from None
++        except _hegel.AssumeError:
++            raise BackendCannotProceed("discard_test_case") from None
++
++    def choices(self) -> list:
++        return decode_choices(self._tc.choices_blob())
++
+     def _complete(self, status: int, origin: str | None = None) -> None:
+         pass
+ 
+@@ -118,6 +154,34 @@ _STATUS = {
+ }
+ 
+ 
++def _nodes_from_choices(choices: list) -> tuple[ChoiceNode, ...]:
++    nodes = []
++    for value in choices:
++        kind = (
++            "boolean"
++            if isinstance(value, bool)
++            else (
++                "integer"
++                if isinstance(value, int)
++                else (
++                    "float"
++                    if isinstance(value, float)
++                    else "bytes" if isinstance(value, bytes) else "string"
++                )
++            )
++        )
++        nodes.append(
++            ChoiceNode(
++                type=kind,
++                value=value,
++                constraints=_PERMISSIVE_CONSTRAINTS[kind],
++                was_forced=False,
++                index=len(nodes),
++            )
++        )
++    return tuple(nodes)
++
++
+ def _origin_key(origin: InterestingOrigin) -> str:
+     """A stable per-process string naming a failure for libhegel's grouping."""
+     return (
+@@ -177,6 +241,20 @@ class HegelRunner:
+         observer: DataObserver | None = None,
+         max_choices: int | None = None,
+     ) -> ConjectureData:
++        if self._engine is not None and all(
++            isinstance(c, (bool, int, float, str, bytes)) for c in prefix
++        ):
++            # replay through libhegel, so natively generated strategies
++            # re-materialise from the same choices
++            tc = self._engine.test_case_from_blob(encode_choices(list(prefix)))
++            return ConjectureData(
++                observer=observer or DataObserver(),
++                provider=HegelCaseProvider(self._engine, tc, self._generators),
++                # libhegel bounds the replay; Python's node count includes
++                # forced draws libhegel never saw
++                max_choices=None,
++                random=self.random,
++            )
+         return ConjectureData(
+             prefix=prefix,
+             observer=observer or DataObserver(),
+@@ -313,6 +391,10 @@ class HegelRunner:
+             # case, then let it propagate
+             tc.mark_complete(_hegel.STATUS_INVALID)
+             raise
++        # libhegel's own record of the case is the choice sequence: Python's
++        # node list misses draws Hypothesis forces without consulting the
++        # provider (the first min_size continues of `many`, for one).
++        data.nodes = _nodes_from_choices(provider.choices())
+         data.freeze()
+         self._stats.append(
+             {
+diff --git a/hypothesis/tests/conjecture/test_hegel_ir.py b/hypothesis/tests/conjecture/test_hegel_ir.py
+new file mode 100644
+index 00000000..bce4c7cb
+--- /dev/null
++++ b/hypothesis/tests/conjecture/test_hegel_ir.py
+@@ -0,0 +1,161 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: whole strategies generated natively. ``hegel_ir`` compiles the
++declarative part of a strategy into a tree the libhegel interpreter walks;
++the check that matters is that a value generated that way is exactly what
++the Python engine draws from the same choice sequence.
++"""
++
++import math
++
++import pytest
++
++from hypothesis import Phase, given, settings, strategies as st
++from hypothesis.control import BuildContext
++from hypothesis.internal.conjecture.data import ConjectureData
++from hypothesis.internal.conjecture.hegel_ir import NOT_BATCHABLE, compile_strategy
++from hypothesis.internal.conjecture.hegel_runner import HegelCaseProvider, HegelRunner
++
++
++@pytest.fixture(autouse=True)
++def hegel_engine(monkeypatch):
++    monkeypatch.setenv("HYPOTHESIS_ENGINE", "hegel")
++    monkeypatch.delenv("HYPOTHESIS_HEGEL_BATCH", raising=False)
++
++
++@st.composite
++def pairs(draw):
++    n = draw(st.integers(0, 10))
++    return (n, draw(st.text(max_size=n)))
++
++
++JUST = st.just(7)
++DATA = st.data()
++BATCHABLE = [
++    st.integers(),
++    st.integers(0, 100),
++    st.integers(min_value=5),
++    st.integers(max_value=-(2**70)),
++    st.booleans(),
++    st.floats(),
++    st.floats(0, 1),
++    st.binary(max_size=5),
++    st.text(),
++    st.text(alphabet="ab", min_size=1, max_size=4),
++    st.characters(categories=["Lu"]),
++    st.lists(st.integers()),
++    st.lists(st.text(), min_size=2, max_size=5),
++    st.lists(st.lists(st.integers(0, 3)), max_size=4),
++    st.tuples(st.booleans(), st.binary(max_size=3)),
++    st.fixed_dictionaries({"a": st.integers(), "b": st.floats(allow_nan=False)}),
++    st.one_of(st.integers(), st.text(), st.none()),
++    st.sampled_from([1, 2, 3]),
++    st.sampled_from([1, 2, 3]).map(str),
++    JUST,
++    st.integers().map(str),
++    st.builds(dict, a=st.booleans(), b=st.lists(st.integers(), max_size=3)),
++    st.tuples(st.shared(st.integers(), key="k"), st.shared(st.integers(), key="k")),
++    st.integers().filter(lambda x: x % 2 == 0),
++    st.lists(st.integers().filter(lambda x: x > 3), max_size=3),
++    st.text().filter(lambda s: "a" not in s),
++]
++OPAQUE_ROOTS = [
++    pairs(),
++    DATA,
++    st.lists(st.integers(), unique=True),
++    st.datetimes(),
++    st.sampled_from([1, 2, 3]).filter(lambda x: x > 1),
++    st.fixed_dictionaries({}, optional={"a": st.integers()}),
++    st.recursive(st.integers(), st.lists),
++]
++MIXED = [
++    st.lists(pairs(), max_size=3),
++    st.lists(pairs(), min_size=2, max_size=3),
++    st.sampled_from(range(10)).filter(lambda x: x > 5),
++    st.fixed_dictionaries({"a": st.integers()}, optional={"b": st.booleans()}),
++    st.tuples(st.datetimes(), st.integers()),
++    st.dictionaries(st.text(), st.integers()),
++]
++
++
++@pytest.mark.parametrize("strategy", BATCHABLE, ids=repr)
++def test_declarative_strategies_compile(strategy):
++    assert compile_strategy(strategy) is not NOT_BATCHABLE
++
++
++@pytest.mark.parametrize("strategy", OPAQUE_ROOTS, ids=repr)
++def test_strategies_that_run_python_code_do_not(strategy):
++    assert compile_strategy(strategy) is NOT_BATCHABLE
++
++
++def _same(a, b):
++    if isinstance(a, float) and isinstance(b, float):
++        return (math.isnan(a) and math.isnan(b)) or (
++            a == b and math.copysign(1, a) == math.copysign(1, b)
++        )
++    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
++        return (
++            type(a) is type(b)
++            and len(a) == len(b)
++            and all(_same(x, y) for x, y in zip(a, b, strict=True))
++        )
++    if isinstance(a, dict) and isinstance(b, dict):
++        return list(a) == list(b) and all(_same(a[k], b[k]) for k in a)
++    return type(a) is type(b) and a == b
++
++
++@pytest.mark.parametrize(
++    "strategy",
++    BATCHABLE + [s for s in OPAQUE_ROOTS if s is not DATA] + MIXED,
++    ids=repr,
++)
++def test_a_batched_value_is_what_the_python_engine_draws_from_its_choices(strategy):
++    # libhegel generates the value and records the choice sequence; the Python
++    # engine, replaying that sequence through its own do_draw code, has to
++    # arrive at the same value
++    seen = []
++
++    def test_function(data):
++        with BuildContext(data, wrapped_test=lambda: None):
++            value = data.draw(strategy)
++        seen.append((data, value))
++
++    runner = HegelRunner(
++        test_function,
++        settings=settings(database=None, max_examples=60, phases=[Phase.generate]),
++    )
++    runner.run()
++    # a case without choices ends libhegel's run as exhausted
++    assert len(seen) >= (1 if strategy is JUST else 30)
++    for data, value in seen:
++        replay = ConjectureData.for_choices([n.value for n in data.nodes])
++        with BuildContext(replay, wrapped_test=lambda: None):
++            replayed = replay.draw(strategy)
++        assert _same(replayed, value), (value, replayed, data.nodes)
++        assert not replay.misaligned_at
++
++
++def test_most_draws_are_batched_and_the_switch_turns_it_off(monkeypatch):
++    @settings(database=None, max_examples=20, phases=[Phase.generate])
++    @given(st.lists(st.integers()), st.text(), st.datetimes())
++    def f(xs, s, d):
++        pass
++
++    before = (HegelCaseProvider.batched_draws, HegelCaseProvider.interactive_draws)
++    f()
++    assert HegelCaseProvider.batched_draws > before[0]
++    assert HegelCaseProvider.interactive_draws > before[1]
++
++    monkeypatch.setenv("HYPOTHESIS_HEGEL_BATCH", "0")
++    before = HegelCaseProvider.batched_draws
++    f()
++    assert HegelCaseProvider.batched_draws == before
+-- 
+2.43.0
+
