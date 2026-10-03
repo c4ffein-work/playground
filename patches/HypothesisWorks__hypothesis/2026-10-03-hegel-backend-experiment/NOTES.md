@@ -192,10 +192,15 @@ longer where a test's time goes.
 
 | suite | round two | round three |
 |---|---|---|
-| `tests/cover` | 3938 passed, 46 failed | COVER_RESULT |
-| `tests/quality` | 240 passed, 30 failed | QUALITY_RESULT |
+| `tests/cover` | 3938 passed, 46 failed | 3915 passed, 69 failed (3 workers, 6.5 minutes) |
+| `tests/quality` | 240 passed, 30 failed | 242 passed, 30 failed |
 
-QUALITY_NOTES
+The quality suite is unchanged in substance: the same 16 widening, 5
+shrink-quality and 3 targeting cases, and in discovery the six
+`large_factorial` cases (the 2**128 clamp); the duplicate-strings case
+passes now. Shrink outcomes through the interpreter match the interactive
+path's everywhere else, which is the other half of the equivalence claim:
+the choice sequences are the same, so the shrinker's work is the same.
 
 The cover suite is where the interpreter's price shows. The first run
 hung, then failed 74 tests. Four bugs, now fixed:
@@ -215,9 +220,10 @@ hung, then failed 74 tests. Four bugs, now fixed:
   executed case whose choices match it.
 - Fixed-dictionary key-order shuffle and forced draws, above.
 
-What remains (COVER_REMAINING) splits into round two's classes (database,
-flaky semantics, health-check wording, explain phase, engine internals,
-discovery) and one new class: **a `do_draw` does more than draw**. The
+What remains (69) splits into round two's classes (database 11, flaky
+semantics and overruns surfacing inside stateful steps 14, health-check,
+seed and statistics wording 15, explain phase 6, engine internals 4,
+discovery 3) and one new class, 16 tests: **a `do_draw` does more than draw**. The
 built-in strategies' Python code also registers pretty-printers for the
 values it builds (`builds`, `fixed_dictionaries`, `repr`-as-created),
 labels arguments and draws for observability, records why a filter
