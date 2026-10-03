@@ -1,11 +1,11 @@
 # Hypothesis on libhegel: from a draw-level backend to a runner-level engine
 
 Session notes for two patch series: this one against Hypothesis master
-(44b82b24, v6.168.3) and `patches/hegeldev__hegel-rust/2026-10-01-hypothesis-needs`
+(44b82b24, v6.168.3) and `patches/hegeldev__hegel-rust/2026-10-03-hypothesis-needs`
 against hegel-rust main (ebfd9d53, hegeltest 0.48.1 / libhegel 0.44.1).
 The question was whether Hypothesis's Python-to-Rust engine migration
 (HypothesisWorks/hypothesis issue #4740) can be solved by consuming Hegel's
-native engine, and how to check equivalence. Two rounds:
+native engine, and how to check equivalence. Three rounds:
 
 1. **Draw level** (2026-09-29): libhegel linked into `hypothesis._native`
    and exposed as `settings(backend="hegel")`; Hypothesis keeps the loop.
@@ -13,10 +13,16 @@ native engine, and how to check equivalence. Two rounds:
    `HYPOTHESIS_ENGINE=hegel` hands libhegel the whole run loop (generation,
    shrinking, targeting, the choice budget) while Python keeps
    `ConjectureData`, test execution and reporting.
+3. **Whole strategies natively** (2026-10-03): the built-in strategies
+   compiled to a small IR and interpreted in Rust against the libhegel
+   case, so a test's inputs are generated in one crossing instead of one
+   per primitive; everything else falls back to the interactive path. Plus
+   the forced-draw gap closed and a 50x fix to libhegel's unbounded
+   integer draw. See "Round three" below.
 
 ## The patches
 
-hegel-rust, one commit:
+hegel-rust, four commits:
 
 - `hegel_generate_integer_weighted(min, max, shrink_towards, keys, weights)`:
   one plain integer choice whose fresh draws take `keys[i]` with probability
@@ -28,8 +34,22 @@ hegel-rust, one commit:
 - `hegel_string_generator_text_ranges`: an alphabet given as explicit sorted,
   disjoint codepoint ranges, i.e. Hypothesis's `IntervalSet` as it is.
 - Header and frontend FFI list regenerated; C ABI tests for the three.
+- `hegel_test_case_choices`: the choices a live case has made so far, as
+  the same base64 blob a failure's reproduction uses (round three: the
+  frontend no longer sees individual draws, so it asks).
+- `biguint_sample_in_range` builds its "diffuse" pool (256 bignum powers of
+  two, sorted) only when that category is selected, as the "interesting"
+  pool already was. Same RNG consumption, same values; an unbounded
+  integer draw goes from ~160 us to ~3 us. Hypothesis's `integers()` is
+  the most common strategy and clamps to 2**128, past libhegel's i128
+  fast path, so this was most of the engine's cost per example.
+- `hegel_generate_integer_forced(min, max, forced)`: records a
+  caller-chosen value as a forced integer choice, as the forced boolean
+  already could. For the draws Hypothesis forces (filtered
+  `sampled_from`, feature flags, `many` at its bounds) and, later, its
+  constant injection.
 
-Hypothesis, three commits:
+Hypothesis, four commits:
 
 1. Link `hegeltest-c` (a path dependency on the fork) into the PyO3 extension
    and expose the pieces of its C ABI a runner needs: engine and settings
@@ -46,6 +66,12 @@ Hypothesis, three commits:
    translates libhegel's run errors (exhausted space, health checks, a
    nondeterministic test) into Hypothesis's `Unsatisfiable`,
    `FailedHealthCheck` and `FlakyFailure`.
+4. Whole strategies natively: `hegel_ir.py` compiles the declarative
+   strategies into a tree, `hegel_gen.rs` interprets it against the live
+   libhegel case, `ConjectureData.draw` consults the provider's
+   `draw_strategy` first and lets it see forced draws (`draw_forced`);
+   `HYPOTHESIS_HEGEL_BATCH=0` turns batching off for comparison.
+   `tests/conjecture/test_hegel_ir.py` is the equivalence check.
 
 To try: apply both series (`scripts/apply-patch.sh`), build hegel-rust's
 `hegel-c` once (the Hypothesis crate points at it by path), `maturin develop`
@@ -66,6 +92,168 @@ The replay result is the one that makes an engine swap checkable: both
 engines agree on what a choice sequence means, so databases and reproduce
 blobs are portable across them, and the quality suite can compare shrinkers
 on equal terms.
+
+## Round three: whole strategies natively
+
+The question from round two was whether the whole logic of a test case
+should move to Rust rather than one primitive draw at a time. The census
+first: over the strategy draws `tests/cover` makes, three quarters are
+of built-in strategies whose draw is a pure function of their attributes
+(integers, text, lists, tuples, fixed dictionaries, one_of, sampled_from,
+map, builds, filter...), a sixth are `composite` / `data` / stateful
+draws that run arbitrary Python between draws, and the rest are
+specialised strategies with their own Python logic (unique lists,
+recursive, dates, regex). So the engine can own most of the work without
+owning any user code.
+
+Design:
+
+- `hegel_ir.py` walks a strategy object graph and emits a tuple tree, one
+  node per built-in `do_draw` (`int`, `float`, `bool`, `bytes`, `text`,
+  `list`, `tuple`, `fixeddict`, `one_of`, `sampled`, `just`, `map`,
+  `builds`, `shared`, `filter`, plus `text_list` and `empty_list`
+  specialisations). A strategy it cannot express becomes an `opaque` leaf
+  holding the strategy object; a root that is opaque is "not batchable".
+  Compiled once per strategy object and cached on it.
+- `hegel_gen.rs` interprets the tree against the libhegel case: spans with
+  Hypothesis's labels, the `many` continuation protocol with its forced
+  booleans, the fixed-dictionary shuffle, the filter rule (three tries then
+  invalid) and the map rule (three retries on `UnsatisfiedAssumption`),
+  `shared` through `ConjectureData`'s shared-draw table. It records
+  `(kind, value)` pairs and flushes them to `ConjectureData` as choice
+  nodes before any Python callback and at the end. An opaque leaf is
+  handed back to `ConjectureData.draw`, which runs the strategy's own
+  `do_draw` interactively against the same case, and any batchable
+  strategy drawn underneath it is batched again.
+- `ConjectureData.draw` asks the provider's `draw_strategy` before a
+  strategy's `do_draw`; `ConjectureData._draw` tells a provider about
+  forced draws (`draw_forced`) so a provider that keeps its own choice
+  sequence stays aligned. The runner takes the case's nodes from
+  libhegel's own record (`choices_blob`) rather than Python's.
+
+The equivalence check, `test_a_batched_value_is_what_the_python_engine_draws_from_its_choices`:
+for 38 strategies covering every node kind, the opaque fallbacks and
+mixtures of the two, libhegel generates 60 cases each; for every case the
+Python engine replays libhegel's recorded choice sequence through its own
+`do_draw` code (`ConjectureData.for_choices`) and must arrive at the same
+value, without a misaligned draw. It passes. Two of its failures along the
+way were real: Hypothesis shuffles fixed-dictionary key order with a
+Fisher-Yates pass that draws integers (issue 3906, now mirrored), and
+forced draws never reached libhegel (now they do, through the new entry
+point). It also pins the semantics in both directions: a reproduce blob
+from either engine means the same test input to the other.
+
+### Speed, round three
+
+Whole loop on an idle machine, 2000 generated examples (`derandomize`,
+`phases=[generate]`), find + shrink with 500. "Interactive" is the
+round-two runner (`HYPOTHESIS_HEGEL_BATCH=0`), "batched" the interpreter,
+both with the libhegel integer fix. Both libhegel columns are the same
+runner, so the shrink call counts are identical; their time differs by
+generation cost only.
+
+| case | python | libhegel, interactive | libhegel, batched |
+|---|---|---|---|
+| generation, integers | 0.50 ms/ex | 0.27 | 0.27 |
+| generation, text | 0.49 ms/ex | 0.31 | 0.32 |
+| generation, lists of ints | 1.04 ms/ex | 0.57 | 0.41 |
+| generation, dicts(text, floats) | 1.78 ms/ex | 1.14 | 0.90 |
+| generation, tuples / one_of / builds | 1.29 ms/ex | 0.82 | 0.35 |
+| generation, datetimes | 0.63 ms/ex | 0.49 | 0.43 |
+| find + shrink `sum(list) > 1000` | 0.10 s, 50 calls | 1.82 s, 821 calls | 1.13 s, 821 calls |
+| find + shrink text with 'a', len 10 | 0.26 s, 182 calls | 0.58 s, 374 calls | 0.61 s, 374 calls |
+| find + shrink dict with 3 keys | 1.57 s, 429 calls | 4.87 s, 1438 calls | 3.89 s, 1438 calls |
+
+On this mix 91% of strategy draws were batched (56672 against 5561
+interactive, the latter the `datetimes` and `dictionaries` roots whose
+inner draws are batched anyway). Three things to read from the table:
+
+- **The round-two "libhegel is slower to generate" was libhegel's
+  unbounded integer draw**, not the architecture: with the diffuse pool
+  built lazily the interactive runner is already 1.5-2x faster than the
+  Python engine per example, where round two had it 1.1-1.5x slower.
+- **Batching pays in proportion to the draws per example**: nothing for
+  one integer, 2.5x for the structured tuple, 3.7x against the Python
+  engine there. Per-example overhead that remains is Hypothesis's own
+  (`ConjectureData`, the build context, `deterministic_PRNG`, statistics;
+  ~0.25 ms of the 0.27).
+- **Shrinking is still libhegel's call count**: 2-16x more test calls
+  than Hypothesis's shrinker on these three, as in round two. The
+  interpreter makes each call cheaper, nothing more. A result cache by
+  choice sequence and the missing passes are the engine's work.
+
+Direct measurements of the engine, per case, through the extension
+(`tests` with 3000 cases): an empty libhegel case costs 3.6 us, a bounded
+integer draw 0.1-0.4 us on top, `integers()` through the interpreter
+7.5 us, `text()` 7.5 us, `lists(integers())` 19 us. The engine is no
+longer where a test's time goes.
+
+### Suites, round three
+
+| suite | round two | round three |
+|---|---|---|
+| `tests/cover` | 3938 passed, 46 failed | COVER_RESULT |
+| `tests/quality` | 240 passed, 30 failed | QUALITY_RESULT |
+
+QUALITY_NOTES
+
+The cover suite is where the interpreter's price shows. The first run
+hung, then failed 74 tests. Four bugs, now fixed:
+
+- **No overrun on the batched path.** libhegel's first case is the
+  all-simplest one and a nested `find_any` loops drawing from the outer
+  case until its condition holds; the interactive path ran into
+  `ConjectureData`'s length budget, the batched one appended nodes
+  without checking it. `test_slices` ran for ever.
+- **The choices query fails once libhegel has concluded the case** (its
+  own budget ran out inside a draw); the runner now keeps Python's nodes
+  for such a case.
+- **Hypothesis's `sort_key` was choosing the "minimal" failure**, over
+  nodes carrying permissive constraints, so a datetime shrunk by libhegel
+  to the year 2000 lost to an earlier case with the year 1. libhegel's
+  shrinker reports its minimal failure as a blob; the runner now keeps the
+  executed case whose choices match it.
+- Fixed-dictionary key-order shuffle and forced draws, above.
+
+What remains (COVER_REMAINING) splits into round two's classes (database,
+flaky semantics, health-check wording, explain phase, engine internals,
+discovery) and one new class: **a `do_draw` does more than draw**. The
+built-in strategies' Python code also registers pretty-printers for the
+values it builds (`builds`, `fixed_dictionaries`, `repr`-as-created),
+labels arguments and draws for observability, records why a filter
+rejected a value and where, adds notes to errors raised inside
+`sampled_from` and `builds`, and warns about incompatible `shared`
+bases. The interpreter produces the same values and the same choice
+sequence, and none of those side effects; that is the whole of the
+observability, custom-repr, `builds` error-message and
+`sampled_from`-note failures (`shared` went back to Python, it is rare).
+An interpreter that is to be a drop-in has to either reproduce them (the
+pretty-printer registration and arg labels are mechanical, the error
+notes need the Python frames) or hand values back through a thin Python
+layer that does only that part. The second is the honest design: let the
+engine generate, let `do_draw` decorate.
+
+### What the interpreter does not cover yet
+
+- Strategies with Python in their draw stay interactive: `composite`,
+  `data`, `flatmap`, stateful rules, `recursive`, unique lists, dates and
+  times (a `composite` over integers), regex, `from_type`. Their inner
+  built-in draws are batched; the Python between them is not. Moving
+  `recursive`, unique lists and the date strategies into the IR is
+  mechanical; `composite` never moves.
+- Optional fixed-dictionary keys and filtered `sampled_from` (both
+  forced-draw heavy) are opaque; they could be nodes now that forced
+  integers exist.
+- Constant injection stays off on the engine path. With the forced
+  integer in place it can be turned back on, passing constants down as
+  forced draws, which is how Hypothesis's own replay treats them.
+- `integers()` beyond int64 with weights, and forced integers beyond
+  int64, fall back to the unweighted / unrecorded path (never seen in the
+  suites, but a hole).
+- The IR is a tuple protocol between two files with no schema; a real
+  version gives each node a dataclass and a version tag, and checks the
+  compiled tree against the strategy's `do_draw` source in the test suite
+  when strategies change.
 
 ## What the engine-level flag taught
 
@@ -168,9 +356,10 @@ more calls.
 
 ## What a real integration still needs
 
-1. A forced-draw entry point in the C ABI, so Hypothesis's constant
-   injection and `@example` replay can go through libhegel's choice
-   sequence rather than around it.
+1. Constant injection and `@example` replay through libhegel's choice
+   sequence: the forced integer and boolean entry points now exist, the
+   provider has to use them for constants (round three records only the
+   draws Hypothesis itself forces).
 2. A database story: either libhegel calls back into Hypothesis's
    `ExampleDatabase` (it is public API with third-party implementations),
    or reuse stays in Python with the blob codec above as the bridge.
@@ -181,5 +370,8 @@ more calls.
    to close the call-count gap.
 5. A delegating backend in libhegel for CrossHair (issue #4823), so the
    runner flag can apply to every `settings.backend`.
-6. Governance: libhegel is MIT under an Antithesis-funded org; the license
+6. The interpreter as the engine's front door: the IR is what a shared
+   engine would take from any frontend, and the two files here are a
+   prototype of that boundary, not its final shape.
+7. Governance: libhegel is MIT under an Antithesis-funded org; the license
    is fine, the dependency is a decision to make explicitly.

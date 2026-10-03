@@ -1,4 +1,4 @@
-From be75190cd398aecfbf079eb3015b2539527cae40 Mon Sep 17 00:00:00 2001
+From 9f80165c5f56020be6e209c915a61f6efc012739 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sat, 3 Oct 2026 22:44:41 +0000
 Subject: [PATCH 4/4] Generate whole strategies natively under
@@ -37,12 +37,12 @@ Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
  hypothesis/rust/src/internal/hegel.rs         |  59 +-
  hypothesis/rust/src/internal/hegel_gen.rs     | 923 ++++++++++++++++++
  hypothesis/rust/src/internal/mod.rs           |   1 +
- .../hypothesis/internal/conjecture/data.py    |  61 ++
- .../internal/conjecture/hegel_ir.py           | 249 +++++
+ .../hypothesis/internal/conjecture/data.py    |  65 ++
+ .../internal/conjecture/hegel_ir.py           | 251 +++++
  .../internal/conjecture/hegel_provider.py     |  96 +-
- .../internal/conjecture/hegel_runner.py       |  88 +-
+ .../internal/conjecture/hegel_runner.py       | 120 ++-
  hypothesis/tests/conjecture/test_hegel_ir.py  | 161 +++
- 9 files changed, 1619 insertions(+), 22 deletions(-)
+ 9 files changed, 1657 insertions(+), 22 deletions(-)
  create mode 100644 hypothesis/rust/src/internal/hegel_gen.rs
  create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
  create mode 100644 hypothesis/tests/conjecture/test_hegel_ir.py
@@ -1123,7 +1123,7 @@ index 5300e82d..187b5c38 100644
  #[pyo3::pymodule]
  pub(crate) mod internal {
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/data.py b/hypothesis/src/hypothesis/internal/conjecture/data.py
-index 3b0fb12b..30686b3a 100644
+index 3b0fb12b..a1f7f516 100644
 --- a/hypothesis/src/hypothesis/internal/conjecture/data.py
 +++ b/hypothesis/src/hypothesis/internal/conjecture/data.py
 @@ -10,6 +10,7 @@
@@ -1175,7 +1175,7 @@ index 3b0fb12b..30686b3a 100644
  
          if forced is not None:
              value = forced
-@@ -1211,6 +1239,26 @@ class ConjectureData:
+@@ -1211,6 +1239,30 @@ class ConjectureData:
          self.index += 1
          return choice
  
@@ -1198,11 +1198,15 @@ index 3b0fb12b..30686b3a 100644
 +            )
 +        self.nodes += tuple(nodes)
 +        self.length += choices_size([n.value for n in nodes])
++        if self.length > self.max_length or (
++            self.max_choices is not None and len(self.nodes) > self.max_choices
++        ):
++            self.mark_overrun()
 +
      def as_result(self) -> ConjectureResult | _Overrun:
          """Convert the result of running this test into
          either an Overrun object or a ConjectureResult."""
-@@ -1282,6 +1330,19 @@ class ConjectureData:
+@@ -1282,6 +1334,19 @@ class ConjectureData:
              label = unwrapped.label
              assert isinstance(label, int)
  
@@ -1224,10 +1228,10 @@ index 3b0fb12b..30686b3a 100644
          # it, and let do_draw consume those choices (under our own constraints)
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
 new file mode 100644
-index 00000000..477c6e39
+index 00000000..107d3d66
 --- /dev/null
 +++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
-@@ -0,0 +1,249 @@
+@@ -0,0 +1,251 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -1425,7 +1429,9 @@ index 00000000..477c6e39
 +            label,
 +        )
 +    if type(s) is SharedStrategy:
-+        return ("shared", s.key or s, s, child(s.base), label)
++        # SharedStrategy.do_draw also warns about incompatible bases under one
++        # key; left to Python (its base is batched underneath)
++        return ("opaque", s)
 +    if type(s) is FilteredStrategy:
 +        return (
 +            "filter",
@@ -1614,7 +1620,7 @@ index 0fb80cdf..452b1c92 100644
      """Encode a Hypothesis choice sequence as a libhegel reproduce blob
      (``base64(0x00 ++ serialize_choices)``, libhegel's raw blob form), so a
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
-index 4d538199..df3eda8f 100644
+index 4d538199..fe6b4366 100644
 --- a/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
 +++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
 @@ -43,8 +43,10 @@ from hypothesis.errors import (
@@ -1629,11 +1635,12 @@ index 4d538199..df3eda8f 100644
      ConjectureData,
      ConjectureResult,
      DataObserver,
-@@ -55,7 +57,13 @@ from hypothesis.internal.conjecture.engine import (
+@@ -55,7 +57,14 @@ from hypothesis.internal.conjecture.engine import (
      ExitReason,
      StatisticsDict,
  )
 -from hypothesis.internal.conjecture.hegel_provider import HegelProvider
++from hypothesis.internal.conjecture.floats import float_to_int
 +from hypothesis.internal.conjecture.hegel_ir import NOT_BATCHABLE, compile_strategy
 +from hypothesis.internal.conjecture.hegel_provider import (
 +    HegelOverrun,
@@ -1644,7 +1651,7 @@ index 4d538199..df3eda8f 100644
  from hypothesis.internal.conjecture.junkdrawer import ensure_free_stackframes
  from hypothesis.internal.conjecture.providers import HypothesisProvider
  from hypothesis.internal.conjecture.shrinker import sort_key
-@@ -68,9 +76,19 @@ def hegel_engine_enabled() -> bool:
+@@ -68,9 +77,19 @@ def hegel_engine_enabled() -> bool:
      return os.environ.get("HYPOTHESIS_ENGINE") == "hegel"
  
  
@@ -1665,7 +1672,7 @@ index 4d538199..df3eda8f 100644
  
      def __init__(self, engine: Any, tc: Any, generators: dict) -> None:
          self._cd = None
-@@ -91,6 +109,24 @@ class HegelCaseProvider(HegelProvider):
+@@ -91,6 +110,29 @@ class HegelCaseProvider(HegelProvider):
      def _test_case(self) -> Any:
          return self._tc
  
@@ -1684,13 +1691,18 @@ index 4d538199..df3eda8f 100644
 +        except _hegel.AssumeError:
 +            raise BackendCannotProceed("discard_test_case") from None
 +
-+    def choices(self) -> list:
-+        return decode_choices(self._tc.choices_blob())
++    def choices_blob(self) -> str | None:
++        """libhegel's record of the case so far, or None once libhegel has
++        concluded the case itself (its budget ran out mid-draw)."""
++        try:
++            return self._tc.choices_blob()
++        except _hegel.StopTestError:
++            return None
 +
      def _complete(self, status: int, origin: str | None = None) -> None:
          pass
  
-@@ -118,6 +154,34 @@ _STATUS = {
+@@ -118,6 +160,40 @@ _STATUS = {
  }
  
  
@@ -1722,10 +1734,25 @@ index 4d538199..df3eda8f 100644
 +    return tuple(nodes)
 +
 +
++def _choices_key(choices: list) -> tuple:
++    """A hashable identity for a decoded choice sequence (libhegel's failure
++    blobs are compressed, a live case's are raw: compare by content)."""
++    return tuple((float_to_int(v) if isinstance(v, float) else v) for v in choices)
++
++
  def _origin_key(origin: InterestingOrigin) -> str:
      """A stable per-process string naming a failure for libhegel's grouping."""
      return (
-@@ -177,6 +241,20 @@ class HegelRunner:
+@@ -163,6 +239,8 @@ class HegelRunner:
+         self._generators: dict = {}
+         self._engine: Any = None
+         self.hegel_failures: list[tuple[str, str | None]] = []
++        self._interesting_by_choices: dict[tuple, ConjectureResult] = {}
++        self._origin_by_key: dict[str, InterestingOrigin] = {}
+ 
+     # -- what core.py calls ------------------------------------------------
+ 
+@@ -177,6 +255,20 @@ class HegelRunner:
          observer: DataObserver | None = None,
          max_choices: int | None = None,
      ) -> ConjectureData:
@@ -1746,17 +1773,49 @@ index 4d538199..df3eda8f 100644
          return ConjectureData(
              prefix=prefix,
              observer=observer or DataObserver(),
-@@ -313,6 +391,10 @@ class HegelRunner:
+@@ -220,6 +312,18 @@ class HegelRunner:
+             }
+         result = run.result()
+         self.hegel_failures = [(f.origin, f.blob) for f in result.failures]
++        # libhegel's shrinker decides which case is the minimal one for each
++        # failure (Hypothesis's sort_key over the permissive nodes above would
++        # rank e.g. a year of 1998 below the shrink target 2000)
++        for key, blob in self.hegel_failures:
++            found = None
++            if blob:
++                found = self._interesting_by_choices.get(
++                    _choices_key(decode_choices(blob))
++                )
++            origin = self._origin_by_key.get(key)
++            if found is not None and origin is not None:
++                self.interesting_test_cases[origin] = found
+         if self.interesting_test_cases or self.call_count < self.settings.max_examples:
+             self.exit_reason = ExitReason.finished
+         else:
+@@ -313,6 +417,13 @@ class HegelRunner:
              # case, then let it propagate
              tc.mark_complete(_hegel.STATUS_INVALID)
              raise
 +        # libhegel's own record of the case is the choice sequence: Python's
 +        # node list misses draws Hypothesis forces without consulting the
 +        # provider (the first min_size continues of `many`, for one).
-+        data.nodes = _nodes_from_choices(provider.choices())
++        blob = provider.choices_blob()
++        choices = None if blob is None else decode_choices(blob)
++        if choices is not None:
++            data.nodes = _nodes_from_choices(choices)
          data.freeze()
          self._stats.append(
              {
+@@ -345,6 +456,9 @@ class HegelRunner:
+             origin_key = _origin_key(origin)
+             result = data.as_result()
+             assert isinstance(result, ConjectureResult)
++            if choices is not None:
++                self._interesting_by_choices[_choices_key(choices)] = result
++            self._origin_by_key[origin_key] = origin
+             existing = self.interesting_test_cases.get(origin)
+             if existing is None:
+                 self.interesting_test_cases[origin] = result
 diff --git a/hypothesis/tests/conjecture/test_hegel_ir.py b/hypothesis/tests/conjecture/test_hegel_ir.py
 new file mode 100644
 index 00000000..bce4c7cb
