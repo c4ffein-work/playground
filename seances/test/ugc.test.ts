@@ -7,7 +7,9 @@ describe("parseShowings", () => {
   const { films, showings } = parseShowings(fixture);
 
   test("finds every film block and every screening card", () => {
-    expect(films.map((f) => f.id)).toEqual([18319, 17879]);
+    expect(films).toHaveLength(2);
+    expect(films[0].key).toBe("delivre-nous-du-mal");
+    expect(films[1].key).toMatch(/^[a-z0-9-]+$/);
     expect(showings).toHaveLength(5);
   });
 
@@ -29,13 +31,13 @@ describe("parseShowings", () => {
   test("screening cards carry the planning fields", () => {
     const s = showings[0];
     expect(s).toMatchObject({
-      id: "330401306442", filmId: 18319, cinemaId: 32, date: "2026-10-04", time: "18:30",
-      endTime: "20:35", version: "VF", room: "Salle 1",
+      id: "ugc:330401306442", filmKey: "delivre-nous-du-mal", cinemaId: "ugc:32", date: "2026-10-04", time: "18:30",
+      endTime: "20:35", version: "VF", extra: "", room: "Salle 1",
       bookingUrl: "https://www.ugc.fr/reservationSeances.html?id=330401306442",
     });
     expect(showings.map((x) => x.time)).toEqual(["18:30", "11:00", "14:00", "17:00", "20:00"]);
-    expect(showings.map((x) => x.version)).toEqual(["VF", "VOSTF", "VOSTF", "VF", "VOSTF"]);
-    expect(new Set(showings.slice(1).map((x) => x.filmId))).toEqual(new Set([17879]));
+    expect(showings.map((x) => x.version)).toEqual(["VF", "VOST", "VOST", "VF", "VOST"]);
+    expect(new Set(showings.slice(1).map((x) => x.filmKey))).toEqual(new Set([films[1].key]));
   });
 
   test("an empty page yields nothing rather than throwing", () => {

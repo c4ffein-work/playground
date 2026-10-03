@@ -34,7 +34,11 @@
     const [y, m, d] = iso.split("-").map(Number);
     return fmtDay.format(new Date(y, m - 1, d));
   };
-  const shortCinema = (name) => name.replace(/^UGC (Ciné Cité )?/i, "");
+  // "UGC Ciné Cité Bordeaux Gambetta" → "UGC Gambetta", "CGR Bordeaux - Le Français" → "CGR Le Français"
+  const shortCinema = (name) => {
+    const city = (S.city.name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return name.replace(/Ciné Cité /i, "").replace(new RegExp(`\\b${city}\\b`, "i"), "").replace(/\s*-\s*/g, " ").replace(/\s+/g, " ").trim();
+  };
   const initials = (name) => (name || "?").trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join("");
   const userById = (id) => S.users.find((u) => u.id === id);
   const avatar = (id, lg) => {
@@ -117,7 +121,7 @@
 
   function renderPlans() {
     const byId = new Map(S.showings.map((s) => [s.id, s]));
-    const films = new Map(S.films.map((f) => [f.id, f]));
+    const films = new Map(S.films.map((f) => [f.key, f]));
     const cin = new Map(S.cinemas.map((c) => [c.id, c.name]));
     const plans = S.plans.map((id) => byId.get(id)).filter(Boolean);
     const sec = h("section", { class: "card plans" }, h("h2", {}, "Best plans"));
@@ -125,8 +129,8 @@
     sec.append(h("ol", {}, ...plans.map((s) => h("li", {},
       null,
       h("div", {},
-        h("div", { class: "when" }, `${dayLabel(s.date)} ${s.time} · ${films.get(s.film_id)?.title ?? "?"}`),
-        h("div", { class: "muted", style: "font-size:13px" }, `${shortCinema(cin.get(s.cinema_id) ?? "")} · ${s.version}${s.room ? " · " + s.room : ""}${s.end_time ? " · ends " + s.end_time : ""}`),
+        h("div", { class: "when" }, `${dayLabel(s.date)} ${s.time} · ${films.get(s.film_key)?.title ?? "?"}`),
+        h("div", { class: "muted", style: "font-size:13px" }, `${shortCinema(cin.get(s.cinema_id) ?? "")} · ${s.version}${s.extra ? " " + s.extra : ""}${s.room ? " · " + s.room : ""}${s.end_time ? " · ends " + s.end_time : ""}`),
         h("div", { class: "who" }, ...s.available.map((id) => avatar(id)))),
       h("div", {},
         h("div", { style: "text-align:right;font-weight:800;font-size:18px" }, s.available.length, h("span", { class: "muted", style: "font-size:11px;font-weight:400" }, "/" + Math.max(S.users.length, 1))),
@@ -139,26 +143,27 @@
     const cin = new Map(S.cinemas.map((c) => [c.id, c.name]));
     const multiCinema = S.cinemas.filter((c) => c.selected).length > 1;
     const byFilm = new Map();
-    for (const s of S.showings) if (visible(s)) (byFilm.get(s.film_id) ?? byFilm.set(s.film_id, []).get(s.film_id)).push(s);
+    for (const s of S.showings) if (visible(s)) (byFilm.get(s.film_key) ?? byFilm.set(s.film_key, []).get(s.film_key)).push(s);
     const net = (f) => Object.values(f.votes).reduce((a, b) => a + b, 0);
-    const films = S.films.filter((f) => byFilm.has(f.id)).sort((a, b) => net(b) - net(a) || a.title.localeCompare(b.title));
+    const films = S.films.filter((f) => byFilm.has(f.key)).sort((a, b) => net(b) - net(a) || a.title.localeCompare(b.title));
     const grid = h("section", { class: "films" });
     if (!films.length) grid.append(h("p", { class: "muted" }, S.showings.length ? "Nothing matches these filters." : S.refreshing ? "Scraping the programme…" : "No programme yet — hit refresh."));
     for (const f of films) {
       const mine = me ? f.votes[me] ?? 0 : 0;
       const ups = Object.entries(f.votes).filter(([, v]) => v > 0).map(([id]) => id);
       const downs = Object.entries(f.votes).filter(([, v]) => v < 0).map(([id]) => id);
-      const vote = (v) => async () => { if (!me || !S.me.name) return openMe(); S = await api("/api/film-vote", { filmId: f.id, vote: mine === v ? 0 : v }); render(); };
-      const syn = h("p", { class: `syn${openSyn.has(f.id) ? " open" : ""}`, onclick: () => { openSyn.has(f.id) ? openSyn.delete(f.id) : openSyn.add(f.id); render(); } }, f.synopsis);
+      const vote = (v) => async () => { if (!me || !S.me.name) return openMe(); S = await api("/api/film-vote", { filmKey: f.key, vote: mine === v ? 0 : v }); render(); };
+      const syn = h("p", { class: `syn${openSyn.has(f.key) ? " open" : ""}`, onclick: () => { openSyn.has(f.key) ? openSyn.delete(f.key) : openSyn.add(f.key); render(); } }, f.synopsis);
       const days = h("div", { class: "days" });
       const byDay = new Map();
-      for (const s of byFilm.get(f.id)) (byDay.get(s.date) ?? byDay.set(s.date, []).get(s.date)).push(s);
+      for (const s of byFilm.get(f.key)) (byDay.get(s.date) ?? byDay.set(s.date, []).get(s.date)).push(s);
       for (const [d, list] of byDay) {
         days.append(h("div", { class: "day" }, h("span", { class: "d" }, dayLabel(d)), ...list.map((s) => {
           const isMe = me && s.available.includes(me);
           return h("button", { class: `slot${isMe ? " me" : s.available.length ? " some" : ""}`, title: `${cin.get(s.cinema_id)} · ${s.room || ""} · ends ${s.end_time || "?"}`,
             onclick: async () => { if (!me || !S.me.name) return openMe(); S = await api("/api/availability", { showingId: s.id, on: !isMe }); render(); } },
-            s.time, h("span", { class: "v" }, s.version), multiCinema ? h("span", { class: "cin" }, shortCinema(cin.get(s.cinema_id) ?? "")) : null,
+            s.time, h("span", { class: "v" }, s.version), s.extra ? h("span", { class: "v x" }, s.extra) : null,
+            multiCinema ? h("span", { class: "cin" }, shortCinema(cin.get(s.cinema_id) ?? "")) : null,
             s.available.length ? h("span", { class: "n" }, s.available.length) : null);
         })));
       }

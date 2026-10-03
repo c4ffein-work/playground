@@ -69,6 +69,7 @@ label input { margin-top: 4px; }
 .day .d { font-size: 12px; font-weight: 700; color: var(--muted); min-width: 64px }
 .slot { padding: 4px 8px; font-size: 13px; display: inline-flex; gap: 6px; align-items: center; border-radius: 8px; }
 .slot .v { font-size: 10px; padding: 0 4px; border-radius: 3px; background: var(--panel); color: var(--muted); }
+.slot .v.x { background: #3a2a10; color: var(--accent); }
 .slot .cin { font-size: 11px; color: var(--muted); }
 .slot .n { font-size: 11px; font-weight: 700; background: var(--panel); border-radius: 999px; padding: 0 6px; }
 .slot.some { border-color: var(--ok); }

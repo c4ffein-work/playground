@@ -1,28 +1,39 @@
 import { Database } from "bun:sqlite";
-import type { Film, Showing } from "./ugc";
+import type { Chain, CinemaRef, Film, Showing } from "./types";
 
 export type User = { id: string; name: string; email: string; phone: string; created_at: number };
+
+/** Bump when the tables change shape: an older file is wiped (it only ever holds a week of votes). */
+const SCHEMA_VERSION = "2";
 
 export function openDb(path = ":memory:"): Database {
   const db = new Database(path, { create: true });
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  db.exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  const v = getSetting(db, "schema_version");
+  if (v !== null && v !== SCHEMA_VERSION) {
+    console.warn(`[db] schema ${v} → ${SCHEMA_VERSION}: resetting the database`);
+    db.exec("PRAGMA foreign_keys = OFF");
+    for (const t of ["availability", "film_votes", "showings", "scrapes", "films", "cinemas", "users", "settings"]) db.exec(`DROP TABLE IF EXISTS ${t}`);
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  }
   db.exec(`
-    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS cinemas (
-      id INTEGER PRIMARY KEY, name TEXT NOT NULL, selected INTEGER NOT NULL DEFAULT 1
+      id TEXT PRIMARY KEY, chain TEXT NOT NULL, name TEXT NOT NULL, selected INTEGER NOT NULL DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS films (
-      id INTEGER PRIMARY KEY, title TEXT NOT NULL, genre TEXT, duration TEXT, release TEXT,
+      key TEXT PRIMARY KEY, title TEXT NOT NULL, genre TEXT, duration TEXT, release TEXT,
       director TEXT, synopsis TEXT, poster TEXT, label TEXT, rating REAL
     );
     CREATE TABLE IF NOT EXISTS showings (
-      id TEXT PRIMARY KEY, film_id INTEGER NOT NULL REFERENCES films(id),
-      cinema_id INTEGER NOT NULL, date TEXT NOT NULL, time TEXT NOT NULL, end_time TEXT,
-      version TEXT, room TEXT, booking_url TEXT, scraped_at INTEGER NOT NULL
+      id TEXT PRIMARY KEY, film_key TEXT NOT NULL REFERENCES films(key),
+      cinema_id TEXT NOT NULL, date TEXT NOT NULL, time TEXT NOT NULL, end_time TEXT,
+      version TEXT, extra TEXT, room TEXT, booking_url TEXT, scraped_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS showings_day ON showings(cinema_id, date);
     CREATE TABLE IF NOT EXISTS scrapes (
-      cinema_id INTEGER NOT NULL, date TEXT NOT NULL, fetched_at INTEGER NOT NULL, count INTEGER NOT NULL,
+      cinema_id TEXT NOT NULL, date TEXT NOT NULL, fetched_at INTEGER NOT NULL, count INTEGER NOT NULL,
       PRIMARY KEY (cinema_id, date)
     );
     CREATE TABLE IF NOT EXISTS users (
@@ -36,11 +47,12 @@ export function openDb(path = ":memory:"): Database {
     );
     CREATE TABLE IF NOT EXISTS film_votes (
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      film_id INTEGER NOT NULL REFERENCES films(id) ON DELETE CASCADE,
+      film_key TEXT NOT NULL REFERENCES films(key) ON DELETE CASCADE,
       vote INTEGER NOT NULL CHECK (vote IN (-1, 1)),
-      PRIMARY KEY (user_id, film_id)
+      PRIMARY KEY (user_id, film_key)
     );
   `);
+  setSetting(db, "schema_version", SCHEMA_VERSION);
   return db;
 }
 
@@ -51,9 +63,9 @@ export const setSetting = (db: Database, key: string, value: string) =>
   db.query("INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
 
 // ---- cinemas ----
-export type Cinema = { id: number; name: string; selected: number };
-export const listCinemas = (db: Database) => db.query("SELECT * FROM cinemas ORDER BY name").all() as Cinema[];
-export function replaceCinemas(db: Database, cinemas: { id: number; name: string }[]) {
+export type Cinema = { id: string; chain: Chain; name: string; selected: number };
+export const listCinemas = (db: Database) => db.query("SELECT * FROM cinemas ORDER BY chain, name").all() as Cinema[];
+export function replaceCinemas(db: Database, cinemas: CinemaRef[]) {
   db.transaction(() => {
     db.query("DELETE FROM availability").run();
     db.query("DELETE FROM film_votes").run();
@@ -61,37 +73,50 @@ export function replaceCinemas(db: Database, cinemas: { id: number; name: string
     db.query("DELETE FROM scrapes").run();
     db.query("DELETE FROM films").run();
     db.query("DELETE FROM cinemas").run();
-    const ins = db.query("INSERT INTO cinemas(id, name, selected) VALUES (?, ?, 1)");
-    for (const c of cinemas) ins.run(c.id, c.name);
+    const ins = db.query("INSERT INTO cinemas(id, chain, name, selected) VALUES (?, ?, ?, 1)");
+    for (const c of cinemas) ins.run(c.id, c.chain, c.name);
   })();
 }
-export const setCinemaSelected = (db: Database, id: number, selected: boolean) =>
+export const setCinemaSelected = (db: Database, id: string, selected: boolean) =>
   db.query("UPDATE cinemas SET selected = ? WHERE id = ?").run(selected ? 1 : 0, id);
 
 // ---- scrape ingestion ----
-/** Replace the showings of one (cinema, day) with a fresh scrape; keeps votes on ids that survive. */
-export function ingestDay(db: Database, cinemaId: number, date: string, films: Film[], showings: Showing[], now = Date.now()) {
+/**
+ * Replace the showings of one cinema on the given days with a fresh scrape.
+ * Votes on showing ids that survive are kept; vanished showings cascade.
+ */
+export function ingestCinema(db: Database, cinemaId: string, dates: string[], films: Film[], showings: Showing[], now = Date.now()) {
   db.transaction(() => {
     const upFilm = db.query(`
-      INSERT INTO films(id, title, genre, duration, release, director, synopsis, poster, label, rating)
+      INSERT INTO films(key, title, genre, duration, release, director, synopsis, poster, label, rating)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET title = excluded.title, genre = excluded.genre, duration = excluded.duration,
-        release = excluded.release, director = excluded.director, synopsis = excluded.synopsis,
-        poster = excluded.poster, label = excluded.label, rating = excluded.rating`);
-    for (const f of films) upFilm.run(f.id, f.title, f.genre, f.duration, f.release, f.director, f.synopsis, f.poster, f.label, f.rating);
-    const keep = showings.filter((s) => s.cinemaId === cinemaId && s.date === date);
-    const ids = keep.map((s) => s.id);
-    const stale = db.query("SELECT id FROM showings WHERE cinema_id = ? AND date = ?").all(cinemaId, date) as { id: string }[];
+      ON CONFLICT(key) DO UPDATE SET
+        title = CASE WHEN excluded.title = upper(excluded.title) AND films.title != upper(films.title) THEN films.title ELSE excluded.title END,
+        genre = CASE WHEN excluded.genre != '' THEN excluded.genre ELSE films.genre END,
+        duration = CASE WHEN excluded.duration != '' THEN excluded.duration ELSE films.duration END,
+        release = CASE WHEN excluded.release != '' THEN excluded.release ELSE films.release END,
+        director = CASE WHEN excluded.director != '' THEN excluded.director ELSE films.director END,
+        synopsis = CASE WHEN length(excluded.synopsis) > length(films.synopsis) THEN excluded.synopsis ELSE films.synopsis END,
+        poster = CASE WHEN excluded.poster != '' THEN excluded.poster ELSE films.poster END,
+        label = CASE WHEN excluded.label != '' THEN excluded.label ELSE films.label END,
+        rating = COALESCE(excluded.rating, films.rating)`);
+    for (const f of films) upFilm.run(f.key, f.title, f.genre, f.duration, f.release, f.director, f.synopsis, f.poster, f.label, f.rating);
+    const days = new Set(dates);
+    const keep = showings.filter((s) => s.cinemaId === cinemaId && days.has(s.date));
+    const ids = new Set(keep.map((s) => s.id));
     const del = db.query("DELETE FROM showings WHERE id = ?");
-    for (const s of stale) if (!ids.includes(s.id)) del.run(s.id);
+    for (const d of dates) {
+      const stale = db.query("SELECT id FROM showings WHERE cinema_id = ? AND date = ?").all(cinemaId, d) as { id: string }[];
+      for (const s of stale) if (!ids.has(s.id)) del.run(s.id);
+    }
     const up = db.query(`
-      INSERT INTO showings(id, film_id, cinema_id, date, time, end_time, version, room, booking_url, scraped_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET film_id = excluded.film_id, time = excluded.time, end_time = excluded.end_time,
-        version = excluded.version, room = excluded.room, booking_url = excluded.booking_url, scraped_at = excluded.scraped_at`);
-    for (const s of keep) up.run(s.id, s.filmId, s.cinemaId, s.date, s.time, s.endTime, s.version, s.room, s.bookingUrl, now);
-    db.query("INSERT INTO scrapes(cinema_id, date, fetched_at, count) VALUES (?, ?, ?, ?) ON CONFLICT(cinema_id, date) DO UPDATE SET fetched_at = excluded.fetched_at, count = excluded.count")
-      .run(cinemaId, date, now, keep.length);
+      INSERT INTO showings(id, film_key, cinema_id, date, time, end_time, version, extra, room, booking_url, scraped_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET film_key = excluded.film_key, time = excluded.time, end_time = excluded.end_time,
+        version = excluded.version, extra = excluded.extra, room = excluded.room, booking_url = excluded.booking_url, scraped_at = excluded.scraped_at`);
+    for (const s of keep) up.run(s.id, s.filmKey, s.cinemaId, s.date, s.time, s.endTime, s.version, s.extra, s.room, s.bookingUrl, now);
+    const mark = db.query("INSERT INTO scrapes(cinema_id, date, fetched_at, count) VALUES (?, ?, ?, ?) ON CONFLICT(cinema_id, date) DO UPDATE SET fetched_at = excluded.fetched_at, count = excluded.count");
+    for (const d of dates) mark.run(cinemaId, d, now, keep.filter((s) => s.date === d).length);
   })();
 }
 
@@ -100,7 +125,7 @@ export function pruneBefore(db: Database, isoToday: string) {
   db.transaction(() => {
     db.query("DELETE FROM showings WHERE date < ?").run(isoToday);
     db.query("DELETE FROM scrapes WHERE date < ?").run(isoToday);
-    db.query("DELETE FROM films WHERE id NOT IN (SELECT DISTINCT film_id FROM showings)").run();
+    db.query("DELETE FROM films WHERE key NOT IN (SELECT DISTINCT film_key FROM showings)").run();
   })();
 }
 
@@ -160,23 +185,23 @@ export function setAvailability(db: Database, userId: string, showingId: string,
   if (on) db.query("INSERT OR IGNORE INTO availability(user_id, showing_id) VALUES (?, ?)").run(userId, showingId);
   else db.query("DELETE FROM availability WHERE user_id = ? AND showing_id = ?").run(userId, showingId);
 }
-export function setFilmVote(db: Database, userId: string, filmId: number, vote: -1 | 0 | 1) {
-  if (vote === 0) db.query("DELETE FROM film_votes WHERE user_id = ? AND film_id = ?").run(userId, filmId);
-  else db.query("INSERT INTO film_votes(user_id, film_id, vote) VALUES (?, ?, ?) ON CONFLICT(user_id, film_id) DO UPDATE SET vote = excluded.vote").run(userId, filmId, vote);
+export function setFilmVote(db: Database, userId: string, filmKey: string, vote: -1 | 0 | 1) {
+  if (vote === 0) db.query("DELETE FROM film_votes WHERE user_id = ? AND film_key = ?").run(userId, filmKey);
+  else db.query("INSERT INTO film_votes(user_id, film_key, vote) VALUES (?, ?, ?) ON CONFLICT(user_id, film_key) DO UPDATE SET vote = excluded.vote").run(userId, filmKey, vote);
 }
 
 // ---- read model ----
 export type ShowingRow = {
-  id: string; film_id: number; cinema_id: number; date: string; time: string; end_time: string;
-  version: string; room: string; booking_url: string; available: string[];
+  id: string; film_key: string; cinema_id: string; date: string; time: string; end_time: string;
+  version: string; extra: string; room: string; booking_url: string; available: string[];
 };
 export type FilmRow = Film & { votes: Record<string, number> };
 
 export function snapshot(db: Database, isoToday: string, nowHM: string) {
   const films = (db.query("SELECT * FROM films").all() as any[]).map((f) => ({ ...f, votes: {} as Record<string, number> }));
-  const byFilm = new Map<number, FilmRow>(films.map((f) => [f.id, f]));
-  for (const v of db.query("SELECT user_id, film_id, vote FROM film_votes").all() as { user_id: string; film_id: number; vote: number }[]) {
-    byFilm.get(v.film_id)!.votes[v.user_id] = v.vote;
+  const byFilm = new Map<string, FilmRow>(films.map((f) => [f.key, f]));
+  for (const v of db.query("SELECT user_id, film_key, vote FROM film_votes").all() as { user_id: string; film_key: string; vote: number }[]) {
+    byFilm.get(v.film_key)!.votes[v.user_id] = v.vote;
   }
   const showings = (db.query(
     `SELECT s.* FROM showings s JOIN cinemas c ON c.id = s.cinema_id
@@ -187,8 +212,8 @@ export function snapshot(db: Database, isoToday: string, nowHM: string) {
     byShowing.get(a.showing_id)?.available.push(a.user_id);
   }
   // Films with no upcoming showing in a selected cinema are noise.
-  const live = new Set(showings.map((s) => s.film_id));
-  return { films: films.filter((f) => live.has(f.id)), showings };
+  const live = new Set(showings.map((s) => s.film_key));
+  return { films: films.filter((f) => live.has(f.key)), showings };
 }
 
 /**
@@ -196,12 +221,12 @@ export function snapshot(db: Database, isoToday: string, nowHM: string) {
  * everyone, then the sooner séance.
  */
 export function rankPlans(showings: ShowingRow[], films: FilmRow[], limit = 5): ShowingRow[] {
-  const score = new Map(films.map((f) => [f.id, Object.values(f.votes).reduce((a, b) => a + b, 0)]));
+  const score = new Map(films.map((f) => [f.key, Object.values(f.votes).reduce((a, b) => a + b, 0)]));
   return [...showings]
     .filter((s) => s.available.length > 0)
     .sort((a, b) =>
       b.available.length - a.available.length ||
-      (score.get(b.film_id) ?? 0) - (score.get(a.film_id) ?? 0) ||
+      (score.get(b.film_key) ?? 0) - (score.get(a.film_key) ?? 0) ||
       (a.date + a.time).localeCompare(b.date + b.time),
     )
     .slice(0, limit);

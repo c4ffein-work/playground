@@ -1,0 +1,41 @@
+[
+ {
+  "id": "55774",
+  "title": "Cars",
+  "runtime": 7020,
+  "genres": "Animation, Comédie, Action, Fantastique",
+  "poster": "https://all.web.img.acsta.net/img/59/da/59da33b9de0e915a94ce75dcd407df2d.jpg",
+  "synopsis": "Flash McQueen, une splendide voiture de course toute neuve promise au succès, découvre que dans la vie, ce n'est pas de franchir la ligne d'arrivée qui compte, mais le parcours que l'on a suivi. Parti pour participer à la prestigieuse Piston Cup, il atterrit suite à une déviation dans la petite ville tranquille de Radiator Springs, sur la Route 66. McQueen va apprendre à connaître Sally (une élégante Porsche 2002), Doc Hudson (une Hudson Hornet 1951 au passé mystérieux), et Mater (une dépanneuse rouillée mais à qui on peut faire confiance). Ils vont l'aider à découvrir qu'il y a des choses plus importantes que les trophées, la gloire et les sponsors...",
+  "direction": [
+   "John Lasseter"
+  ],
+  "release": "2006-06-14T00:00:00.000Z",
+  "originalTitle": "Cars"
+ },
+ {
+  "id": "320681",
+  "title": "La Pat' Patrouille : Le film mission Dino",
+  "runtime": 5280,
+  "genres": "Animation, Aventure, Famille, Comédie",
+  "poster": "https://all.web.img.acsta.net/img/bb/35/bb358019448f4fcd5c37b0d19c04fd0d.jpg",
+  "synopsis": "Lorsqu’une mystérieuse tempête surprend leur navire, la Pat’ Patrouille s’échoue sur une île tropicale encore inexplorée… et peuplée de dinosaures ! Ils y rencontrent Rex, un chiot courageux installé sur l’île depuis des années et devenu un véritable expert des dinosaures. Mais leur ennemi de toujours, M.Hellinger, arrive lui aussi sur l’île avec un projet dangereux : exploiter ses richesses naturelles en creusant des mines. Ses actions imprudentes déclenchent bientôt l’éruption d’un gigantesque volcan endormi. La Pat’ Patrouille se retrouve alors entraînée dans une série de missions de sauvetage spectaculaires, plus impressionnantes que tout ce qu’elle a connu jusqu’ici. Elle devra arrêter M. Hellinger et sauver l’île avant qu’il ne soit trop tard.",
+  "direction": [
+   "Cal Brunker"
+  ],
+  "release": "2026-08-05T00:00:00.000Z",
+  "originalTitle": "PAW Patrol: The Dino Movie"
+ },
+ {
+  "id": "327174",
+  "title": "Digger",
+  "runtime": 7740,
+  "genres": "Action, Comédie",
+  "poster": "https://all.web.img.acsta.net/img/ca/46/ca467fa6a145bb9d8fda93417d4374cf.jpg",
+  "synopsis": "L’homme le plus puissant au monde se lance dans une mission effrénée pour s'ériger en sauveur de l’humanité avant que la catastrophe, qu’il a lui-même déclenchée, n’anéantisse la planète.",
+  "direction": [
+   "Alejandro González Iñárritu"
+  ],
+  "release": "2026-09-30T00:00:00.000Z",
+  "originalTitle": "Digger"
+ }
+]

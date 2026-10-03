@@ -2,6 +2,8 @@
 import type { Database } from "bun:sqlite";
 import { join } from "node:path";
 import { REGIONS, fetchCityCinemas, isoDate } from "./ugc";
+import { fetchCgrTheaters, theatersInCity } from "./cgr";
+import type { CinemaRef } from "./types";
 import {
   createUser, findUserByContact, getSetting, getUser, isBlankUser, lastScrapeAt, listCinemas, listUsers, openDb,
   rankPlans, replaceCinemas, setAvailability, setCinemaSelected, setFilmVote, setSetting, snapshot, updateUser,
@@ -12,7 +14,27 @@ const PUBLIC = join(import.meta.dir, "..", "public");
 const COOKIE = "seances_uid";
 const ONE_YEAR = 60 * 60 * 24 * 365;
 
-export type AppOptions = { db: Database; port?: number; refreshEveryMs?: number; autoRefresh?: boolean; cityFetcher?: typeof fetchCityCinemas };
+export type AppOptions = {
+  db: Database; port?: number; refreshEveryMs?: number; autoRefresh?: boolean;
+  /** Resolves every cinema (all chains) of a city; the default unions UGC + CGR and tolerates one chain failing. */
+  cityFetcher?: (regionId: number, regionName: string) => Promise<CinemaRef[]>;
+};
+
+export async function cityCinemas(regionId: number, regionName: string): Promise<CinemaRef[]> {
+  const [ugc, cgr] = await Promise.allSettled([
+    fetchCityCinemas(regionId),
+    fetchCgrTheaters().then((all) => theatersInCity(all, regionName).map(({ id, chain, name }) => ({ id, chain, name }))),
+  ]);
+  const errors: string[] = [];
+  const out: CinemaRef[] = [];
+  for (const [chain, r] of [["UGC", ugc], ["CGR", cgr]] as const) {
+    if (r.status === "fulfilled") out.push(...r.value);
+    else errors.push(`${chain}: ${(r.reason as Error).message}`);
+  }
+  if (!out.length) throw new Error(errors.join("; ") || "no cinema found");
+  if (errors.length) console.warn("[city] partial:", errors.join("; "));
+  return out;
+}
 
 function json(data: unknown, init: ResponseInit = {}) {
   return new Response(JSON.stringify(data), { ...init, headers: { "content-type": "application/json; charset=utf-8", ...(init.headers ?? {}) } });
@@ -35,7 +57,7 @@ function nowHM(d = new Date()) {
 
 export function createApp(opts: AppOptions) {
   const { db } = opts;
-  const cityFetcher = opts.cityFetcher ?? fetchCityCinemas;
+  const cityFetcher = opts.cityFetcher ?? cityCinemas;
   let refreshing: Promise<unknown> | null = null;
 
   function kickRefresh(days?: number) {
@@ -109,8 +131,8 @@ export function createApp(opts: AppOptions) {
       const region = REGIONS.find((r) => r.id === Number(b.regionId));
       if (!region) return withCookie(bad("unknown city"));
       let cinemas;
-      try { cinemas = await cityFetcher(region.id); }
-      catch (e) { return withCookie(bad("UGC lookup failed: " + (e as Error).message, 502)); }
+      try { cinemas = await cityFetcher(region.id, region.name); }
+      catch (e) { return withCookie(bad("cinema lookup failed: " + (e as Error).message, 502)); }
       if (!cinemas.length) return withCookie(bad("no UGC cinema found for that city", 404));
       replaceCinemas(db, cinemas);
       setSetting(db, "region_id", String(region.id));
@@ -121,8 +143,8 @@ export function createApp(opts: AppOptions) {
 
     if (m === "POST" && path === "/api/cinema") {
       const b = await body(req);
-      if (!listCinemas(db).some((c) => c.id === Number(b.id))) return withCookie(bad("unknown cinema"));
-      setCinemaSelected(db, Number(b.id), !!b.selected);
+      if (!listCinemas(db).some((c) => c.id === String(b.id))) return withCookie(bad("unknown cinema"));
+      setCinemaSelected(db, String(b.id), !!b.selected);
       if (b.selected && opts.autoRefresh !== false) kickRefresh();
       return withCookie(json(stateFor(uid)));
     }
@@ -142,10 +164,10 @@ export function createApp(opts: AppOptions) {
 
     if (m === "POST" && path === "/api/film-vote") {
       const b = await body(req);
-      const fid = Number(b.filmId), v = Number(b.vote);
-      if (!db.query("SELECT 1 FROM films WHERE id = ?").get(fid)) return withCookie(bad("unknown film", 404));
+      const key = String(b.filmKey ?? ""), v = Number(b.vote);
+      if (!db.query("SELECT 1 FROM films WHERE key = ?").get(key)) return withCookie(bad("unknown film", 404));
       if (![-1, 0, 1].includes(v)) return withCookie(bad("vote must be -1, 0 or 1"));
-      setFilmVote(db, uid, fid, v as -1 | 0 | 1);
+      setFilmVote(db, uid, key, v as -1 | 0 | 1);
       return withCookie(json(stateFor(uid)));
     }
 

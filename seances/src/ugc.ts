@@ -21,30 +21,7 @@ export const REGIONS: { id: number; name: string }[] = [
   { id: 11, name: "Toulouse" },
 ];
 
-export type Film = {
-  id: number;
-  title: string;
-  genre: string;
-  duration: string; // "1h49"
-  release: string; // "30 septembre 2026"
-  director: string;
-  synopsis: string;
-  poster: string;
-  label: string; // "Sélection UGC Culte", "UGC Aime", ...
-  rating: number | null; // audience average /5
-};
-
-export type Showing = {
-  id: string; // UGC's showing id, also the booking id
-  filmId: number;
-  cinemaId: number;
-  date: string; // ISO yyyy-mm-dd
-  time: string; // "18:30"
-  endTime: string; // "20:35" or ""
-  version: string; // VF / VOSTF / ...
-  room: string; // "Salle 1"
-  bookingUrl: string;
-};
+import { filmKey, type CinemaRef, type Film, type Showing } from "./types";
 
 const ENTITIES: Record<string, string> = {
   amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", hellip: "…",
@@ -82,6 +59,12 @@ function between(src: string, after: RegExp, until: string): string {
   return end < 0 ? "" : src.slice(start, end);
 }
 
+/** UGC says VOSTF / VFSTF; CGR says VOST / VFST. One vocabulary for the filter chips. */
+export function normVersion(v: string): string {
+  const u = v.toUpperCase().trim();
+  return u === "VOSTF" ? "VOST" : u === "VFSTF" ? "VFST" : u;
+}
+
 /** "04/10/2026" -> "2026-10-04" */
 export function frDateToIso(d: string): string {
   const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(d.trim());
@@ -93,6 +76,7 @@ export function parseShowings(html: string): { films: Film[]; showings: Showing[
   const films: Film[] = [];
   const showings: Showing[] = [];
   const blocks = html.split(/<div id="bloc-showing-film-(?=\d+")/).slice(1);
+  const keyOf = new Map<number, string>();
   for (const block of blocks) {
     const id = parseInt(block, 10);
     if (!Number.isFinite(id)) continue;
@@ -105,9 +89,11 @@ export function parseShowings(html: string): { films: Film[]; showings: Showing[
     const rateM = /<h1 class="average">\s*([\d,.]+)/.exec(block);
     const posterM = /<img class="lozad[^"]*"\s+data-src="([^"]*)"/.exec(block);
     const kind = attr(anchor, "data-film-kind");
+    const title = clean(attr(anchor, "title"));
+    keyOf.set(id, filmKey(title));
     films.push({
-      id,
-      title: clean(attr(anchor, "title")),
+      key: filmKey(title),
+      title,
       genre: clean(kind),
       duration: durM ? durM[1] : "",
       release: clean(relM?.[1]).replace(/\s*\(\d+h\d{2}\)$/, ""),
@@ -126,14 +112,16 @@ export function parseShowings(html: string): { films: Film[]; showings: Showing[
       const endM = /screening-time-end">\s*\(fin\s+(\d{1,2}:\d{2})\)/.exec(tail);
       const roomM = /screening-room">\s*([^<]*?)\s*</.exec(tail);
       const sid = m[1];
+      const fid = parseInt(attr(tag, "data-filmId"), 10) || id;
       showings.push({
-        id: sid,
-        filmId: parseInt(attr(tag, "data-filmId"), 10) || id,
-        cinemaId: parseInt(attr(tag, "data-cinemaId"), 10),
+        id: `ugc:${sid}`,
+        filmKey: keyOf.get(fid) ?? keyOf.get(id)!,
+        cinemaId: `ugc:${parseInt(attr(tag, "data-cinemaId"), 10)}`,
         date: frDateToIso(attr(tag, "data-seanceDate")),
         time: attr(tag, "data-seanceHour"),
         endTime: endM ? endM[1] : "",
-        version: attr(tag, "data-version").toUpperCase(),
+        version: normVersion(attr(tag, "data-version")),
+        extra: "",
         room: clean(roomM?.[1]),
         bookingUrl: `${BASE}/reservationSeances.html?id=${sid}`,
       });
@@ -151,13 +139,11 @@ async function get(url: string, init?: RequestInit): Promise<string> {
   return await res.text();
 }
 
-export type CinemaRef = { id: number; name: string };
-
 /** Every UGC cinema with its numeric id (a JSON endpoint). */
 export async function fetchAllCinemas(): Promise<CinemaRef[]> {
   const json = JSON.parse(await get(`${BASE}/inscriptionNewsletterAction!getCinemaList.action`));
   if (!Array.isArray(json?.cinemas)) throw new Error("UGC: unexpected cinema list payload");
-  return json.cinemas.map((c: any) => ({ id: Number(c.id), name: String(c.name).trim() }));
+  return json.cinemas.map((c: any) => ({ id: `ugc:${Number(c.id)}`, chain: "ugc" as const, name: String(c.name).trim() }));
 }
 
 /** Cinema names listed under one city tab (no ids in that fragment). */
@@ -181,13 +167,13 @@ export async function fetchCityCinemas(regionId: number): Promise<CinemaRef[]> {
   const out: CinemaRef[] = [];
   for (const n of names) {
     const hit = byName.get(norm(n));
-    if (hit) out.push({ id: hit.id, name: n });
+    if (hit) out.push({ id: hit.id, chain: "ugc", name: n });
   }
   if (names.length && !out.length) throw new Error("UGC: could not match any city cinema to an id");
   return out;
 }
 
-/** One cinema, one day. `date` is ISO yyyy-mm-dd. */
+/** One cinema, one day. `cinemaId` is the bare UGC number, `date` ISO yyyy-mm-dd. */
 export async function fetchShowings(cinemaId: number, date: string) {
   const url = `${BASE}/showingsCinemaAjaxAction!getShowingsForCinemaPage.action?cinemaId=${cinemaId}&date=${date}`;
   const html = await get(url);

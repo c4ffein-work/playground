@@ -1,0 +1,203 @@
+{
+ "W3300": {
+  "schedule": {
+   "55774": {
+    "2026-10-04": [
+     {
+      "id": "55774-2026-10-04 10:30:00-Localization.Language.French,Showtime.Accessibility.Accessible,Auditorium.Experience.Ice",
+      "startsAt": "2026-10-04T10:30:00",
+      "tags": [
+       "Localization.Language.French",
+       "Showtime.Accessibility.Accessible",
+       "Auditorium.Experience.Ice"
+      ],
+      "isExpired": false,
+      "data": {
+       "ticketing": [
+        {
+         "urls": [
+          "https://achat.cgrcinemas.fr/lefrancais/r/435133"
+         ],
+         "type": "DESKTOP",
+         "provider": "default"
+        },
+        {
+         "urls": [
+          "https://relay.mvtx.us/ticketing/dbz?code_theater=W3300&gid_entity=movie.movie._.55774&tags=Localization.Language.French,Showtime.Accessibility.Accessible,Auditorium.Experience.Ice&perfd=20261004&perft=10:30&code=Accès PMR; ICE; VF;"
+         ],
+         "type": "DESKTOP",
+         "provider": "relay"
+        }
+       ]
+      },
+      "occupancy": {
+       "rate": 11
+      },
+      "screen": {
+       "name": "Salle ICE"
+      },
+      "nextShowtimes": []
+     },
+     {
+      "id": "55774-2026-10-04 13:30:00-Localization.Language.French,Showtime.Accessibility.Accessible,Auditorium.Experience.Ice",
+      "startsAt": "2026-10-04T13:30:00",
+      "tags": [
+       "Localization.Language.French",
+       "Showtime.Accessibility.Accessible",
+       "Auditorium.Experience.Ice"
+      ],
+      "isExpired": false,
+      "data": {
+       "ticketing": [
+        {
+         "urls": [
+          "https://achat.cgrcinemas.fr/lefrancais/r/435135"
+         ],
+         "type": "DESKTOP",
+         "provider": "default"
+        },
+        {
+         "urls": [
+          "https://relay.mvtx.us/ticketing/dbz?code_theater=W3300&gid_entity=movie.movie._.55774&tags=Localization.Language.French,Showtime.Accessibility.Accessible,Auditorium.Experience.Ice&perfd=20261004&perft=13:30&code=Accès PMR; ICE; VF;"
+         ],
+         "type": "DESKTOP",
+         "provider": "relay"
+        }
+       ]
+      },
+      "occupancy": {
+       "rate": 16
+      },
+      "screen": {
+       "name": "Salle ICE"
+      },
+      "nextShowtimes": []
+     },
+     {
+      "id": "55774-2026-10-04 15:40:00-Localization.Language.French",
+      "startsAt": "2026-10-04T15:40:00",
+      "tags": [
+       "Localization.Language.French"
+      ],
+      "isExpired": false,
+      "data": {
+       "ticketing": [
+        {
+         "urls": [
+          "https://achat.cgrcinemas.fr/lefrancais/r/435137"
+         ],
+         "type": "DESKTOP",
+         "provider": "default"
+        },
+        {
+         "urls": [
+          "https://relay.mvtx.us/ticketing/dbz?code_theater=W3300&gid_entity=movie.movie._.55774&tags=Localization.Language.French&perfd=20261004&perft=15:40&code=VF;"
+         ],
+         "type": "DESKTOP",
+         "provider": "relay"
+        }
+       ]
+      },
+      "occupancy": {
+       "rate": 8
+      },
+      "screen": {
+       "name": "Salle 11"
+      },
+      "nextShowtimes": []
+     }
+    ]
+   },
+   "320681": {
+    "2026-10-04": [
+     {
+      "id": "320681-2026-10-04 10:45:00-Localization.Language.French",
+      "startsAt": "2026-10-04T10:45:00",
+      "tags": [
+       "Localization.Language.French"
+      ],
+      "isExpired": false,
+      "data": {
+       "ticketing": [
+        {
+         "urls": [
+          "https://achat.cgrcinemas.fr/lefrancais/r/437466"
+         ],
+         "type": "DESKTOP",
+         "provider": "default"
+        },
+        {
+         "urls": [
+          "https://relay.mvtx.us/ticketing/dbz?code_theater=W3300&gid_entity=movie.movie._.320681&tags=Localization.Language.French&perfd=20261004&perft=10:45&code=VF;"
+         ],
+         "type": "DESKTOP",
+         "provider": "relay"
+        }
+       ]
+      },
+      "occupancy": {
+       "rate": 0
+      },
+      "screen": {
+       "name": "Salle 05"
+      },
+      "nextShowtimes": []
+     }
+    ]
+   },
+   "327174": {
+    "2026-10-04": [
+     {
+      "id": "327174-2026-10-04 19:30:00-Showtime.Accessibility.Accessible,Auditorium.Experience.Ice,Localization.Version.Original,Showtime.Accessibility.Subtitled",
+      "startsAt": "2026-10-04T19:30:00",
+      "tags": [
+       "Showtime.Accessibility.Accessible",
+       "Auditorium.Experience.Ice",
+       "Localization.Version.Original",
+       "Showtime.Accessibility.Subtitled"
+      ],
+      "isExpired": false,
+      "data": {
+       "ticketing": [
+        {
+         "urls": [
+          "https://achat.cgrcinemas.fr/lefrancais/r/437598"
+         ],
+         "type": "DESKTOP",
+         "provider": "default"
+        },
+        {
+         "urls": [
+          "https://relay.mvtx.us/ticketing/dbz?code_theater=W3300&gid_entity=movie.movie._.327174&tags=Showtime.Accessibility.Accessible,Auditorium.Experience.Ice,Localization.Version.Original,Showtime.Accessibility.Subtitled&perfd=20261004&perft=19:30&code=Accès PMR; ICE; VOST;"
+         ],
+         "type": "DESKTOP",
+         "provider": "relay"
+        }
+       ]
+      },
+      "occupancy": {
+       "rate": 0
+      },
+      "screen": {
+       "name": "Salle ICE"
+      },
+      "nextShowtimes": []
+     }
+    ]
+   }
+  },
+  "moviesTags": {
+   "55774": [
+    "Localization.Language.French",
+    "Showtime.Accessibility.Accessible",
+    "Auditorium.Experience.Ice"
+   ],
+   "320681": [
+    "Localization.Language.French"
+   ]
+  },
+  "showtimesDates": [
+   "2026-10-04"
+  ]
+ }
+}
