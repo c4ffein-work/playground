@@ -188,6 +188,62 @@ integer draw 0.1-0.4 us on top, `integers()` through the interpreter
 7.5 us, `text()` 7.5 us, `lists(integers())` 19 us. The engine is no
 longer where a test's time goes.
 
+### Big tests (2026-10-04)
+
+The per-example table above is on tiny tests, where 0.27 ms of Hypothesis's
+own per-example bookkeeping is the whole cost and no engine can show.
+`bench-big-tests.py` (next to these notes) asks the question that matters:
+large examples, a rare bug that takes many tries, and the shrink that
+follows. Python engine against the batched libhegel runner, three seeds
+each, `max_examples=20000`, `report_multiple_bugs=False`; "found@" is the
+test call that first failed, "shrink" the calls and seconds after it.
+
+Generation, examples of hundreds of draws (300 examples):
+
+| case | python | libhegel batched | ratio |
+|---|---|---|---|
+| lists of 100-200 records (5 fields: int, text, float, tags, bool) | 76.3 ms/ex | 6.1 ms/ex | 12.5x |
+| the same with `unique_by` id (opaque root, batched records) | 93.4 ms/ex | 18.1 ms/ex | 5.2x |
+| 30x30 matrix of unbounded integers | 30.3 ms/ex | 10.8 ms/ex | 2.8x |
+
+Hunts (found@ calls, then shrink calls / seconds; "min" = the expected
+minimum was reached):
+
+| case | python, seeds 0 / 1 / 2 | libhegel batched, seeds 0 / 1 / 2 |
+|---|---|---|
+| a pair with int > 990 and a 3-char string, in a list of pairs | found@145 / 60 / 69; shrink 98 / 72 / 32 calls, 0.6 / 0.3 / 0.1 s; min | found@5 / 26 / 3; shrink 178 / 182 / 185 calls, 0.3 s each; min |
+| two records with the same id and different names | found@19 / 17 / 18; shrink 441 / 473 / 490 calls, 4.1 / 4.3 / 4.9 s; min on one seed, names `'0'`/`'00'` on two | found@28 / 2 / 2; shrink 143 / 94 / 90 calls, 2.1 / 1.8 / 1.8 s; min (`'0'`/`'1'`) on all |
+| nested lists summing past 10**6 with a row of 5 | found@41 / 19 / 58; shrink 106 / 98 / 109 calls, 0.3-0.4 s; min | found@2 / 5 / 11; shrink 965 / 1007 / 933 calls, 1.9-2.1 s; min |
+| a sorted run of 6 distinct values in a list of 0..100 | found@672 / 300 / 1414; shrink 234 / 292 / 296 calls, 0.7-1.0 s; min | found@35 / 15 / 215; shrink 1061 / 1067 / 1051 calls, 1.3-1.4 s; min |
+
+Reading it:
+
+- **Large examples are where the interpreter pays off**: 12x on a list of
+  records, because the Python engine's cost is per draw (five fields,
+  the list protocol, the dictionary shuffle, ~700 draws per example) and
+  the interpreter's is per example. The 30x30 matrix is only 2.8x
+  because the 900 integers still become 900 Python ints and 900
+  `ChoiceNode`s on the way back; recording the choice sequence lazily
+  (keep libhegel's blob, materialise nodes only when something reads
+  them) is the next step and would take that case toward the records'.
+- **libhegel finds the bugs in a fraction of the examples**: 2 to 35 calls
+  against 17 to 1414. Its generation is far more biased to boundaries and
+  duplicates (round two measured 6% zero integers against 0.1%), which is
+  exactly what these bugs want; the quality suite's `large_factorial`
+  cases are the price of the same bias.
+- **Shrinking is mixed, and libhegel is not simply worse.** On the records
+  it uses a fifth of the calls and reaches the one-character minimum where
+  Hypothesis's shrinker stopped at `'00'` on two seeds out of three. On
+  the nested-sum and sorted-run cases it uses 4 to 10 times the calls
+  (no result cache, no duplicate-aware passes: round two's finding), yet
+  the wall time is within 2x because each call is cheaper.
+- The whole hunt plus shrink is faster under libhegel on every seed of the
+  first two cases and slower by about a second on the other two. On a
+  test whose body takes milliseconds (the realistic case), the call counts
+  decide and the engine's share disappears either way; what remains is
+  how many calls the shrinker needs, which is a shrinker question, not a
+  boundary question.
+
 ### Suites, round three
 
 | suite | round two | round three |
