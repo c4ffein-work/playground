@@ -1,0 +1,35 @@
+From 3d3bda0b1c5eb7a4786062c3493c9777322fbf84 Mon Sep 17 00:00:00 2001
+From: Robert Perry <robert@skolocfd.com>
+Date: Wed, 7 Oct 2026 13:32:22 +0200
+Subject: [PATCH] Bugfix: skip fold sender-receiver that keeps all its vertices
+
+When a receiver selected as sender-receiver was the last remaining
+receiver, the overload computation made it keep all its excess
+vertices (vertsndnbr == 0), but the send do-while loop still ran once.
+The receiver cursor then went past the last receiver onto the
+sender-receiver itself, recording a zero-vertex self-send and wasting
+receive slots. Debug builds abort with "dgraphFoldComm: internal
+error (2)"; release builds need extra retries and may keep a self-send
+with no matching receive in the final plan.
+
+Such a process now remains a plain receiver and sends nothing.
+---
+ src/libscotch/dgraph_fold_comm.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/libscotch/dgraph_fold_comm.c b/src/libscotch/dgraph_fold_comm.c
+index 171884a..b71a127 100644
+--- a/src/libscotch/dgraph_fold_comm.c
++++ b/src/libscotch/dgraph_fold_comm.c
+@@ -325,6 +325,8 @@ Gnum * restrict * restrict const                vertdlttabptr) /* Pointer to glo
+           vertglbtmp  = (vertsndnbr - vertrcvnbr + commnbr) / (commnbr + 1); /* Compute overload including sender process */
+           vertglbdlt += vertglbtmp;               /* Add extra overload to current overload                               */
+           vertsndnbr -= vertglbtmp;               /* Extra overload vertices will not be sent by sender receiver process  */
++          if (vertsndnbr <= 0)                    /* If it keeps all its vertices, it remains a plain receiver            */
++            continue;
+         }
+       }
+       else {                                      /* There is room for adding messages       */
+-- 
+2.43.0
+

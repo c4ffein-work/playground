@@ -1,0 +1,9 @@
+{
+  "repo": "scotch/scotch",
+  "remote": "https://gitlab.inria.fr/scotch/scotch.git",
+  "base_branch": "master",
+  "base_sha": "ea5d15690c54aa8644b4cb7bab76099a70db693c",
+  "created": "2026-10-07",
+  "patches": 1,
+  "title": "Bugfix: skip fold sender-receiver that keeps all its vertices"
+}
