@@ -1,4 +1,4 @@
-From 35b93a3ecd6a9f1bc8a6bc5dbe7d129ecb228b29 Mon Sep 17 00:00:00 2001
+From 842baa8764bf60856b7150ba21785331b44a2222 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Sun, 25 Oct 2026 17:53:34 +0000
 Subject: [PATCH 1/2] libhegel: the draws a Hypothesis frontend needs
@@ -57,7 +57,7 @@ index 8c13fa5c..36355fa8 100644
              fn hegel_test_case_from_blob(ctx: *mut HegelContext, s: *const HegelSettings, blob: hegel_string_t, callback: hegel_output_callback_t, user_data: *mut c_void, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
 diff --git a/libhegel/RELEASE.md b/libhegel/RELEASE.md
 new file mode 100644
-index 00000000..2901cf90
+index 00000000..f20e752b
 --- /dev/null
 +++ b/libhegel/RELEASE.md
 @@ -0,0 +1,11 @@
@@ -71,7 +71,7 @@ index 00000000..2901cf90
 +- `hegel_test_case_choices(tc, out)`: the choices a live test case has recorded so far, as the same base64 blob a failure's reproduction uses, for a frontend that generates whole values natively and learns the sequence after the fact.
 +- `allow_nan` is now accepted alongside finite float bounds: NaN comes with the usual NaN probability and in-range values otherwise, where the combination used to be an invalid argument.
 +
-+It also builds the "diffuse" pool of a wide integer draw (up to 256 bignum powers of two) only when that category is selected, as the "interesting" pool already was; an integer draw over a range wider than `i128`, such as `integers()` clamped to `2**128`, goes from about 160 microseconds to about 3, with the same values from the same seed.
++It also builds the "diffuse" pool of a wide integer draw (up to 256 bignum powers of two) only when that category is selected, as the "interesting" pool already was; an integer draw over a range wider than `i128`, such as `integers()` clamped to `2**128`, takes about a quarter of the time it did, with the same values from the same seed.
 diff --git a/libhegel/include/hegel.h b/libhegel/include/hegel.h
 index d81258ea..b2eb4a0f 100644
 --- a/libhegel/include/hegel.h

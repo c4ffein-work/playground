@@ -1,0 +1,9 @@
+{
+  "repo": "hegeldev/hegel",
+  "remote": "https://github.com/hegeldev/hegel",
+  "base_branch": "main",
+  "base_sha": "36f65de4e5b48f129e76ab955d84cc355135bd7e",
+  "created": "2026-10-25",
+  "patches": 1,
+  "title": "Build the diffuse integer pool only when it is selected"
+}

@@ -21,8 +21,9 @@ native engine, and how to check equivalence. Three rounds:
    compiled to a small IR and interpreted in Rust against the libhegel
    case, so a test's inputs are generated in one crossing instead of one
    per primitive; everything else falls back to the interactive path. Plus
-   the forced-draw gap closed and a 50x fix to libhegel's unbounded
-   integer draw. See "Round three" below.
+   the forced-draw gap closed and a 2.5-4x fix to libhegel's unbounded
+   integer draw (first reported here as 50x: see the correction in round
+   four). See "Round three" below.
 4. **The bridge on Hegel's own Python binding** (2026-10-25): the Rust half
    moved into the Hegel monorepo (libhegel plus `hegel._native`, the pyo3
    extension of Hegel's Python frontend), Hypothesis's half became Python
@@ -106,6 +107,18 @@ three targeting cases and three of the five shrink-quality cases now pass,
 leaving widening (16), the six `large_factorial` discovery cases and two
 `lowering_together` cases.
 
+**A correction, and the one patch worth sending first.** Re-measuring the
+lazy diffuse pool on its own, with one seed and 20000 wide draws through
+the C ABI (fingerprints identical before and after): 5.7 to 1.3 us per draw
+at the monorepo's dev profile, 3.0 to 1.2 at release, and the untouched
+0.44.1 tree draws at 5.0 us too. The "160 us to 3 us" of rounds two and
+three compared an unoptimized build with an optimized one. The fix is
+real and free, just 2.5-4x, not 50x. It is cut as its own single commit
+against the monorepo's main,
+`patches/hegeldev__hegel/2026-10-25-lazy-diffuse-pool` with a `PR.md`
+beside it, because it needs no design conversation: same values, same
+seed, less work.
+
 What the move changes for the question: the engine is now the one
 Hegel's own frontend ships, from PyPI; the Hypothesis side is an
 optional-dependency backend like CrossHair's, which is the shape
@@ -136,10 +149,10 @@ hegel-rust, four commits:
   frontend no longer sees individual draws, so it asks).
 - `biguint_sample_in_range` builds its "diffuse" pool (256 bignum powers of
   two, sorted) only when that category is selected, as the "interesting"
-  pool already was. Same RNG consumption, same values; an unbounded
-  integer draw goes from ~160 us to ~3 us. Hypothesis's `integers()` is
-  the most common strategy and clamps to 2**128, past libhegel's i128
-  fast path, so this was most of the engine's cost per example.
+  pool already was. Same RNG consumption, same values. Measured properly
+  (round four), a wide integer draw takes about a quarter of the time it
+  did; the "160 us to 3 us" first reported here was a comparison across
+  build profiles, not the fix.
 - `hegel_generate_integer_forced(min, max, forced)`: records a
   caller-chosen value as a forced integer choice, as the forced boolean
   already could. For the draws Hypothesis forces (filtered
@@ -265,10 +278,13 @@ On this mix 91% of strategy draws were batched (56672 against 5561
 interactive, the latter the `datetimes` and `dictionaries` roots whose
 inner draws are batched anyway). Three things to read from the table:
 
-- **The round-two "libhegel is slower to generate" was libhegel's
-  unbounded integer draw**, not the architecture: with the diffuse pool
-  built lazily the interactive runner is already 1.5-2x faster than the
-  Python engine per example, where round two had it 1.1-1.5x slower.
+- **The round-two "libhegel is slower to generate" did not survive a
+  rebuild**: between the two measurements the diffuse pool became lazy and
+  the extension was rebuilt, and the interactive runner went from 1.1-1.5x
+  slower than the Python engine per example to 1.5-2x faster. Round four's
+  seeded measurement puts the lazy pool alone at 2.5-4x per wide draw, so
+  part of that swing was the build, not the engine; the ordering after it
+  held through every later measurement.
 - **Batching pays in proportion to the draws per example**: nothing for
   one integer, 2.5x for the structured tuple, 3.7x against the Python
   engine there. Per-example overhead that remains is Hypothesis's own

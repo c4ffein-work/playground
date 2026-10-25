@@ -1,0 +1,92 @@
+From dfd6462082d5a2db5611e471f173aaecd69020b0 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 19:24:14 +0000
+Subject: [PATCH] Build the diffuse integer pool only when it is selected
+
+biguint_sample_in_range built its diffuse pool (up to 256 bignum powers
+of two, sorted and deduplicated) on every draw over a range wider than
+i128, although that category is picked a small fraction of the time; the
+interesting pool was already built lazily. Doing the same for the diffuse
+one takes a seeded wide draw from 5.7 to 1.3 microseconds at the dev
+profile (3.0 to 1.2 at release), with the same RNG consumption and so
+the same values: 20000 draws from one seed fingerprint identically
+before and after.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ libhegel/RELEASE.md               |  3 +++
+ libhegel/src/native/core/state.rs | 40 ++++++++++++++++---------------
+ 2 files changed, 24 insertions(+), 19 deletions(-)
+ create mode 100644 libhegel/RELEASE.md
+
+diff --git a/libhegel/RELEASE.md b/libhegel/RELEASE.md
+new file mode 100644
+index 00000000..0c333a55
+--- /dev/null
++++ b/libhegel/RELEASE.md
+@@ -0,0 +1,3 @@
++RELEASE_TYPE: patch
++
++This patch improves the performance of integer draws over ranges wider than `i128`, such as a frontend's unbounded `integers()` clamped to `[-2**128, 2**128]`. The sampler built its "diffuse" pool of candidates (up to 256 big-integer powers of two, sorted and deduplicated) on every draw, although that category is selected only a small fraction of the time; it is now built only when selected, as the "interesting" pool already was. Such a draw takes about a quarter of the time it did, and generates exactly the same values from the same seed.
+diff --git a/libhegel/src/native/core/state.rs b/libhegel/src/native/core/state.rs
+index e7496efa..ab83a9fc 100644
+--- a/libhegel/src/native/core/state.rs
++++ b/libhegel/src/native/core/state.rs
+@@ -1084,23 +1084,6 @@ fn biguint_sample_in_range(
+         }
+     }
+ 
+-    // Diffuse category: powers of two spanning the range magnitude.
+-    let mut diffuse: Vec<BigInt> = Vec::new();
+-    {
+-        let mut push_diffuse = |v: BigInt| {
+-            if &v >= min && &v <= max {
+-                diffuse.push(v);
+-            }
+-        };
+-        for k in 1..=bits.min(128) {
+-            let p2 = BigInt::from(BigUint::from(1u32) << (k as usize));
+-            push_diffuse(-p2.clone());
+-            push_diffuse(p2);
+-        }
+-    }
+-    diffuse.sort();
+-    diffuse.dedup();
+-
+     // One shared draw selects the category by cumulative weight; an empty
+     // category is skipped so its mass flows to the next (finally the middle). A
+     // range beyond `i128` always has non-empty endpoints.
+@@ -1125,8 +1108,27 @@ fn biguint_sample_in_range(
+         }
+     }
+     acc += params.diffuse_probability;
+-    if u < acc && !diffuse.is_empty() {
+-        return Ok(diffuse[rng.random_range(0..diffuse.len())].clone());
++    if u < acc {
++        // Diffuse category (built only when selected): powers of two spanning
++        // the range magnitude.
++        let mut diffuse: Vec<BigInt> = Vec::new();
++        {
++            let mut push_diffuse = |v: BigInt| {
++                if &v >= min && &v <= max {
++                    diffuse.push(v);
++                }
++            };
++            for k in 1..=bits.min(128) {
++                let p2 = BigInt::from(BigUint::from(1u32) << (k as usize));
++                push_diffuse(-p2.clone());
++                push_diffuse(p2);
++            }
++        }
++        diffuse.sort();
++        diffuse.dedup();
++        if !diffuse.is_empty() {
++            return Ok(diffuse[rng.random_range(0..diffuse.len())].clone());
++        }
+     }
+ 
+     let below: BigUint = (center - min).magnitude();
+-- 
+2.43.0
+
