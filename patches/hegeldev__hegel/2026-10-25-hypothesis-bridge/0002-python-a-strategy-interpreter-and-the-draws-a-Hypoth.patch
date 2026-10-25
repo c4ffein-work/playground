@@ -1,0 +1,1243 @@
+From 2a526f52d81944a8f78e1f581b321b86bfa2bfcd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 18:04:03 +0000
+Subject: [PATCH 2/2] python: a strategy interpreter and the draws a Hypothesis
+ frontend needs
+
+hegel._native gains TestCase.generate, which walks a CompiledStrategy (a
+frontend's strategy compiled into a tree of primitive draws, collections
+under the frontend's own continuation protocol, choices between
+alternatives, mapped, built and filtered values, and opaque leaves the
+frontend draws itself) against the live test case in one call, recording
+the choices it makes for the frontend's bookkeeping. With it the five
+small entry points a frontend built on another API needs: a weighted
+integer draw carrying shrink_towards, a forced integer draw, a text
+generator over explicit codepoint ranges, a live case's choices as a
+blob, and a test case replaying a blob outside a run. Nothing changes for
+hegel.generators. Ported from the Hypothesis-side extension of the
+experiment running Hypothesis on libhegel, and Hypothesis-agnostic: the
+frontend passes its draw, record and invalid callbacks and its retry
+exception.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ frontends/python/RELEASE.md                  |   3 +
+ frontends/python/python/hegel/_native.pyi    |  39 +-
+ frontends/python/src/interpret.rs            | 737 +++++++++++++++++++
+ frontends/python/src/lib.rs                  |   3 +
+ frontends/python/src/strings.rs              |  21 +
+ frontends/python/src/test_case.rs            | 115 ++-
+ frontends/python/tests/test_native_bridge.py | 171 +++++
+ 7 files changed, 1081 insertions(+), 8 deletions(-)
+ create mode 100644 frontends/python/RELEASE.md
+ create mode 100644 frontends/python/src/interpret.rs
+ create mode 100644 frontends/python/tests/test_native_bridge.py
+
+diff --git a/frontends/python/RELEASE.md b/frontends/python/RELEASE.md
+new file mode 100644
+index 00000000..b496d360
+--- /dev/null
++++ b/frontends/python/RELEASE.md
+@@ -0,0 +1,3 @@
++RELEASE_TYPE: patch
++
++This patch adds to `hegel._native`, for a frontend that drives libhegel through this binding rather than through `hegel.generators`, the pieces an experiment putting Hypothesis on libhegel needed: `TestCase.generate_integer_weighted` and a `forced` argument to `TestCase.generate_integer`, `StringGenerator.text_ranges`, `TestCase.choices_blob`, `TestCase.from_blob`, and `TestCase.generate`, which walks a `CompiledStrategy` (a strategy compiled by its frontend into a small tree of draws, collections, alternatives, mapped and filtered values and opaque leaves) against the test case in one call, recording the choices it made. Nothing changes for `hegel.generators`.
+diff --git a/frontends/python/python/hegel/_native.pyi b/frontends/python/python/hegel/_native.pyi
+index 1ce40a6d..eb8055d6 100644
+--- a/frontends/python/python/hegel/_native.pyi
++++ b/frontends/python/python/hegel/_native.pyi
+@@ -1,7 +1,8 @@
+ """Type stubs for the ``hegel._native`` extension module (pyo3 bindings
+ over libhegel). Keep in sync with ``src/*.rs``."""
+ 
+-from collections.abc import Sequence
++from collections.abc import Callable, Sequence
++from typing import Any
+ 
+ # -- exceptions ---------------------------------------------------------------
+ 
+@@ -106,6 +107,10 @@ class StringGenerator:
+         exclude_characters: str | None,
+     ) -> StringGenerator: ...
+     @staticmethod
++    def text_ranges(
++        min_size: int, max_size: int, ranges: Sequence[tuple[int, int]]
++    ) -> StringGenerator: ...
++    @staticmethod
+     def regex(
+         pattern: str, fullmatch: bool, alphabet: StringGenerator | None
+     ) -> StringGenerator: ...
+@@ -152,14 +157,44 @@ class RunResult:
+     def failure_count(self) -> int: ...
+     def failure(self, index: int) -> tuple[str, str | None, str | None]: ...
+ 
++class CompiledStrategy:
++    def __init__(
++        self,
++        desc: tuple,
++        one_from_many: int,
++        filtered: int,
++        mapped: int,
++        retry_exception: type[BaseException],
++    ) -> None: ...
++
+ class TestCase:
++    @staticmethod
++    def from_blob(settings: Settings, blob: str) -> TestCase: ...
+     def clone(self) -> TestCase: ...
+     def block(self, indent: int) -> TestCase: ...
+     def set_worker(self, worker_index: int) -> None: ...
+     def should_capture(self) -> bool: ...
+     def mark_complete(self, status: int, origin: str | None) -> None: ...
+     def generate_boolean(self, p: float, forced: bool | None = None) -> bool: ...
+-    def generate_integer(self, min_value: int, max_value: int) -> int: ...
++    def generate_integer(
++        self, min_value: int, max_value: int, forced: int | None = None
++    ) -> int: ...
++    def generate_integer_weighted(
++        self,
++        min_value: int,
++        max_value: int,
++        keys: Sequence[int],
++        weights: Sequence[float],
++        shrink_towards: int,
++    ) -> int: ...
++    def choices_blob(self) -> str: ...
++    def generate(
++        self,
++        compiled: CompiledStrategy,
++        draw: Callable[[Any], Any],
++        record: Callable[[list[tuple[str, Any]]], None],
++        invalid: Callable[[str], None],
++    ) -> Any: ...
+     def generate_float(
+         self,
+         width: int,
+diff --git a/frontends/python/src/interpret.rs b/frontends/python/src/interpret.rs
+new file mode 100644
+index 00000000..78416e22
+--- /dev/null
++++ b/frontends/python/src/interpret.rs
+@@ -0,0 +1,737 @@
++use crate::{InvalidArgument, StringGenerator, TestCase, check, with_ctx};
++use hegel_c as c;
++use num_bigint::BigInt;
++use pyo3::prelude::*;
++use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple, PyType};
++use std::ptr;
++
++struct IntNode {
++    lo: BigInt,
++    hi: BigInt,
++    shrink_towards: BigInt,
++    keys: Vec<i64>,
++    weights: Vec<f64>,
++}
++
++enum Node {
++    Int(IntNode, u64),
++    Float {
++        min: f64,
++        max: f64,
++        allow_nan: bool,
++        snm: f64,
++        label: u64,
++    },
++    Bool {
++        p: f64,
++        label: u64,
++    },
++    Bytes {
++        min: u64,
++        max: u64,
++        label: u64,
++    },
++    Text {
++        generator: Py<StringGenerator>,
++        label: u64,
++    },
++    TextList {
++        elem: Box<Node>,
++        min: u64,
++        max: u64,
++        p_continue: f64,
++        label: u64,
++    },
++    EmptyList {
++        label: u64,
++    },
++    List {
++        elem: Box<Node>,
++        min: u64,
++        max: u64,
++        p_continue: f64,
++        label: u64,
++    },
++    Tuple {
++        children: Vec<Node>,
++        label: u64,
++    },
++    FixedDict {
++        keys: Vec<Py<PyAny>>,
++        children: Vec<Node>,
++        dict_type: Py<PyAny>,
++        label: u64,
++    },
++    OneOf {
++        children: Vec<Node>,
++        inner_label: u64,
++        label: u64,
++    },
++    Sampled {
++        elements: Py<PyAny>,
++        n: i64,
++        maps: Vec<Py<PyAny>>,
++        label: u64,
++    },
++    Just {
++        value: Py<PyAny>,
++        maps: Vec<Py<PyAny>>,
++        label: u64,
++    },
++    Map {
++        inner: Box<Node>,
++        pack: Py<PyAny>,
++        label: u64,
++    },
++    Builds {
++        target: Py<PyAny>,
++        args: Vec<Node>,
++        names: Vec<Py<PyAny>>,
++        kwargs: Vec<Node>,
++        label: u64,
++    },
++    Filter {
++        inner: Box<Node>,
++        conditions: Vec<Py<PyAny>>,
++        repr: String,
++        label: u64,
++    },
++    Opaque(Py<PyAny>),
++}
++
++fn item<'py>(t: &Bound<'py, PyTuple>, i: usize) -> PyResult<Bound<'py, PyAny>> {
++    t.get_item(i)
++}
++
++fn objects(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Py<PyAny>>> {
++    obj.try_iter()?.map(|c| Ok(c?.unbind())).collect()
++}
++
++fn children(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Node>> {
++    obj.try_iter()?.map(|c| Node::from_py(&c?)).collect()
++}
++
++impl Node {
++    fn from_py(obj: &Bound<'_, PyAny>) -> PyResult<Node> {
++        let t = obj.cast::<PyTuple>()?;
++        let tag: String = item(t, 0)?.extract()?;
++        Ok(match tag.as_str() {
++            "int" => Node::Int(
++                IntNode {
++                    lo: item(t, 1)?.extract()?,
++                    hi: item(t, 2)?.extract()?,
++                    shrink_towards: item(t, 3)?.extract()?,
++                    keys: item(t, 4)?.extract()?,
++                    weights: item(t, 5)?.extract()?,
++                },
++                item(t, 6)?.extract()?,
++            ),
++            "float" => Node::Float {
++                min: item(t, 1)?.extract()?,
++                max: item(t, 2)?.extract()?,
++                allow_nan: item(t, 3)?.extract()?,
++                snm: item(t, 4)?.extract()?,
++                label: item(t, 5)?.extract()?,
++            },
++            "bool" => Node::Bool {
++                p: item(t, 1)?.extract()?,
++                label: item(t, 2)?.extract()?,
++            },
++            "bytes" => Node::Bytes {
++                min: item(t, 1)?.extract()?,
++                max: item(t, 2)?.extract()?,
++                label: item(t, 3)?.extract()?,
++            },
++            "text" => Node::Text {
++                generator: item(t, 1)?.extract()?,
++                label: item(t, 2)?.extract()?,
++            },
++            "text_list" => Node::TextList {
++                elem: Box::new(Node::from_py(&item(t, 1)?)?),
++                min: item(t, 2)?.extract()?,
++                max: item(t, 3)?.extract()?,
++                p_continue: item(t, 4)?.extract()?,
++                label: item(t, 5)?.extract()?,
++            },
++            "empty_list" => Node::EmptyList {
++                label: item(t, 1)?.extract()?,
++            },
++            "list" => Node::List {
++                elem: Box::new(Node::from_py(&item(t, 1)?)?),
++                min: item(t, 2)?.extract()?,
++                max: item(t, 3)?.extract()?,
++                p_continue: item(t, 4)?.extract()?,
++                label: item(t, 5)?.extract()?,
++            },
++            "tuple" => Node::Tuple {
++                children: children(&item(t, 1)?)?,
++                label: item(t, 2)?.extract()?,
++            },
++            "fixeddict" => Node::FixedDict {
++                keys: objects(&item(t, 1)?)?,
++                children: children(&item(t, 2)?)?,
++                dict_type: item(t, 3)?.unbind(),
++                label: item(t, 4)?.extract()?,
++            },
++            "one_of" => Node::OneOf {
++                children: children(&item(t, 1)?)?,
++                inner_label: item(t, 2)?.extract()?,
++                label: item(t, 3)?.extract()?,
++            },
++            "sampled" => {
++                let elements = item(t, 1)?;
++                Node::Sampled {
++                    n: elements.len()? as i64,
++                    elements: elements.unbind(),
++                    maps: objects(&item(t, 2)?)?,
++                    label: item(t, 3)?.extract()?,
++                }
++            }
++            "just" => Node::Just {
++                value: item(t, 1)?.unbind(),
++                maps: objects(&item(t, 2)?)?,
++                label: item(t, 3)?.extract()?,
++            },
++            "map" => Node::Map {
++                inner: Box::new(Node::from_py(&item(t, 1)?)?),
++                pack: item(t, 2)?.unbind(),
++                label: item(t, 3)?.extract()?,
++            },
++            "builds" => Node::Builds {
++                target: item(t, 1)?.unbind(),
++                args: children(&item(t, 2)?)?,
++                names: objects(&item(t, 3)?)?,
++                kwargs: children(&item(t, 4)?)?,
++                label: item(t, 5)?.extract()?,
++            },
++            "filter" => Node::Filter {
++                inner: Box::new(Node::from_py(&item(t, 1)?)?),
++                conditions: objects(&item(t, 2)?)?,
++                repr: item(t, 3)?.extract()?,
++                label: item(t, 4)?.extract()?,
++            },
++            "opaque" => Node::Opaque(item(t, 1)?.unbind()),
++            other => {
++                return Err(InvalidArgument::new_err(format!(
++                    "unknown strategy node {other:?}"
++                )));
++            }
++        })
++    }
++}
++
++/// A strategy compiled by its frontend into a tree the engine walks in one
++/// call (`TestCase.generate`): primitive draws, collections built with the
++/// frontend's own continuation protocol, choices between alternatives,
++/// mapped, built and filtered values, and opaque leaves the frontend draws
++/// itself. `one_from_many`, `filtered` and `mapped` are the span labels the
++/// frontend uses for those draws; `retry_exception` is what a map raises to
++/// ask for another attempt.
++#[pyclass(frozen, name = "CompiledStrategy", module = "hegel._native")]
++pub(crate) struct CompiledStrategy {
++    root: Node,
++    one_from_many: u64,
++    filtered: u64,
++    mapped: u64,
++    retry_exception: Py<PyType>,
++}
++
++#[pymethods]
++impl CompiledStrategy {
++    #[new]
++    fn new(
++        desc: &Bound<'_, PyAny>,
++        one_from_many: u64,
++        filtered: u64,
++        mapped: u64,
++        retry_exception: Py<PyType>,
++    ) -> PyResult<Self> {
++        Ok(CompiledStrategy {
++            root: Node::from_py(desc)?,
++            one_from_many,
++            filtered,
++            mapped,
++            retry_exception,
++        })
++    }
++}
++
++pub(crate) struct Callbacks<'py> {
++    pub(crate) draw: Bound<'py, PyAny>,
++    pub(crate) record: Bound<'py, PyAny>,
++    pub(crate) invalid: Bound<'py, PyAny>,
++}
++
++struct Gen<'a, 'py> {
++    py: Python<'py>,
++    tc: *mut c::HegelTestCase,
++    compiled: &'a CompiledStrategy,
++    callbacks: Callbacks<'py>,
++    recorded: Vec<(&'static str, Py<PyAny>)>,
++}
++
++impl<'a, 'py> Gen<'a, 'py> {
++    fn flush(&mut self) -> PyResult<()> {
++        if self.recorded.is_empty() {
++            return Ok(());
++        }
++        let items: Vec<Bound<'py, PyAny>> = self
++            .recorded
++            .drain(..)
++            .map(|(kind, v)| {
++                PyTuple::new(
++                    self.py,
++                    [
++                        PyString::new(self.py, kind).into_any(),
++                        v.into_bound(self.py),
++                    ],
++                )
++                .map(|t| t.into_any())
++            })
++            .collect::<PyResult<_>>()?;
++        self.callbacks
++            .record
++            .call1((PyList::new(self.py, items)?,))?;
++        Ok(())
++    }
++
++    fn record(&mut self, kind: &'static str, v: &Bound<'py, PyAny>) {
++        self.recorded.push((kind, v.clone().unbind()));
++    }
++
++    fn start_span(&self, label: u64) -> PyResult<()> {
++        with_ctx(|ctx| check(unsafe { c::hegel_start_span(ctx, self.tc, label) }))
++    }
++
++    fn stop_span(&self, discard: bool) {
++        with_ctx(|ctx| {
++            let _ = unsafe { c::hegel_stop_span(ctx, self.tc, discard) };
++        });
++    }
++
++    fn spanned<T>(&mut self, label: u64, f: impl FnOnce(&mut Self) -> PyResult<T>) -> PyResult<T> {
++        self.start_span(label)?;
++        let out = f(self);
++        self.stop_span(false);
++        out
++    }
++
++    fn draw_bool(&mut self, p: f64, forced: Option<bool>) -> PyResult<bool> {
++        let mut out = false;
++        with_ctx(|ctx| {
++            check(unsafe {
++                c::hegel_generate_boolean(
++                    ctx,
++                    self.tc,
++                    p,
++                    forced.unwrap_or(false),
++                    forced.is_some(),
++                    &mut out,
++                )
++            })
++        })?;
++        let v = out.into_pyobject(self.py)?.to_owned().into_any();
++        self.record("boolean", &v);
++        Ok(out)
++    }
++
++    fn draw_index(&mut self, lo: i64, hi: i64) -> PyResult<i64> {
++        self.draw_int(&IntNode {
++            lo: BigInt::from(lo),
++            hi: BigInt::from(hi),
++            shrink_towards: BigInt::from(0),
++            keys: vec![],
++            weights: vec![],
++        })?
++        .extract()
++    }
++
++    fn draw_int(&mut self, n: &IntNode) -> PyResult<Bound<'py, PyAny>> {
++        let v = integer_weighted(
++            self.tc,
++            &n.lo,
++            &n.hi,
++            &n.shrink_towards,
++            &n.keys,
++            &n.weights,
++        )?
++        .into_pyobject(self.py)?
++        .into_any();
++        self.record("integer", &v);
++        Ok(v)
++    }
++
++    fn draw_float(
++        &mut self,
++        min: f64,
++        max: f64,
++        allow_nan: bool,
++        snm: f64,
++    ) -> PyResult<Bound<'py, PyAny>> {
++        let mut out = 0.0f64;
++        with_ctx(|ctx| {
++            check(unsafe {
++                c::hegel_generate_float(
++                    ctx,
++                    self.tc,
++                    64,
++                    min,
++                    max,
++                    allow_nan,
++                    min.is_infinite() || max.is_infinite(),
++                    false,
++                    false,
++                    snm,
++                    &mut out,
++                )
++            })
++        })?;
++        let v = out.into_pyobject(self.py)?.into_any();
++        self.record("float", &v);
++        Ok(v)
++    }
++
++    fn draw_bytes(&mut self, min: u64, max: u64) -> PyResult<Bound<'py, PyAny>> {
++        let mut result = c::hegel_generate_bytes_result_t {
++            data: ptr::null_mut(),
++            len: 0,
++        };
++        let bytes = with_ctx(|ctx| {
++            check(unsafe { c::hegel_generate_bytes(ctx, self.tc, min, max, &mut result) })?;
++            let bytes = unsafe { std::slice::from_raw_parts(result.data, result.len) }.to_vec();
++            let _ = unsafe { c::hegel_generate_bytes_result_free(ctx, &mut result) };
++            Ok::<_, PyErr>(bytes)
++        })?;
++        let v = PyBytes::new(self.py, &bytes).into_any();
++        self.record("bytes", &v);
++        Ok(v)
++    }
++
++    fn draw_text(&mut self, generator: &Py<StringGenerator>) -> PyResult<Bound<'py, PyAny>> {
++        let raw = generator.get().raw();
++        let bytes = generate_string(self.tc, raw)?;
++        let v = PyString::new(self.py, &String::from_utf8_lossy(&bytes)).into_any();
++        self.record("string", &v);
++        Ok(v)
++    }
++
++    fn many(
++        &mut self,
++        min: u64,
++        max: u64,
++        p_continue: f64,
++        mut body: impl FnMut(&mut Self) -> PyResult<Bound<'py, PyAny>>,
++    ) -> PyResult<Vec<Bound<'py, PyAny>>> {
++        let mut out = Vec::new();
++        let mut count: u64 = 0;
++        let label = self.compiled.one_from_many;
++        loop {
++            self.start_span(label)?;
++            let more = if min == max {
++                count < min
++            } else {
++                let forced = if count < min {
++                    Some(true)
++                } else if count >= max {
++                    Some(false)
++                } else {
++                    None
++                };
++                self.draw_bool(p_continue, forced)?
++            };
++            if !more {
++                self.stop_span(false);
++                return Ok(out);
++            }
++            count += 1;
++            let v = body(self);
++            self.stop_span(false);
++            out.push(v?);
++        }
++    }
++
++    fn apply_maps(
++        &mut self,
++        mut v: Bound<'py, PyAny>,
++        maps: &[Py<PyAny>],
++    ) -> PyResult<Bound<'py, PyAny>> {
++        for m in maps {
++            v = m.bind(self.py).call1((v,))?;
++        }
++        Ok(v)
++    }
++
++    fn generate(&mut self, node: &Node) -> PyResult<Bound<'py, PyAny>> {
++        match node {
++            Node::Int(n, label) => self.spanned(*label, |g| g.draw_int(n)),
++            Node::Float {
++                min,
++                max,
++                allow_nan,
++                snm,
++                label,
++            } => self.spanned(*label, |g| g.draw_float(*min, *max, *allow_nan, *snm)),
++            Node::Bool { p, label } => self.spanned(*label, |g| {
++                Ok(g.draw_bool(*p, None)?
++                    .into_pyobject(g.py)?
++                    .to_owned()
++                    .into_any())
++            }),
++            Node::Bytes { min, max, label } => self.spanned(*label, |g| g.draw_bytes(*min, *max)),
++            Node::Text { generator, label } => self.spanned(*label, |g| g.draw_text(generator)),
++            Node::TextList {
++                elem,
++                min,
++                max,
++                p_continue,
++                label,
++            } => self.spanned(*label, |g| {
++                let parts = g.many(*min, *max, *p_continue, |g| g.generate(elem))?;
++                let mut s = String::new();
++                for p in parts {
++                    s.push_str(&p.extract::<String>()?);
++                }
++                Ok(PyString::new(g.py, &s).into_any())
++            }),
++            Node::EmptyList { label } => {
++                self.spanned(*label, |g| Ok(PyList::empty(g.py).into_any()))
++            }
++            Node::List {
++                elem,
++                min,
++                max,
++                p_continue,
++                label,
++            } => self.spanned(*label, |g| {
++                let items = g.many(*min, *max, *p_continue, |g| g.generate(elem))?;
++                Ok(PyList::new(g.py, items)?.into_any())
++            }),
++            Node::Tuple { children, label } => self.spanned(*label, |g| {
++                let items: Vec<_> = children
++                    .iter()
++                    .map(|c| g.generate(c))
++                    .collect::<PyResult<_>>()?;
++                Ok(PyTuple::new(g.py, items)?.into_any())
++            }),
++            Node::FixedDict {
++                keys,
++                children,
++                dict_type,
++                label,
++            } => self.spanned(*label, |g| {
++                let mut pairs: Vec<Bound<'py, PyAny>> = keys
++                    .iter()
++                    .zip(children)
++                    .map(|(k, c)| {
++                        let v = g.generate(c)?;
++                        Ok(PyTuple::new(g.py, [k.bind(g.py).clone(), v])?.into_any())
++                    })
++                    .collect::<PyResult<_>>()?;
++                let n = pairs.len();
++                for i in 0..n.saturating_sub(1) {
++                    let j = g.draw_index(i as i64, (n - 1) as i64)?;
++                    pairs.swap(i, j as usize);
++                }
++                dict_type.bind(g.py).call1((PyList::new(g.py, pairs)?,))
++            }),
++            Node::OneOf {
++                children,
++                inner_label,
++                label,
++            } => self.spanned(*label, |g| {
++                if children.len() == 1 {
++                    return g.generate(&children[0]);
++                }
++                let n = children.len() as i64;
++                let i = g.spanned(*inner_label, |g| g.draw_index(0, n - 1))?;
++                g.generate(&children[i as usize])
++            }),
++            Node::Sampled {
++                elements,
++                n,
++                maps,
++                label,
++            } => self.spanned(*label, |g| {
++                let i = g.draw_index(0, n - 1)?;
++                let v = elements.bind(g.py).get_item(i)?;
++                g.apply_maps(v, maps)
++            }),
++            Node::Just { value, maps, label } => {
++                self.spanned(*label, |g| g.apply_maps(value.bind(g.py).clone(), maps))
++            }
++            Node::Map { inner, pack, label } => self.spanned(*label, |g| {
++                let mapped = g.compiled.mapped;
++                let retry = g.compiled.retry_exception.bind(g.py).clone();
++                let mut last_err = None;
++                for _ in 0..3 {
++                    g.start_span(mapped)?;
++                    let x = g.generate(inner)?;
++                    match pack.bind(g.py).call1((x,)) {
++                        Ok(v) => {
++                            g.stop_span(false);
++                            return Ok(v);
++                        }
++                        Err(e) if e.is_instance(g.py, &retry) => {
++                            g.stop_span(true);
++                            last_err = Some(e);
++                        }
++                        Err(e) => {
++                            g.stop_span(false);
++                            return Err(e);
++                        }
++                    }
++                }
++                Err(last_err.unwrap())
++            }),
++            Node::Builds {
++                target,
++                args,
++                names,
++                kwargs,
++                label,
++            } => self.spanned(*label, |g| {
++                let a: Vec<_> = args
++                    .iter()
++                    .map(|c| g.generate(c))
++                    .collect::<PyResult<_>>()?;
++                let kw = PyDict::new(g.py);
++                for (name, c) in names.iter().zip(kwargs) {
++                    let v = g.generate(c)?;
++                    kw.set_item(name.bind(g.py), v)?;
++                }
++                target.bind(g.py).call(PyTuple::new(g.py, a)?, Some(&kw))
++            }),
++            Node::Filter {
++                inner,
++                conditions,
++                repr,
++                label,
++            } => self.spanned(*label, |g| {
++                let filtered = g.compiled.filtered;
++                for _ in 0..3 {
++                    g.start_span(filtered)?;
++                    let v = g.generate(inner)?;
++                    let mut ok = true;
++                    for cond in conditions {
++                        if !cond.bind(g.py).call1((v.clone(),))?.is_truthy()? {
++                            ok = false;
++                            break;
++                        }
++                    }
++                    if ok {
++                        g.stop_span(false);
++                        return Ok(v);
++                    }
++                    g.stop_span(true);
++                }
++                g.flush()?;
++                g.callbacks.invalid.call1((repr.as_str(),))?;
++                Err(InvalidArgument::new_err(
++                    "the invalid callback returned instead of ending the test case",
++                ))
++            }),
++            Node::Opaque(strategy) => {
++                self.flush()?;
++                self.callbacks.draw.call1((strategy.bind(self.py),))
++            }
++        }
++    }
++}
++
++pub(crate) fn generate<'py>(
++    py: Python<'py>,
++    tc: &TestCase,
++    compiled: &CompiledStrategy,
++    callbacks: Callbacks<'py>,
++) -> PyResult<Bound<'py, PyAny>> {
++    let mut g = Gen {
++        py,
++        tc: tc.tc(),
++        compiled,
++        callbacks,
++        recorded: Vec::new(),
++    };
++    let out = g.generate(&compiled.root);
++    let flushed = g.flush();
++    let v = out?;
++    flushed?;
++    Ok(v)
++}
++
++pub(crate) fn integer_weighted(
++    tc: *mut c::HegelTestCase,
++    lo: &BigInt,
++    hi: &BigInt,
++    shrink_towards: &BigInt,
++    keys: &[i64],
++    weights: &[f64],
++) -> PyResult<BigInt> {
++    if let (Ok(lo), Ok(hi), Ok(st)) = (
++        i64::try_from(lo),
++        i64::try_from(hi),
++        i64::try_from(shrink_towards),
++    ) {
++        let mut out = 0i64;
++        with_ctx(|ctx| {
++            check(unsafe {
++                c::hegel_generate_integer_weighted(
++                    ctx,
++                    tc,
++                    lo,
++                    hi,
++                    st,
++                    keys.as_ptr(),
++                    weights.as_ptr(),
++                    keys.len(),
++                    &mut out,
++                )
++            })
++        })?;
++        return Ok(BigInt::from(out));
++    }
++    let lo_b = lo.to_signed_bytes_le();
++    let hi_b = hi.to_signed_bytes_le();
++    let mut out = vec![0u8; lo_b.len().max(hi_b.len()) + 1];
++    let mut out_len = 0usize;
++    with_ctx(|ctx| {
++        check(unsafe {
++            c::hegel_generate_integer_big(
++                ctx,
++                tc,
++                lo_b.as_ptr(),
++                lo_b.len(),
++                hi_b.as_ptr(),
++                hi_b.len(),
++                out.as_mut_ptr(),
++                out.len(),
++                &mut out_len,
++            )
++        })
++    })?;
++    Ok(BigInt::from_signed_bytes_le(&out[..out_len.min(out.len())]))
++}
++
++pub(crate) fn generate_string(
++    tc: *mut c::HegelTestCase,
++    generator: *const c::HegelStringGenerator,
++) -> PyResult<Vec<u8>> {
++    let mut result = c::hegel_owned_string_t::default();
++    with_ctx(|ctx| {
++        check(unsafe { c::hegel_generate_string(ctx, tc, generator, &mut result) })?;
++        let bytes =
++            unsafe { std::slice::from_raw_parts(result.data as *const u8, result.len) }.to_vec();
++        let _ = unsafe { c::hegel_owned_string_free(ctx, &mut result) };
++        Ok(bytes)
++    })
++}
++
++pub(crate) fn choices_blob(tc: *mut c::HegelTestCase) -> PyResult<String> {
++    let mut result = c::hegel_owned_string_t::default();
++    with_ctx(|ctx| {
++        check(unsafe { c::hegel_test_case_choices(ctx, tc, &mut result) })?;
++        let bytes =
++            unsafe { std::slice::from_raw_parts(result.data as *const u8, result.len) }.to_vec();
++        let _ = unsafe { c::hegel_owned_string_free(ctx, &mut result) };
++        Ok(String::from_utf8_lossy(&bytes).into_owned())
++    })
++}
+diff --git a/frontends/python/src/lib.rs b/frontends/python/src/lib.rs
+index 03b84f38..e7b7a3fc 100644
+--- a/frontends/python/src/lib.rs
++++ b/frontends/python/src/lib.rs
+@@ -15,11 +15,13 @@ use pyo3::types::PyModule;
+ use std::ffi::{c_char, c_void};
+ use std::sync::{Arc, Mutex};
+ 
++mod interpret;
+ mod printer;
+ mod settings;
+ mod strings;
+ mod test_case;
+ 
++pub(crate) use interpret::CompiledStrategy;
+ pub(crate) use printer::Printer;
+ pub(crate) use settings::Settings;
+ pub(crate) use strings::StringGenerator;
+@@ -285,6 +287,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+     m.add_class::<Pool>()?;
+     m.add_class::<StateMachine>()?;
+     m.add_class::<StringGenerator>()?;
++    m.add_class::<CompiledStrategy>()?;
+     m.add_class::<Printer>()?;
+     m.add_function(wrap_pyfunction!(version, m)?)?;
+     m.add_function(wrap_pyfunction!(label_from_name, m)?)?;
+diff --git a/frontends/python/src/strings.rs b/frontends/python/src/strings.rs
+index e00e182e..b45a3a22 100644
+--- a/frontends/python/src/strings.rs
++++ b/frontends/python/src/strings.rs
+@@ -65,6 +65,27 @@ impl StringGenerator {
+         Ok(StringGenerator { raw: SendPtr(raw) })
+     }
+ 
++    /// Strings of length `[min_size, max_size]` over an alphabet given as
++    /// sorted, disjoint, inclusive codepoint ranges.
++    #[staticmethod]
++    fn text_ranges(min_size: u64, max_size: u64, ranges: Vec<(u32, u32)>) -> PyResult<Self> {
++        let flat: Vec<u32> = ranges.iter().flat_map(|&(lo, hi)| [lo, hi]).collect();
++        let mut raw: *mut c::HegelStringGenerator = ptr::null_mut();
++        with_ctx(|ctx| {
++            check(unsafe {
++                c::hegel_string_generator_text_ranges(
++                    ctx,
++                    min_size,
++                    max_size,
++                    flat.as_ptr(),
++                    ranges.len(),
++                    &mut raw,
++                )
++            })
++        })?;
++        Ok(StringGenerator { raw: SendPtr(raw) })
++    }
++
+     #[staticmethod]
+     #[pyo3(signature = (pattern, fullmatch, alphabet))]
+     fn regex(pattern: &str, fullmatch: bool, alphabet: Option<&StringGenerator>) -> PyResult<Self> {
+diff --git a/frontends/python/src/test_case.rs b/frontends/python/src/test_case.rs
+index 663bb470..f4bc6cdb 100644
+--- a/frontends/python/src/test_case.rs
++++ b/frontends/python/src/test_case.rs
+@@ -1,8 +1,9 @@
++use crate::interpret::{Callbacks, CompiledStrategy, choices_blob, generate, integer_weighted};
+ use crate::printer::{Printer, with_options};
+ use crate::{
+-    InternalError, OutputBuffer, SendPtr, Settings, StringGenerator, big_from_le, big_to_le, check,
+-    hstr, hstr_bytes, hstrs, opt_string_from, output_trampoline, output_user_data, string_from,
+-    with_ctx,
++    InternalError, InvalidArgument, OutputBuffer, SendPtr, Settings, StringGenerator, big_from_le,
++    big_to_le, check, hstr, hstr_bytes, hstrs, opt_string_from, output_trampoline,
++    output_user_data, string_from, with_ctx,
+ };
+ use hegel_c as c;
+ use hegel_c::hegel_result_t as Rc;
+@@ -215,7 +216,7 @@ impl Drop for TestCase {
+ }
+ 
+ impl TestCase {
+-    fn tc(&self) -> *mut c::HegelTestCase {
++    pub(crate) fn tc(&self) -> *mut c::HegelTestCase {
+         self.raw.0
+     }
+ }
+@@ -342,8 +343,52 @@ impl TestCase {
+         Ok(out)
+     }
+ 
+-    /// Draw an integer in `[min_value, max_value]`, of any magnitude.
+-    fn generate_integer(&self, min_value: BigInt, max_value: BigInt) -> PyResult<BigInt> {
++    /// A test case replaying `blob` outside any run, for a frontend that
++    /// replays recorded cases itself: drive it with the usual draws, then
++    /// `mark_complete`.
++    #[staticmethod]
++    fn from_blob(settings: &Settings, blob: &str) -> PyResult<TestCase> {
++        let mut raw: *mut c::HegelTestCase = ptr::null_mut();
++        with_ctx(|ctx| {
++            check(unsafe {
++                c::hegel_test_case_from_blob(
++                    ctx,
++                    settings.raw(),
++                    hstr(blob),
++                    None,
++                    ptr::null_mut(),
++                    &mut raw,
++                )
++            })
++        })?;
++        Ok(TestCase { raw: SendPtr(raw) })
++    }
++
++    /// Draw an integer in `[min_value, max_value]`, of any magnitude. A
++    /// `forced` value (within int64) is recorded as a forced choice instead
++    /// of drawn.
++    #[pyo3(signature = (min_value, max_value, forced=None))]
++    fn generate_integer(
++        &self,
++        min_value: BigInt,
++        max_value: BigInt,
++        forced: Option<BigInt>,
++    ) -> PyResult<BigInt> {
++        if let Some(forced) = forced {
++            let (Ok(lo), Ok(hi), Ok(f)) = (
++                i64::try_from(&min_value),
++                i64::try_from(&max_value),
++                i64::try_from(&forced),
++            ) else {
++                return Err(InvalidArgument::new_err(
++                    "a forced integer draw must fit int64",
++                ));
++            };
++            with_ctx(|ctx| {
++                check(unsafe { c::hegel_generate_integer_forced(ctx, self.tc(), lo, hi, f) })
++            })?;
++            return Ok(forced);
++        }
+         if let (Ok(lo), Ok(hi)) = (i64::try_from(&min_value), i64::try_from(&max_value)) {
+             let mut out = 0i64;
+             with_ctx(|ctx| {
+@@ -378,6 +423,64 @@ impl TestCase {
+         Ok(big_from_le(&out[..out_len]))
+     }
+ 
++    /// Draw an integer in `[min_value, max_value]` taking `keys[i]` with
++    /// probability `weights[i]` and otherwise the ordinary distribution,
++    /// shrinking toward `shrink_towards`. One plain integer choice: the
++    /// weights steer generation only. Weights apply within int64 bounds.
++    #[pyo3(signature = (min_value, max_value, keys, weights, shrink_towards))]
++    fn generate_integer_weighted(
++        &self,
++        min_value: BigInt,
++        max_value: BigInt,
++        keys: Vec<i64>,
++        weights: Vec<f64>,
++        shrink_towards: BigInt,
++    ) -> PyResult<BigInt> {
++        if keys.len() != weights.len() {
++            return Err(InvalidArgument::new_err(
++                "keys and weights differ in length",
++            ));
++        }
++        integer_weighted(
++            self.tc(),
++            &min_value,
++            &max_value,
++            &shrink_towards,
++            &keys,
++            &weights,
++        )
++    }
++
++    /// The choices this case has recorded so far, as a reproduce blob.
++    fn choices_blob(&self) -> PyResult<String> {
++        choices_blob(self.tc())
++    }
++
++    /// Generate one value for `compiled` against this case in a single
++    /// call. `draw(strategy)` is the frontend's own draw for opaque leaves,
++    /// `record(pairs)` receives the `(kind, value)` choices made so far
++    /// before each such call and at the end, `invalid(reason)` must end the
++    /// case when a filter gives up.
++    fn generate<'py>(
++        &self,
++        py: Python<'py>,
++        compiled: &CompiledStrategy,
++        draw: Bound<'py, PyAny>,
++        record: Bound<'py, PyAny>,
++        invalid: Bound<'py, PyAny>,
++    ) -> PyResult<Bound<'py, PyAny>> {
++        generate(
++            py,
++            self,
++            compiled,
++            Callbacks {
++                draw,
++                record,
++                invalid,
++            },
++        )
++    }
++
+     fn generate_float(
+         &self,
+         width: u32,
+diff --git a/frontends/python/tests/test_native_bridge.py b/frontends/python/tests/test_native_bridge.py
+new file mode 100644
+index 00000000..1697d5ee
+--- /dev/null
++++ b/frontends/python/tests/test_native_bridge.py
+@@ -0,0 +1,171 @@
++"""The ``hegel._native`` entry points a frontend built on another API uses
++(the Hypothesis-on-libhegel experiment): weighted and forced integer draws,
++explicit-range text generators, a case's choices as a blob, replaying one,
++and the strategy interpreter."""
++
++from __future__ import annotations
++
++import pytest
++
++from hegel import _native
++
++
++def _settings(test_cases: int = 20, seed: int = 7) -> _native.Settings:
++    s = _native.Settings.new()
++    s.set_test_cases(test_cases)
++    s.set_database("")
++    s.set_phases(_native.PHASE_GENERATE)
++    s.set_seed(seed)
++    return s
++
++
++def _cases(test_cases: int = 20):
++    run = _native.Run.start(_settings(test_cases))
++    while (tc := run.next_test_case()) is not None:
++        yield tc
++        tc.mark_complete(_native.STATUS_VALID, None)
++
++
++def test_weighted_integers_take_their_keys_and_stay_in_range():
++    seen = {7: 0, 42: 0, "other": 0}
++    for tc in _cases(400):
++        v = tc.generate_integer_weighted(0, 1000, [7, 42], [0.3, 0.2], 0)
++        assert 0 <= v <= 1000
++        seen[v if v in (7, 42) else "other"] += 1
++    assert seen[7] > 40 and seen[42] > 20 and seen["other"] > 60
++
++
++def test_weighted_integers_validate_their_arguments():
++    for tc in _cases(1):
++        with pytest.raises(_native.InvalidArgument):
++            tc.generate_integer_weighted(0, 5, [7], [0.3], 0)
++        with pytest.raises(_native.InvalidArgument):
++            tc.generate_integer_weighted(0, 5, [1, 2], [0.3], 0)
++        with pytest.raises(_native.InvalidArgument):
++            tc.generate_integer_weighted(0, 5, [1], [1.5], 0)
++
++
++def test_forced_integers_take_a_choice_position_and_replay():
++    for tc in _cases(5):
++        a = tc.generate_integer(0, 1000)
++        assert tc.generate_integer(0, 2, forced=1) == 1
++        with pytest.raises(_native.InvalidArgument):
++            tc.generate_integer(0, 2, forced=3)
++        with pytest.raises(_native.InvalidArgument):
++            tc.generate_integer(0, 2**70, forced=1)
++        b = tc.generate_integer(0, 1000)
++        replay = _native.TestCase.from_blob(_settings(), tc.choices_blob())
++        assert replay.generate_integer(0, 1000) == a
++        assert replay.generate_integer(0, 2, forced=2) == 2
++        assert replay.generate_integer(0, 1000) == b
++        replay.mark_complete(_native.STATUS_VALID, None)
++
++
++def test_text_ranges_draw_only_from_the_ranges():
++    gen = _native.StringGenerator.text_ranges(1, 4, [(97, 99), (0x1F600, 0x1F601)])
++    seen = set()
++    for tc in _cases(200):
++        text = tc.generate_string(gen).decode("utf-8", "surrogatepass")
++        assert 1 <= len(text) <= 4
++        for c in text:
++            assert c in "abc\U0001f600\U0001f601"
++            seen.add(c)
++    assert len(seen) >= 3
++    for bad in ([(99, 97)], [(97, 99), (98, 100)], [(0, 0x110000)]):
++        with pytest.raises(_native.InvalidArgument):
++            _native.StringGenerator.text_ranges(0, 5, bad)
++    with pytest.raises(_native.InvalidArgument):
++        _native.StringGenerator.text_ranges(1, 5, [(0xD800, 0xDFFF)])
++
++
++class _Retry(Exception):
++    pass
++
++
++def _compiled(desc: tuple) -> _native.CompiledStrategy:
++    return _native.CompiledStrategy(desc, 11, 12, 13, _Retry)
++
++
++def _generate(tc: _native.TestCase, desc: tuple, draw=None):
++    recorded: list = []
++    value = tc.generate(
++        _compiled(desc),
++        draw or (lambda s: s),
++        recorded.extend,
++        lambda reason: (_ for _ in ()).throw(_native.AssumeFailed(reason)),
++    )
++    return value, recorded
++
++
++def test_the_interpreter_builds_values_and_records_their_choices():
++    gen = _native.StringGenerator.text_ranges(0, 3, [(97, 98)])
++    desc = (
++        "tuple",
++        [
++            ("int", -(2**70), 2**70, 0, [], [], 1),
++            ("float", 0.0, 1.0, False, 5e-324, 2),
++            ("bool", 0.5, 3),
++            ("bytes", 0, 2, 4),
++            ("text", gen, 5),
++            ("list", ("int", 0, 3, 0, [], [], 6), 1, 3, 0.5, 7),
++            ("one_of", [("just", "x", [], 8), ("sampled", [10, 20], [str], 9)], 14, 10),
++            ("fixeddict", ["a", "b"], [("bool", 0.5, 15), ("bool", 0.5, 16)], dict, 17),
++            ("map", ("int", 0, 9, 0, [], [], 18), lambda x: x * 2, 19),
++            (
++                "builds",
++                lambda *a, **k: (a, k),
++                [("int", 0, 1, 0, [], [], 20)],
++                ["k"],
++                [("just", 5, [], 21)],
++                22,
++            ),
++            ("filter", ("int", 0, 100, 0, [], [], 23), [lambda x: True], "integers()", 24),
++            ("opaque", "handled by the frontend"),
++        ],
++        0,
++    )
++    for tc in _cases(30):
++        value, recorded = _generate(tc, desc, draw=lambda s: s.upper())
++        n, f, b, bs, text, xs, alt, d, m, built, flt, opaque = value
++        assert -(2**70) <= n <= 2**70 and 0.0 <= f <= 1.0 and isinstance(b, bool)
++        assert isinstance(bs, bytes) and len(bs) <= 2
++        assert set(text) <= {"a", "b"} and len(text) <= 3
++        assert 1 <= len(xs) <= 3 and all(0 <= x <= 3 for x in xs)
++        assert alt in ("x", "10", "20")
++        assert set(d) == {"a", "b"} and m % 2 == 0
++        assert built == ((0,), {"k": 5}) or built == ((1,), {"k": 5})
++        assert 0 <= flt <= 100 and opaque == "HANDLED BY THE FRONTEND"
++        kinds = [k for k, _ in recorded]
++        assert kinds[:5] == ["integer", "float", "boolean", "bytes", "string"]
++        assert all(k in ("integer", "float", "boolean", "bytes", "string") for k in kinds)
++        replay = _native.TestCase.from_blob(_settings(), tc.choices_blob())
++        again, _ = _generate(replay, desc, draw=lambda s: s.upper())
++        assert again == value
++        replay.mark_complete(_native.STATUS_VALID, None)
++
++
++def test_a_filter_that_never_passes_hands_the_case_to_the_invalid_callback():
++    desc = ("filter", ("int", 0, 100, 0, [], [], 1), [lambda x: False], "never", 2)
++    for tc in _cases(3):
++        with pytest.raises(_native.AssumeFailed):
++            _generate(tc, desc)
++
++
++def test_a_map_retries_on_its_retry_exception_then_gives_up():
++    calls = []
++
++    def pack(x):
++        calls.append(x)
++        raise _Retry
++
++    desc = ("map", ("int", 0, 9, 0, [], [], 1), pack, 2)
++    for tc in _cases(2):
++        calls.clear()
++        with pytest.raises(_Retry):
++            _generate(tc, desc)
++        assert len(calls) == 3
++
++
++def test_unknown_nodes_are_rejected_when_compiled():
++    with pytest.raises(_native.InvalidArgument):
++        _compiled(("nope", 1))
+-- 
+2.43.0
+

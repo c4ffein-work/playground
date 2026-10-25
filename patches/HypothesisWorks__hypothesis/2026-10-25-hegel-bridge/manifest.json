@@ -1,0 +1,9 @@
+{
+  "repo": "HypothesisWorks/hypothesis",
+  "remote": "https://github.com/HypothesisWorks/hypothesis",
+  "base_branch": "master",
+  "base_sha": "5057a16cd98bf2882848a031d3d50f1d25ba8b73",
+  "created": "2026-10-25",
+  "patches": 1,
+  "title": "Add experimental libhegel backend and engine through hegeltest's binding"
+}

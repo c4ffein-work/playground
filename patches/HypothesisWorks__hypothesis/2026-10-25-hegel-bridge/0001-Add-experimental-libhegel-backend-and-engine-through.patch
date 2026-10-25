@@ -1,0 +1,2073 @@
+From 0ee0b10a688dd6f76bf7f27c3b265ba9dace47cb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 18:04:39 +0000
+Subject: [PATCH] Add experimental libhegel backend and engine through
+ hegeltest's binding
+
+Two experiments towards sharing one engine with libhegel, the native
+engine behind the Hegel libraries, reached through hegel._native, the
+pyo3 extension of Hegel's own Python frontend (the hegeltest package, an
+optional dependency: hypothesis[hegel]). No Rust is added to Hypothesis.
+
+backend="hegel" is a PrimitiveProvider whose draw_* go to libhegel one to
+one (weighted and shrink_towards integers, NaN with finite bounds,
+alphabets as explicit codepoint ranges, forced draws recorded in the
+engine's sequence), with replay-equivalence tests: a Hypothesis choice
+sequence encoded as a libhegel blob replays through libhegel value for
+value.
+
+HYPOTHESIS_ENGINE=hegel makes core.py build a HegelRunner instead of
+ConjectureRunner for tests on the default backend: libhegel owns the run
+loop, generation, shrinking, targeting and the choice budget, Python
+keeps ConjectureData, test execution and reporting; libhegel's run
+errors map onto Unsatisfiable, the health checks and FlakyFailure by
+kind. hegel_ir.py compiles the declarative built-in strategies
+(integers, floats, booleans, binary, text, lists, tuples, fixed
+dictionaries, one_of, sampled_from, just, map, builds, filter) into the
+tree hegel._native's interpreter walks in one call, mirroring each
+do_draw, with opaque leaves handed back to ConjectureData.draw for
+everything else; ConjectureData consults the provider's draw_strategy
+first, records the choices the interpreter made, and tells a provider
+about the draws Hypothesis forces. The equivalence check: for each kind
+of strategy, a natively generated value is exactly what the Python
+engine draws when it replays libhegel's recorded choices through its own
+do_draw code. HYPOTHESIS_HEGEL_BATCH=0 keeps every draw interactive.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ hypothesis/RELEASE.rst                        |  13 +
+ hypothesis/pyproject.toml                     |   1 +
+ hypothesis/src/hypothesis/core.py             |   9 +-
+ .../hypothesis/internal/conjecture/data.py    |  65 +++
+ .../internal/conjecture/hegel_ir.py           | 249 +++++++++
+ .../internal/conjecture/hegel_provider.py     | 517 ++++++++++++++++++
+ .../internal/conjecture/hegel_runner.py       | 492 +++++++++++++++++
+ .../internal/conjecture/providers.py          |   2 +
+ hypothesis/tests/conjecture/test_hegel_ir.py  | 161 ++++++
+ .../tests/conjecture/test_hegel_provider.py   | 207 +++++++
+ .../tests/conjecture/test_hegel_runner.py     | 149 +++++
+ .../tests/quality/test_discovery_ability.py   |   7 +-
+ 12 files changed, 1870 insertions(+), 2 deletions(-)
+ create mode 100644 hypothesis/RELEASE.rst
+ create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
+ create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
+ create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
+ create mode 100644 hypothesis/tests/conjecture/test_hegel_ir.py
+ create mode 100644 hypothesis/tests/conjecture/test_hegel_provider.py
+ create mode 100644 hypothesis/tests/conjecture/test_hegel_runner.py
+
+diff --git a/hypothesis/RELEASE.rst b/hypothesis/RELEASE.rst
+new file mode 100644
+index 00000000..e7ed794f
+--- /dev/null
++++ b/hypothesis/RELEASE.rst
+@@ -0,0 +1,13 @@
++RELEASE_TYPE: minor
++
++This release adds two experiments towards sharing one engine with
++`libhegel <https://hegel.dev/reference/libhegel>`__, the native engine behind
++the Hegel family of property-based testing libraries, reached through the
++``hegeltest`` package (Hegel's own Python frontend, ``pip install
++hypothesis[hegel]``). ``backend="hegel"`` generates inputs with it while
++everything else stays in Python, and setting ``HYPOTHESIS_ENGINE=hegel`` in
++the environment hands it the whole run loop, including shrinking and
++targeting, for tests on the default backend, generating whole values of the
++built-in strategies natively where it can. Neither is a supported feature:
++both may change or disappear in any release, and the engine flag ignores the
++example database for now.
+diff --git a/hypothesis/pyproject.toml b/hypothesis/pyproject.toml
+index 5d68d48e..d6a165f4 100644
+--- a/hypothesis/pyproject.toml
++++ b/hypothesis/pyproject.toml
+@@ -116,6 +116,7 @@ pytest = ["pytest>=4.6"]
+ dpcontracts = ["dpcontracts>=0.4"]
+ redis = ["redis>=3.0.0"]
+ crosshair = ["hypothesis-crosshair>=0.0.31", "crosshair-tool>=0.0.111"]
++hegel = ["hegeltest>=0.2.1"]
+ # zoneinfo is an odd one: every dependency is platform-conditional.
+ zoneinfo = ["tzdata>=2026.5; sys_platform == 'win32' or sys_platform == 'emscripten'"]
+ # We only support Django versions with upstream support - see
+diff --git a/hypothesis/src/hypothesis/core.py b/hypothesis/src/hypothesis/core.py
+index ecc9c6ef..96b9035a 100644
+--- a/hypothesis/src/hypothesis/core.py
++++ b/hypothesis/src/hypothesis/core.py
+@@ -85,6 +85,7 @@ from hypothesis.internal.conjecture.engine import (
+     ConjectureRunner,
+     ExitReason,
+ )
++from hypothesis.internal.conjecture.hegel_runner import hegel_engine_enabled
+ from hypothesis.internal.conjecture.junkdrawer import (
+     ensure_free_stackframes,
+     gc_cumulative_time,
+@@ -1417,7 +1418,13 @@ class StateForActualGivenExecution:
+             else:
+                 database_key = None
+ 
+-        runner = ConjectureRunner(
++        runner_cls: Any = ConjectureRunner
++        if hegel_engine_enabled() and self.settings.backend == "hypothesis":
++            # EXPERIMENT: libhegel owns the run loop; see hegel_runner.py
++            from hypothesis.internal.conjecture.hegel_runner import HegelRunner
++
++            runner_cls = HegelRunner
++        runner = runner_cls(
+             self._execute_once_for_engine,
+             settings=self.settings,
+             random=self.random,
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/data.py b/hypothesis/src/hypothesis/internal/conjecture/data.py
+index 29ace6ef..75e5e82c 100644
+--- a/hypothesis/src/hypothesis/internal/conjecture/data.py
++++ b/hypothesis/src/hypothesis/internal/conjecture/data.py
+@@ -10,6 +10,7 @@
+ 
+ import datetime
+ import math
++import sys
+ import time
+ import types
+ import weakref
+@@ -118,6 +119,29 @@ UNIQUE_COLLECTION_LABEL = calc_label_from_name(
+ )
+ MAX_DEPTH = 100
+ 
++_NOT_BATCHED = object()
++_PERMISSIVE_CONSTRAINTS: dict[str, Any] = {
++    "integer": {
++        "min_value": None,
++        "max_value": None,
++        "weights": None,
++        "shrink_towards": 0,
++    },
++    "float": {
++        "min_value": -math.inf,
++        "max_value": math.inf,
++        "allow_nan": True,
++        "smallest_nonzero_magnitude": SMALLEST_SUBNORMAL,
++    },
++    "string": {
++        "intervals": IntervalSet(((0, sys.maxunicode),)),
++        "min_size": 0,
++        "max_size": COLLECTION_DEFAULT_MAX_SIZE,
++    },
++    "bytes": {"min_size": 0, "max_size": COLLECTION_DEFAULT_MAX_SIZE},
++    "boolean": {"p": 0.5},
++}
++
+ threadlocal = ThreadLocal(global_test_counter=int)
+ 
+ 
+@@ -903,6 +927,10 @@ class ConjectureData:
+         elif forced is None:
+             value = getattr(self.provider, f"draw_{choice_type}")(**constraints)
+         else:
++            if observe and (draw_forced := getattr(self.provider, "draw_forced", None)):
++                # EXPERIMENT (libhegel): a provider that keeps its own choice
++                # sequence has to see the draws Hypothesis forces too
++                draw_forced(choice_type, constraints, forced)
+             value = forced
+ 
+         # nan values generated via int_to_float break list membership:
+@@ -1242,6 +1270,30 @@ class ConjectureData:
+         self.index += 1
+         return choice
+ 
++    def _hegel_record_many(self, drawn: list[tuple[ChoiceTypeT, ChoiceT]]) -> None:
++        """EXPERIMENT: append the choices a native generator made, in order,
++        as nodes with maximally permissive constraints (their values are
++        libhegel's, which owns replay and shrinking on that path)."""
++        nodes = []
++        for choice_type, value in drawn:
++            if choice_type == "float" and math.isnan(value):
++                value = int_to_float(float_to_int(value))
++            nodes.append(
++                ChoiceNode(
++                    type=choice_type,
++                    value=value,
++                    constraints=_PERMISSIVE_CONSTRAINTS[choice_type],
++                    was_forced=False,
++                    index=len(self.nodes) + len(nodes),
++                )
++            )
++        self.nodes += tuple(nodes)
++        self.length += choices_size([n.value for n in nodes])
++        if self.length > self.max_length or (
++            self.max_choices is not None and len(self.nodes) > self.max_choices
++        ):
++            self.mark_overrun()
++
+     def as_result(self) -> ConjectureResult | _Overrun:
+         """Convert the result of running this test into
+         either an Overrun object or a ConjectureResult."""
+@@ -1314,6 +1366,19 @@ class ConjectureData:
+             label = unwrapped.label
+             assert isinstance(label, int)
+ 
++        # EXPERIMENT: a provider that generates whole strategies natively
++        # (hegel_runner.HegelCaseProvider) takes the draw here; it records
++        # the choices it made through _hegel_record_many.
++        draw_strategy = getattr(self.provider, "draw_strategy", None)
++        if draw_strategy is not None and self.prefix is None:
++            batched = draw_strategy(unwrapped, self)
++            if batched is not _NOT_BATCHED:
++                if at_top_level:
++                    assert start_time is not None
++                    key = observe_as or f"generate:unlabeled_{len(self.draw_times)}"
++                    self.draw_times[key] = time.perf_counter() - start_time
++                return batched
++
+         # If the next prefix element is a ValueHole, we are the strategy being
+         # asked to re-encode its value: replace the hole with our inversion of
+         # it, and let do_draw consume those choices (under our own constraints)
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
+new file mode 100644
+index 00000000..f34a27af
+--- /dev/null
++++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
+@@ -0,0 +1,249 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: compile the declarative part of a strategy object graph into the
++tree libhegel's Python binding interprets in one call (``TestCase.generate``
++in hegeltest's ``hegel._native``).
++
++Most strategies are data, not code: a strategy's draw is a function of its
++attributes and of the values drawn so far, and for the built-in ones that
++function is known here. Those become IR nodes mirroring each ``do_draw``.
++Anything else (composite, flatmap, data, recursion, stateful, filters on
++sampled_from, optional fixed-dictionary keys, strategies drawing from Python
++state) becomes an ``opaque`` leaf: the interpreter hands it back to
++``ConjectureData.draw`` to run interactively against the same libhegel case.
++A compiled root that is itself opaque is reported as not batchable.
++"""
++
++import math
++from typing import Any
++
++from hypothesis.errors import UnsatisfiedAssumption
++from hypothesis.internal.conjecture.hegel_provider import (
++    INT64_MAX,
++    INT64_MIN,
++    SURROGATES,
++    UNBOUNDED_MAGNITUDE,
++    native,
++)
++from hypothesis.internal.conjecture.providers import COLLECTION_DEFAULT_MAX_SIZE
++from hypothesis.internal.conjecture.utils import ONE_FROM_MANY_LABEL, _calc_p_continue
++from hypothesis.strategies._internal.collections import (
++    FixedDictStrategy,
++    ListStrategy,
++    TupleStrategy,
++)
++from hypothesis.strategies._internal.core import BuildsStrategy
++from hypothesis.strategies._internal.lazy import unwrap_strategies
++from hypothesis.strategies._internal.misc import BooleansStrategy, JustStrategy
++from hypothesis.strategies._internal.numbers import FloatStrategy, IntegersStrategy
++from hypothesis.strategies._internal.shared import SharedStrategy
++from hypothesis.strategies._internal.strategies import (
++    FILTERED_SEARCH_STRATEGY_DO_DRAW_LABEL,
++    MAPPED_SEARCH_STRATEGY_DO_DRAW_LABEL,
++    FilteredStrategy,
++    MappedStrategy,
++    OneOfStrategy,
++    SampledFromStrategy,
++    SearchStrategy,
++)
++from hypothesis.strategies._internal.strings import (
++    BytesStrategy,
++    OneCharStringStrategy,
++    TextStrategy,
++)
++
++NOT_BATCHABLE = object()
++_CACHE_ATTR = "_hegel_compiled"
++_TEXT_GENERATORS: dict[tuple, Any] = {}
++MAX_COMPILE_DEPTH = 32
++
++
++def _size(n: Any) -> int:
++    if n is None or n == math.inf:
++        return COLLECTION_DEFAULT_MAX_SIZE
++    return int(n)
++
++
++def _int_node(start: int | None, end: int | None, label: int) -> tuple:
++    """Mirror IntegersStrategy.do_draw plus the provider's bound clamping."""
++    weights: dict[int, float] | None = None
++    if start is not None and end is not None and end - start > 127:
++        weights = {start: 2 / 128, start + 1: 1 / 128, end - 1: 1 / 128, end: 2 / 128}
++    if start is None and end is None:
++        lo, hi = -UNBOUNDED_MAGNITUDE, UNBOUNDED_MAGNITUDE
++    elif start is None:
++        assert end is not None
++        lo, hi = -max(UNBOUNDED_MAGNITUDE, 2 * abs(end)), end
++    elif end is None:
++        lo, hi = start, max(UNBOUNDED_MAGNITUDE, 2 * abs(start))
++    else:
++        lo, hi = start, end
++    fits = INT64_MIN <= lo and hi <= INT64_MAX
++    keys = list(weights) if (weights and fits) else []
++    ws = list(weights.values()) if (weights and fits) else []
++    return ("int", lo, hi, 0, keys, ws, label)
++
++
++def _compile(s: SearchStrategy, stack: set[int], depth: int) -> tuple:
++    s = unwrap_strategies(s)
++    label = s.label
++    if id(s) in stack or depth > MAX_COMPILE_DEPTH:
++        return ("opaque", s)
++    stack = stack | {id(s)}
++
++    def child(c: SearchStrategy) -> tuple:
++        return _compile(c, stack, depth + 1)
++
++    if isinstance(s, IntegersStrategy):
++        return _int_node(s.start, s.end, label)
++    if isinstance(s, FloatStrategy):
++        return (
++            "float",
++            float(s.min_value),
++            float(s.max_value),
++            s.allow_nan,
++            s.smallest_nonzero_magnitude,
++            label,
++        )
++    if isinstance(s, BooleansStrategy):
++        return ("bool", 0.5, label)
++    if isinstance(s, BytesStrategy):
++        return ("bytes", s.min_size, _size(s.max_size), label)
++    if isinstance(s, OneCharStringStrategy):
++        return _text_node(s.intervals, 1, 1, label)
++    if isinstance(s, TextStrategy):
++        elems = unwrap_strategies(s.element_strategy)
++        if isinstance(elems, OneCharStringStrategy):
++            return _text_node(elems.intervals, s.min_size, _size(s.max_size), label)
++        if elems.is_empty:
++            return ("just", "", [], label)
++        return (
++            "text_list",
++            child(s.element_strategy),
++            s.min_size,
++            _size(s.max_size),
++            _calc_p_continue(s.average_size - s.min_size, s.max_size - s.min_size),
++            label,
++        )
++    if type(s) is ListStrategy:
++        if s.element_strategy.is_empty:
++            return ("empty_list", label)
++        return (
++            "list",
++            child(s.element_strategy),
++            s.min_size,
++            _size(s.max_size),
++            _calc_p_continue(s.average_size - s.min_size, s.max_size - s.min_size),
++            label,
++        )
++    if type(s) is TupleStrategy:
++        return ("tuple", [child(c) for c in s.element_strategies], label)
++    if type(s) is FixedDictStrategy and s.optional is None:
++        keys = list(s.mapping)
++        return (
++            "fixeddict",
++            keys,
++            [child(s.mapping[k]) for k in keys],
++            type(s.mapping),
++            label,
++        )
++    if type(s) is OneOfStrategy:
++        branches = s.element_strategies
++        if not branches:
++            return ("opaque", s)
++        inner = FilteredStrategy(SampledFromStrategy(branches), conditions=()).label
++        return ("one_of", [child(c) for c in branches], inner, label)
++    if type(s) is JustStrategy:
++        if any(kind == "filter" for kind, _, _ in s._transformations):
++            return ("opaque", s)
++        return ("just", s.value, [f for _, f, _ in s._transformations], label)
++    if type(s) is SampledFromStrategy:
++        if any(kind == "filter" for kind, _, _ in s._transformations):
++            return ("opaque", s)
++        return (
++            "sampled",
++            list(s.elements),
++            [f for _, f, _ in s._transformations],
++            label,
++        )
++    if type(s) is MappedStrategy:
++        return ("map", child(s.mapped_strategy), s.pack, label)
++    if type(s) is BuildsStrategy:
++        return (
++            "builds",
++            s.target,
++            [child(c) for c in s.args],
++            list(s.kwargs),
++            [child(s.kwargs[k]) for k in s.kwargs],
++            label,
++        )
++    if type(s) is SharedStrategy:
++        # SharedStrategy.do_draw also warns about incompatible bases under one
++        # key; left to Python (its base is batched underneath)
++        return ("opaque", s)
++    if type(s) is FilteredStrategy:
++        return (
++            "filter",
++            child(s.filtered_strategy),
++            list(s.flat_conditions),
++            repr(s),
++            label,
++        )
++    return ("opaque", s)
++
++
++def _text_node(intervals: Any, min_size: int, max_size: int, label: int) -> tuple:
++    ranges = list(intervals.intervals)
++    if not ranges:
++        return ("just", "", [], label)
++    if all(SURROGATES[0] <= lo and hi <= SURROGATES[1] for lo, hi in ranges):
++        # libhegel cannot hold lone surrogates in a string
++        return ("opaque", _ONE_CHAR_FALLBACK(intervals, min_size, max_size))
++    key = (tuple(ranges), min_size, max_size)
++    if key not in _TEXT_GENERATORS:
++        _TEXT_GENERATORS[key] = native().StringGenerator.text_ranges(
++            min_size, max_size, ranges
++        )
++    return ("text", _TEXT_GENERATORS[key], label)
++
++
++def _ONE_CHAR_FALLBACK(intervals: Any, min_size: int, max_size: int) -> SearchStrategy:
++    from hypothesis.strategies._internal.strings import TextStrategy
++
++    return TextStrategy(OneCharStringStrategy(intervals), min_size, max_size)
++
++
++def compile_strategy(strategy: SearchStrategy) -> Any:
++    """The compiled form of ``strategy`` (cached on it), or NOT_BATCHABLE
++    when its root is opaque."""
++    try:
++        cached = strategy.__dict__.get(_CACHE_ATTR)
++    except AttributeError:
++        return NOT_BATCHABLE
++    if cached is not None:
++        return cached
++    desc = _compile(strategy, set(), 0)
++    if desc[0] == "opaque":
++        compiled: Any = NOT_BATCHABLE
++    else:
++        compiled = native().CompiledStrategy(
++            desc,
++            ONE_FROM_MANY_LABEL,
++            FILTERED_SEARCH_STRATEGY_DO_DRAW_LABEL,
++            MAPPED_SEARCH_STRATEGY_DO_DRAW_LABEL,
++            UnsatisfiedAssumption,
++        )
++    try:
++        strategy.__dict__[_CACHE_ATTR] = compiled
++    except AttributeError:
++        pass
++    return compiled
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
+new file mode 100644
+index 00000000..2d62c51a
+--- /dev/null
++++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
+@@ -0,0 +1,517 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: libhegel, the native Rust engine behind the Hegel property-based
++testing libraries, as a Hypothesis backend.
++
++``settings(backend="hegel")`` routes every ``draw_*`` of the generate phase to
++libhegel, through the ``hegel._native`` extension of the ``hegeltest``
++package (Hegel's own Python frontend), and keeps everything else in Python: Hypothesis still owns the run loop, the database, health checks and
++shrinking (it shrinks by replaying the recorded choices through its own
++provider, as for any alternative backend). libhegel therefore runs with only
++its generate phase enabled, with a large ``test_cases`` budget, no database and
++all health checks suppressed.
++
++Draws map one-to-one onto libhegel primitives except where the two engines'
++vocabularies differ; those cases are documented on the methods below.
++"""
++
++import base64
++import contextlib
++import math
++import random
++import struct
++import zlib
++from collections.abc import Callable, Iterator
++from functools import cached_property
++from typing import Any, TypeVar
++
++from hypothesis.errors import (
++    BackendCannotProceed,
++    InvalidArgument,
++    StopTest,
++    UnsatisfiedAssumption,
++)
++from hypothesis.internal.conjecture.choice import ChoiceT
++from hypothesis.internal.conjecture.providers import (
++    COLLECTION_DEFAULT_MAX_SIZE,
++    HypothesisProvider,
++    PrimitiveProvider,
++    _get_local_constants,
++)
++from hypothesis.internal.conjecture.utils import LABEL_MASK
++from hypothesis.internal.intervalsets import IntervalSet
++
++try:
++    from hegel import _native
++except ImportError:  # pragma: no cover
++    _native = None
++
++T = TypeVar("T")
++
++INT64_MIN = -(2**63)
++INT64_MAX = 2**63 - 1
++# HypothesisProvider bounds unbounded integer draws at [-2**128, 2**128].
++UNBOUNDED_MAGNITUDE = 2**128
++# libhegel's generate-phase budget per run. Hypothesis decides when a test
++# function is done; when libhegel's budget runs out we simply start a new run.
++RUN_TEST_CASES = 10**9
++SURROGATES = (0xD800, 0xDFFF)
++
++
++class HegelOverrun(BackendCannotProceed):
++    """libhegel ran out of choice budget for the current test case."""
++
++    def __init__(self) -> None:
++        super().__init__("discard_test_case")
++
++
++def _signed_bytes(n: int) -> bytes:
++    return n.to_bytes(n.bit_length() // 8 + 1, "little", signed=True)
++
++
++def _is_surrogate_range(lo: int, hi: int) -> bool:
++    return SURROGATES[0] <= lo and hi <= SURROGATES[1]
++
++
++def native() -> Any:
++    """The ``hegel._native`` module, or an error naming the dependency."""
++    if _native is None:  # pragma: no cover
++        raise InvalidArgument(
++            "The libhegel engine needs the hegeltest package (pip install hegeltest)"
++        )
++    return _native
++
++
++def all_health_checks() -> int:
++    n = native()
++    return (
++        n.HC_FILTER_TOO_MUCH
++        | n.HC_TOO_SLOW
++        | n.HC_TEST_CASES_TOO_LARGE
++        | n.HC_LARGE_INITIAL_TEST_CASE
++    )
++
++
++def engine_settings(
++    test_cases: int,
++    *,
++    seed: int | None = None,
++    phases: int | None = None,
++    suppress_health_check: int | None = None,
++    report_multiple_failures: bool = False,
++    nondeterminism_strictness: int | None = None,
++) -> Any:
++    """libhegel settings for a run Hypothesis drives: no database, quiet."""
++    n = native()
++    s = n.Settings.new()
++    s.set_test_cases(test_cases)
++    s.set_phases(n.PHASE_GENERATE if phases is None else phases)
++    s.set_suppress_health_check(
++        all_health_checks() if suppress_health_check is None else suppress_health_check
++    )
++    s.set_seed(seed)
++    s.set_report_multiple_failures(report_multiple_failures)
++    s.set_nondeterminism_strictness(
++        n.NONDETERMINISM_QUIET
++        if nondeterminism_strictness is None
++        else nondeterminism_strictness
++    )
++    s.set_database("")
++    s.set_verbosity(n.VERBOSITY_QUIET)
++    s.set_print_blob(False)
++    return s
++
++
++class HegelProvider(PrimitiveProvider):
++    lifetime = "test_function"
++
++    def __init__(self, conjecturedata: Any, /) -> None:
++        super().__init__(conjecturedata)
++        self._settings = engine_settings(RUN_TEST_CASES)
++        self._run: Any = None
++        self._tc: Any = None
++        self._tc_done = False
++        self._span_depth = 0
++        self._drew = False
++        self._in_context = False
++        self._generators: dict[tuple[IntervalSet, int, int], Any] = {}
++        self.runs_started = 0
++        # Constant injection (HypothesisProvider._maybe_draw_constant) is a
++        # frontend feature, not an engine one: the pool is mined from the
++        # user's Python source. It uses the global PRNG, which Hypothesis
++        # seeds deterministically around every test case. Set to None to
++        # turn it off (the replay tests do).
++        self._random: Any = random.Random(0)
++
++    # -- run / test-case lifecycle ---------------------------------------
++
++    def _test_case(self) -> Any:
++        """The current libhegel test case, opening a run and a case lazily
++        so that draws outside |per_test_case_context_manager| (direct
++        |ConjectureData| use) work too."""
++        if self._tc is not None:
++            return self._tc
++        for _ in range(2):
++            if self._run is None:
++                self._run = native().Run.start(self._settings)
++                self.runs_started += 1
++            self._tc = self._run.next_test_case()
++            self._tc_done = False
++            if self._tc is not None:
++                return self._tc
++            # The run ended (its budget, or a failure closed it): start afresh.
++            self._run = None
++        raise BackendCannotProceed("exhausted")
++
++    def _complete(self, status: int, origin: str | None = None) -> None:
++        tc, self._tc = self._tc, None
++        self._span_depth = 0
++        self._drew = False
++        if tc is not None and not self._tc_done:
++            self._tc_done = True
++            tc.mark_complete(status, origin)
++
++    @contextlib.contextmanager
++    def per_test_case_context_manager(self) -> Iterator[None]:
++        self._complete(native().STATUS_VALID)
++        self._test_case()
++        self._in_context = True
++        try:
++            yield
++        except HegelOverrun:
++            self._complete(native().STATUS_OVERRUN)
++            raise
++        except (StopTest, UnsatisfiedAssumption, BackendCannotProceed):
++            self._complete(native().STATUS_INVALID)
++            raise
++        except Exception as e:
++            tb = e.__traceback__
++            while tb is not None and tb.tb_next is not None:
++                tb = tb.tb_next
++            where = (
++                ""
++                if tb is None
++                else f"@{tb.tb_frame.f_code.co_filename}:{tb.tb_lineno}"
++            )
++            self._complete(
++                native().STATUS_INTERESTING, f"{type(e).__qualname__}{where}"
++            )
++            raise
++        except BaseException:
++            self._complete(native().STATUS_INVALID)
++            raise
++        else:
++            self._complete(native().STATUS_VALID)
++        finally:
++            self._in_context = False
++
++    @cached_property
++    def _local_constants(self) -> Any:
++        return _get_local_constants()
++
++    def _constant(
++        self, choice_type: str, constraints: dict[str, Any], **kw: Any
++    ) -> Any:
++        if self._random is None:
++            return None
++        return HypothesisProvider._maybe_draw_constant(self, choice_type, constraints, **kw)  # type: ignore
++
++    def _draw(self, f: Callable[[Any], T]) -> T:
++        self._drew = True
++        try:
++            return f(self._test_case())
++        except native().StopTest:
++            raise HegelOverrun from None
++        except native().AssumeFailed:
++            raise BackendCannotProceed("discard_test_case") from None
++
++    # -- draws -------------------------------------------------------------
++
++    def draw_boolean(self, p: float = 0.5) -> bool:
++        return self._draw(lambda tc: tc.generate_boolean(p))
++
++    def draw_forced(
++        self, choice_type: str, constraints: dict[str, Any], value: Any
++    ) -> None:
++        """A draw whose value Hypothesis decided itself (``forced=``):
++        record it in libhegel's choice sequence so the two stay aligned.
++        Hypothesis forces only booleans and integers; an integer past int64
++        cannot be recorded yet and is skipped."""
++        if choice_type == "boolean":
++            self._draw(lambda tc: tc.generate_boolean(constraints["p"], forced=value))
++        elif choice_type == "integer":
++            lo, hi = self._integer_bounds(
++                constraints["min_value"],
++                constraints["max_value"],
++                constraints["shrink_towards"],
++            )
++            if INT64_MIN <= lo and hi <= INT64_MAX:
++                self._draw(lambda tc: tc.generate_integer(lo, hi, forced=value))
++
++    @staticmethod
++    def _integer_bounds(
++        min_value: int | None, max_value: int | None, shrink_towards: int
++    ) -> tuple[int, int]:
++        if min_value is None and max_value is None:
++            return (
++                shrink_towards - UNBOUNDED_MAGNITUDE,
++                shrink_towards + UNBOUNDED_MAGNITUDE,
++            )
++        if min_value is None:
++            assert max_value is not None
++            return -max(UNBOUNDED_MAGNITUDE, 2 * abs(max_value)), max_value
++        if max_value is None:
++            return min_value, max(UNBOUNDED_MAGNITUDE, 2 * abs(min_value))
++        return min_value, max_value
++
++    def _draw_bounded_integer(self, lo: int, hi: int) -> int:
++        return self._draw(lambda tc: tc.generate_integer(lo, hi))
++
++    def draw_integer(
++        self,
++        min_value: int | None = None,
++        max_value: int | None = None,
++        *,
++        weights: dict[int, float] | None = None,
++        shrink_towards: int = 0,
++    ) -> int:
++        """libhegel has no unbounded integer draw: unbounded and half-bounded
++        ranges are clamped the way HypothesisProvider clamps them (2**128
++        around the bound / origin). Weights go to libhegel's weighted draw
++        when the bounds fit int64; past that they are emulated as
++        HypothesisProvider does, with the keys picked uniformly.
++        """
++        constraints = {
++            "min_value": min_value,
++            "max_value": max_value,
++            "weights": weights,
++            "shrink_towards": shrink_towards,
++        }
++        if (constant := self._constant("integer", constraints)) is not None:
++            return constant
++        if weights is not None:
++            assert min_value is not None
++            assert max_value is not None
++            if INT64_MIN <= min_value and max_value <= INT64_MAX:
++                keys, ws = list(weights), list(weights.values())
++                st = min(max(shrink_towards, min_value), max_value)
++                return self._draw(
++                    lambda tc: tc.generate_integer_weighted(
++                        min_value, max_value, keys, ws, st
++                    )
++                )
++            if self.draw_boolean(sum(weights.values())):
++                keys = list(weights)
++                return keys[self._draw_bounded_integer(0, len(keys) - 1)]
++            return self._draw_bounded_integer(min_value, max_value)
++        lo, hi = self._integer_bounds(min_value, max_value, shrink_towards)
++        if shrink_towards and INT64_MIN <= lo and hi <= INT64_MAX:
++            # the weighted entry point is the one that carries shrink_towards
++            st = min(max(shrink_towards, lo), hi)
++            return self._draw(
++                lambda tc: tc.generate_integer_weighted(lo, hi, [], [], st)
++            )
++        return self._draw_bounded_integer(lo, hi)
++
++    def draw_float(
++        self,
++        *,
++        min_value: float = -math.inf,
++        max_value: float = math.inf,
++        allow_nan: bool = True,
++        smallest_nonzero_magnitude: float,
++    ) -> float:
++        constraints = {
++            "min_value": min_value,
++            "max_value": max_value,
++            "allow_nan": allow_nan,
++            "smallest_nonzero_magnitude": smallest_nonzero_magnitude,
++        }
++        if (constant := self._constant("float", constraints, p=0.15)) is not None:
++            return constant
++        return self._draw(
++            lambda tc: tc.generate_float(
++                64,
++                min_value,
++                max_value,
++                allow_nan,
++                # Hypothesis says "infinity allowed" through an infinite bound;
++                # libhegel wants the flag too, and rejects it with finite bounds.
++                math.isinf(min_value) or math.isinf(max_value),
++                False,
++                False,
++                smallest_nonzero_magnitude,
++            )
++        )
++
++    def _text_generator(
++        self, intervals: IntervalSet, min_size: int, max_size: int
++    ) -> Any:
++        """A libhegel text generator over exactly ``intervals`` (libhegel
++        drops surrogates), or None when the alphabet is nothing but
++        surrogates, which only the per-character fallback can draw."""
++        key = (intervals, min_size, max_size)
++        if key in self._generators:
++            return self._generators[key]
++        gen = None
++        if any(not _is_surrogate_range(lo, hi) for lo, hi in intervals.intervals):
++            gen = native().StringGenerator.text_ranges(
++                min_size, max_size, list(intervals.intervals)
++            )
++        self._generators[key] = gen
++        return gen
++
++    def draw_string(
++        self,
++        intervals: IntervalSet,
++        *,
++        min_size: int = 0,
++        max_size: int = COLLECTION_DEFAULT_MAX_SIZE,
++    ) -> str:
++        """One libhegel string choice over the exact alphabet. An alphabet of
++        nothing but surrogates (which libhegel cannot hold in a string) falls
++        back to libhegel's collection sizing plus one character index per
++        element, picked as HypothesisProvider picks them."""
++        if len(intervals) == 0:
++            return ""
++        constraints = {
++            "intervals": intervals,
++            "min_size": min_size,
++            "max_size": max_size,
++        }
++        if (constant := self._constant("string", constraints)) is not None:
++            return constant
++        gen = self._text_generator(intervals, min_size, max_size)
++        if gen is not None:
++            return self._draw(lambda tc: tc.generate_string(gen)).decode(
++                "utf-8", "surrogatepass"
++            )
++        collection = self._draw(lambda tc: tc.new_collection(min_size, max_size))
++        chars = []
++        while self._draw(lambda tc: collection.more(tc)):
++            if self._random is None:
++                i = self._draw_bounded_integer(0, len(intervals) - 1)
++            elif len(intervals) > 256 and self._random.random() >= 0.2:
++                # HypothesisProvider's index distribution: the first 256
++                # characters in shrink order most of the time.
++                i = self._random.randint(0, 255)
++            else:
++                i = self._random.randint(0, len(intervals) - 1)
++            chars.append(intervals.char_in_shrink_order(i))
++        return "".join(chars)
++
++    def draw_bytes(
++        self,
++        min_size: int = 0,
++        max_size: int = COLLECTION_DEFAULT_MAX_SIZE,
++    ) -> bytes:
++        constraints = {"min_size": min_size, "max_size": max_size}
++        if (constant := self._constant("bytes", constraints)) is not None:
++            return constant
++        return self._draw(lambda tc: tc.generate_bytes(min_size, max_size))
++
++    # -- spans -------------------------------------------------------------
++
++    def span_start(self, label: int, /) -> None:
++        if self._span_depth == 0 and self._drew and not self._in_context:
++            # Outside per_test_case_context_manager (a ConjectureRunner used
++            # directly, as in tests/quality) a top-level span opening after
++            # draws means the runner moved on to its next test case. Its
++            # outcome is unknown here. Inside the context manager every
++            # @given argument is its own top-level span, so this must not
++            # apply there.
++            self._complete(native().STATUS_VALID)
++        if self._tc is None:
++            # A case opens at its first draw. Forwarding a span before that
++            # would give libhegel a choice-less case, which it (correctly)
++            # takes as an exhausted search space and ends the run on.
++            return
++        self._span_depth += 1
++        with contextlib.suppress(BackendCannotProceed):
++            self._draw(lambda tc: tc.start_span(label & LABEL_MASK))
++
++    def span_end(self, discard: bool, /) -> None:
++        # A span call on a case whose budget is spent (a discarded span's
++        # retry, or spans closed while freezing an overrun case) reports
++        # the exhaustion too; the next draw raises it, a span never does.
++        if self._span_depth > 0:
++            self._span_depth -= 1
++            with contextlib.suppress(BackendCannotProceed):
++                self._draw(lambda tc: tc.stop_span(discard))
++
++
++def decode_choices(blob: str) -> list[ChoiceT]:
++    """Inverse of |encode_choices| for the raw and zlib blob forms."""
++    payload = base64.b64decode(blob)
++    body = payload[1:]
++    if payload[:1] == b"\x01":
++        body = zlib.decompress(body)
++    elif payload[:1] != b"\x00":
++        raise ValueError(f"unsupported blob prefix {payload[:1]!r}")
++    pos = 4
++    (count,) = struct.unpack_from("<I", body, 0)
++    out: list[ChoiceT] = []
++    for _ in range(count):
++        tag = body[pos]
++        pos += 1
++        if tag == 0:
++            sub = body[pos]
++            pos += 1
++            assert sub == 10, sub
++            (n,) = struct.unpack_from("<I", body, pos)
++            pos += 4
++            out.append(int.from_bytes(body[pos : pos + n], "little", signed=True))
++            pos += n
++        elif tag == 1:
++            out.append(bool(body[pos]))
++            pos += 1
++        elif tag == 2:
++            (f,) = struct.unpack_from("<d", body, pos)
++            pos += 8
++            out.append(f)
++        elif tag == 3:
++            (n,) = struct.unpack_from("<I", body, pos)
++            pos += 4
++            out.append(bytes(body[pos : pos + n]))
++            pos += n
++        elif tag == 4:
++            (n,) = struct.unpack_from("<I", body, pos)
++            pos += 4
++            cps = struct.unpack_from(f"<{n}I", body, pos)
++            pos += 4 * n
++            out.append("".join(map(chr, cps)))
++        else:  # pragma: no cover
++            raise ValueError(f"unsupported choice tag {tag}")
++    return out
++
++
++def encode_choices(choices: list[ChoiceT]) -> str:
++    """Encode a Hypothesis choice sequence as a libhegel reproduce blob
++    (``base64(0x00 ++ serialize_choices)``, libhegel's raw blob form), so a
++    Hypothesis-recorded sequence can be replayed by libhegel."""
++    buf = bytearray(struct.pack("<I", len(choices)))
++    for c in choices:
++        if isinstance(c, bool):
++            buf += b"\x01" + bytes([c])
++        elif isinstance(c, int):
++            m = _signed_bytes(c)
++            buf += b"\x00\x0a" + struct.pack("<I", len(m)) + m
++        elif isinstance(c, float):
++            buf += b"\x02" + struct.pack("<d", c)
++        elif isinstance(c, bytes):
++            buf += b"\x03" + struct.pack("<I", len(c)) + c
++        elif isinstance(c, str):
++            buf += b"\x04" + struct.pack("<I", len(c))
++            buf += b"".join(struct.pack("<I", ord(ch)) for ch in c)
++        else:  # pragma: no cover
++            raise TypeError(f"unsupported choice {c!r}")
++    return base64.b64encode(b"\x00" + bytes(buf)).decode("ascii")
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
+new file mode 100644
+index 00000000..e53f9ebf
+--- /dev/null
++++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
+@@ -0,0 +1,492 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: libhegel as the engine. ``HYPOTHESIS_ENGINE=hegel`` makes
++``core.py`` drive tests with |HegelRunner| instead of |ConjectureRunner|:
++libhegel owns the run loop, generation, targeting, shrinking and the choice
++budget, while Python keeps |ConjectureData| as the shim strategies draw from,
++the test execution, interesting-origin bookkeeping and the final report.
++
++Not covered yet: the example database (libhegel's store is disabled and
++Hypothesis's reuse phase is skipped), the explain phase, and Hypothesis's own
++runner-level health checks (libhegel's equivalents run instead, mapped from
++``settings.suppress_health_check``).
++"""
++
++import math
++import os
++import time
++from collections.abc import Callable, Sequence
++from contextlib import nullcontext
++from random import Random
++from typing import Any
++
++from hypothesis._settings import (
++    HealthCheck,
++    Phase,
++    Verbosity,
++    local_settings,
++    settings as Settings,
++)
++from hypothesis.errors import (
++    BackendCannotProceed,
++    FlakyFailure,
++    HypothesisException,
++    StopTest,
++)
++from hypothesis.internal.conjecture.choice import ChoiceNode, ChoiceT, ChoiceTemplate
++from hypothesis.internal.conjecture.data import (
++    _NOT_BATCHED,
++    _PERMISSIVE_CONSTRAINTS,
++    ConjectureData,
++    ConjectureResult,
++    DataObserver,
++    Status,
++)
++from hypothesis.internal.conjecture.engine import (
++    CallStats,
++    ExitReason,
++    StatisticsDict,
++)
++from hypothesis.internal.conjecture.floats import float_to_int
++from hypothesis.internal.conjecture.hegel_ir import NOT_BATCHABLE, compile_strategy
++from hypothesis.internal.conjecture.hegel_provider import (
++    HegelOverrun,
++    HegelProvider,
++    decode_choices,
++    encode_choices,
++    engine_settings,
++    native,
++)
++from hypothesis.internal.conjecture.junkdrawer import ensure_free_stackframes
++from hypothesis.internal.conjecture.providers import HypothesisProvider
++from hypothesis.internal.conjecture.shrinker import sort_key
++from hypothesis.internal.escalation import InterestingOrigin
++from hypothesis.internal.healthcheck import fail_health_check
++from hypothesis.reporting import base_report
++
++
++def hegel_engine_enabled() -> bool:
++    return os.environ.get("HYPOTHESIS_ENGINE") == "hegel"
++
++
++def hegel_batching_enabled() -> bool:
++    # HYPOTHESIS_HEGEL_BATCH=0 keeps every draw interactive (for comparison)
++    return os.environ.get("HYPOTHESIS_HEGEL_BATCH", "1") != "0"
++
++
++class HegelCaseProvider(HegelProvider):
++    """The draw-level provider bound to one libhegel test case the runner
++    already holds: no run of its own, no lifecycle, draws only. Whole
++    strategies that compile to the native interpreter are generated in one
++    call (``draw_strategy``, consulted by ``ConjectureData.draw``)."""
++
++    batched_draws = 0
++    interactive_draws = 0
++
++    def __init__(self, tc: Any, generators: dict) -> None:
++        self._cd = None
++        self._run = None
++        self._tc = tc
++        self._tc_done = False
++        self._span_depth = 0
++        self._drew = False
++        self._in_context = True
++        self._generators = generators
++        # No constant injection here: libhegel replays and shrinks by its own
++        # choice sequence, so every value the test sees has to be a function
++        # of libhegel's draws. (A real integration would pass constants down
++        # as forced draws instead.)
++        self._random = None
++        self.runs_started = 0
++
++    def _test_case(self) -> Any:
++        return self._tc
++
++    def draw_strategy(self, strategy: Any, data: Any) -> Any:
++        if not hegel_batching_enabled():
++            return _NOT_BATCHED
++        compiled = compile_strategy(strategy)
++        if compiled is NOT_BATCHABLE:
++            HegelCaseProvider.interactive_draws += 1
++            return _NOT_BATCHED
++        HegelCaseProvider.batched_draws += 1
++        try:
++            return self._tc.generate(
++                compiled,
++                data.draw,
++                data._hegel_record_many,
++                lambda reason: data.mark_invalid(
++                    f"Aborted test because unable to satisfy {reason}"
++                ),
++            )
++        except native().StopTest:
++            raise HegelOverrun from None
++        except native().AssumeFailed:
++            raise BackendCannotProceed("discard_test_case") from None
++
++    def choices_blob(self) -> str | None:
++        """libhegel's record of the case so far, or None once libhegel has
++        concluded the case itself (its budget ran out mid-draw)."""
++        try:
++            return self._tc.choices_blob()
++        except native().StopTest:
++            return None
++
++    def _complete(self, status: int, origin: str | None = None) -> None:
++        pass
++
++    def per_test_case_context_manager(self) -> Any:
++        return nullcontext()
++
++
++def _phase_bits(settings: Settings) -> int:
++    n = native()
++    bits = {
++        Phase.reuse: n.PHASE_REUSE,
++        Phase.generate: n.PHASE_GENERATE,
++        Phase.target: n.PHASE_TARGET,
++        Phase.shrink: n.PHASE_SHRINK,
++    }
++    return sum(bit for phase, bit in bits.items() if phase in settings.phases)
++
++
++def _health_checks() -> dict[HealthCheck, int]:
++    n = native()
++    return {
++        HealthCheck.filter_too_much: n.HC_FILTER_TOO_MUCH,
++        HealthCheck.too_slow: n.HC_TOO_SLOW,
++        HealthCheck.data_too_large: n.HC_TEST_CASES_TOO_LARGE,
++        HealthCheck.large_base_example: n.HC_LARGE_INITIAL_TEST_CASE,
++    }
++
++
++def _health_check_bits(settings: Settings) -> int:
++    return sum(
++        bit
++        for check, bit in _health_checks().items()
++        if check in settings.suppress_health_check
++    )
++
++
++def _status(status: Status) -> int:
++    n = native()
++    return {
++        Status.VALID: n.STATUS_VALID,
++        Status.INVALID: n.STATUS_INVALID,
++        Status.OVERRUN: n.STATUS_OVERRUN,
++        Status.INTERESTING: n.STATUS_INTERESTING,
++    }[status]
++
++
++def _nodes_from_choices(choices: list) -> tuple[ChoiceNode, ...]:
++    nodes = []
++    for value in choices:
++        kind = (
++            "boolean"
++            if isinstance(value, bool)
++            else (
++                "integer"
++                if isinstance(value, int)
++                else (
++                    "float"
++                    if isinstance(value, float)
++                    else "bytes" if isinstance(value, bytes) else "string"
++                )
++            )
++        )
++        nodes.append(
++            ChoiceNode(
++                type=kind,
++                value=value,
++                constraints=_PERMISSIVE_CONSTRAINTS[kind],
++                was_forced=False,
++                index=len(nodes),
++            )
++        )
++    return tuple(nodes)
++
++
++def _choices_key(choices: list) -> tuple:
++    """A hashable identity for a decoded choice sequence (libhegel's failure
++    blobs are compressed, a live case's are raw: compare by content)."""
++    return tuple((float_to_int(v) if isinstance(v, float) else v) for v in choices)
++
++
++def _origin_key(origin: InterestingOrigin) -> str:
++    """A stable per-process string naming a failure for libhegel's grouping."""
++    return (
++        f"{origin.exc_type.__qualname__}@{origin.filename}:{origin.lineno}"
++        f"#{hash(origin) & 0xFFFFFFFF:08x}"
++    )
++
++
++class HegelRunner:
++    """The subset of |ConjectureRunner| that ``core.py`` drives, backed by a
++    libhegel run."""
++
++    def __init__(
++        self,
++        test_function: Callable[[ConjectureData], None],
++        *,
++        settings: Settings | None = None,
++        random: Random | None = None,
++        database_key: bytes | None = None,
++        ignore_limits: bool = False,
++        thread_overlap: dict[int, bool] | None = None,
++    ) -> None:
++        self._test_function = test_function
++        self.settings = settings or Settings()
++        self.random = random or Random()
++        self.database_key = database_key
++        self.ignore_limits = ignore_limits
++        self.thread_overlap = {} if thread_overlap is None else thread_overlap
++        self.call_count = 0
++        self.valid_test_cases = 0
++        self.invalid_test_cases = 0
++        self.overrun_test_cases = 0
++        self.shrinks = 0
++        self.interesting_test_cases: dict[InterestingOrigin, ConjectureResult] = {}
++        self.best_observed_targets: dict[str, float] = {}
++        self.statistics: StatisticsDict = {}
++        self.exit_reason: ExitReason | None = None
++        self.provider = HypothesisProvider
++        self._current_phase = "generate"
++        self._verified_by_backend = None
++        self._backend_found_failure = False
++        self._stats: list[CallStats] = []
++        self._generators: dict = {}
++        self._engine_settings: Any = None
++        self.hegel_failures: list[tuple[str, str | None]] = []
++        self._interesting_by_choices: dict[tuple, ConjectureResult] = {}
++        self._origin_by_key: dict[str, InterestingOrigin] = {}
++
++    # -- what core.py calls ------------------------------------------------
++
++    def run(self) -> None:
++        with local_settings(self.settings):
++            self._run()
++
++    def new_conjecture_data(
++        self,
++        prefix: Sequence[ChoiceT | ChoiceTemplate | Any],
++        *,
++        observer: DataObserver | None = None,
++        max_choices: int | None = None,
++    ) -> ConjectureData:
++        if self._engine_settings is not None and all(
++            isinstance(c, (bool, int, float, str, bytes)) for c in prefix
++        ):
++            # replay through libhegel, so natively generated strategies
++            # re-materialise from the same choices
++            tc = native().TestCase.from_blob(
++                self._engine_settings, encode_choices(list(prefix))
++            )
++            return ConjectureData(
++                observer=observer or DataObserver(),
++                provider=HegelCaseProvider(tc, self._generators),
++                # libhegel bounds the replay; Python's node count includes
++                # forced draws libhegel never saw
++                max_choices=None,
++                random=self.random,
++            )
++        return ConjectureData(
++            prefix=prefix,
++            observer=observer or DataObserver(),
++            provider=HypothesisProvider,
++            max_choices=max_choices,
++            random=self.random,
++        )
++
++    # -- the loop ------------------------------------------------------------
++
++    def _run(self) -> None:
++        self._engine_settings = engine_settings(
++            self.settings.max_examples,
++            seed=self.random.getrandbits(64),
++            phases=_phase_bits(self.settings),
++            report_multiple_failures=self.settings.report_multiple_bugs,
++            suppress_health_check=_health_check_bits(self.settings),
++            # a test that behaves differently on replay is flaky to
++            # Hypothesis, not something to work around
++            nondeterminism_strictness=native().NONDETERMINISM_ERROR,
++        )
++        started = time.perf_counter()
++        run = native().Run.start(self._engine_settings)
++        try:
++            while (tc := run.next_test_case()) is not None:
++                self._execute(tc)
++        finally:
++            self.statistics["generate-phase"] = {
++                "duration-seconds": time.perf_counter() - started,
++                "test-cases": self._stats,
++                "distinct-failures": len(self.interesting_test_cases),
++                "shrinks-successful": self.shrinks,
++            }
++        result = run.result()
++        self.hegel_failures = [
++            result.failure(i)[:2] for i in range(result.failure_count())
++        ]
++        # libhegel's shrinker decides which case is the minimal one for each
++        # failure (Hypothesis's sort_key over the permissive nodes above would
++        # rank e.g. a year of 1998 below the shrink target 2000)
++        for key, blob in self.hegel_failures:
++            found = None
++            if blob:
++                found = self._interesting_by_choices.get(
++                    _choices_key(decode_choices(blob))
++                )
++            origin = self._origin_by_key.get(key)
++            if found is not None and origin is not None:
++                self.interesting_test_cases[origin] = found
++        if self.interesting_test_cases or self.call_count < self.settings.max_examples:
++            self.exit_reason = ExitReason.finished
++        else:
++            self.exit_reason = ExitReason.max_examples
++        if (error := result.error()) is not None:
++            kind, check = result.error_kind()
++            self._translate_run_error(error, kind, check)
++        self.statistics["stopped-because"] = self.exit_reason.describe(self.settings)
++        if self.best_observed_targets:
++            self.statistics["targets"] = dict(self.best_observed_targets)
++        if self.settings.verbosity >= Verbosity.debug:
++            base_report(
++                f"libhegel run complete after {self.call_count} test cases "
++                f"({self.valid_test_cases} valid) and {self.shrinks} shrinks"
++            )
++
++    def _translate_run_error(self, error: str, kind: int, check: int) -> None:
++        """libhegel's run-level errors in Hypothesis's terms: an exhausted
++        search space is core.py's Unsatisfiable (exit reason ``finished``
++        with no valid case), its health checks are Hypothesis's, and a
++        nondeterministic test is a flaky one."""
++        n = native()
++        if kind == n.RUN_ERROR_UNSATISFIABLE:
++            self.exit_reason = ExitReason.finished
++            self.statistics["stopped-because"] = self.exit_reason.describe(
++                self.settings
++            )
++            return
++        if kind == n.RUN_ERROR_HEALTH_CHECK:
++            messages = {
++                HealthCheck.filter_too_much: (
++                    "It looks like this test is filtering out a lot of inputs. "
++                    f"{self.valid_test_cases} inputs were generated successfully, "
++                    f"while {self.invalid_test_cases} inputs were filtered out and "
++                    f"{self.overrun_test_cases} overran.\n\nAn input might be "
++                    "filtered out by calls to assume(), strategy.filter(...), or "
++                    "occasionally by Hypothesis internals. If you expect this many "
++                    "inputs to be filtered out during generation, you can disable "
++                    "this health check with "
++                    "@settings(suppress_health_check=[HealthCheck.filter_too_much])."
++                ),
++                HealthCheck.too_slow: (
++                    "Data generation is extremely slow: Only produced "
++                    f"{self.valid_test_cases} valid examples in the first test "
++                    "cases. If you expect input generation to take this long, you "
++                    "can disable this health check with "
++                    "@settings(suppress_health_check=[HealthCheck.too_slow])."
++                ),
++                HealthCheck.data_too_large: "Generated inputs are too large.",
++                HealthCheck.large_base_example: (
++                    "The smallest natural example for your test is extremely large."
++                ),
++            }
++            for which, bit in _health_checks().items():
++                if bit == check:
++                    fail_health_check(
++                        self.settings,
++                        f"{messages[which]} (libhegel: {error})",
++                        which,
++                    )
++        if kind in (n.RUN_ERROR_FLAKY, n.RUN_ERROR_NONDETERMINISTIC):
++            self.exit_reason = ExitReason.flaky
++            self.statistics["stopped-because"] = self.exit_reason.describe(
++                self.settings
++            )
++            raise FlakyFailure(
++                "Inconsistent results: libhegel saw this test behave differently "
++                f"when replaying the same inputs ({error})",
++                [HypothesisException(error)],
++            )
++        raise HypothesisException(f"libhegel ended the run with an error: {error}")
++
++    def _execute(self, tc: Any) -> None:
++        provider = HegelCaseProvider(tc, self._generators)
++        data = ConjectureData(random=self.random, provider=provider)
++        self.call_count += 1
++        try:
++            with ensure_free_stackframes():
++                try:
++                    self._test_function(data)
++                except StopTest as e:
++                    if e.testcounter != data.testcounter:
++                        raise
++        except BackendCannotProceed:
++            # the provider ran out of libhegel's choice budget mid-draw
++            data.freeze()
++            self.overrun_test_cases += 1
++            tc.mark_complete(native().STATUS_OVERRUN, None)
++            return
++        except BaseException:
++            # a fatal error or control exception: let libhegel release the
++            # case, then let it propagate
++            tc.mark_complete(native().STATUS_INVALID, None)
++            raise
++        # libhegel's own record of the case is the choice sequence: Python's
++        # node list misses draws Hypothesis forces without consulting the
++        # provider (the first min_size continues of `many`, for one).
++        blob = provider.choices_blob()
++        choices = None if blob is None else decode_choices(blob)
++        if choices is not None:
++            data.nodes = _nodes_from_choices(choices)
++        data.freeze()
++        self._stats.append(
++            {
++                "status": data.status.name.lower(),
++                "runtime": data.finish_time - data.start_time,
++                "drawtime": math.fsum(data.draw_times.values()),
++                "gctime": data.gc_finish_time - data.gc_start_time,
++                "events": sorted(
++                    k if v == "" else f"{k}: {v}" for k, v in data.events.items()
++                ),
++            }
++        )
++        if data.status >= Status.VALID:
++            for label, score in data.target_observations.items():
++                if math.isfinite(score):
++                    tc.target(score, str(label).replace("\0", "\\0"))
++                self.best_observed_targets[label] = max(
++                    self.best_observed_targets.get(label, -math.inf), score
++                )
++        if data.status is Status.VALID:
++            self.valid_test_cases += 1
++        elif data.status is Status.INVALID:
++            self.invalid_test_cases += 1
++        elif data.status is Status.OVERRUN:
++            self.overrun_test_cases += 1
++        origin_key = None
++        if data.status is Status.INTERESTING:
++            origin = data.interesting_origin
++            assert origin is not None
++            origin_key = _origin_key(origin)
++            result = data.as_result()
++            assert isinstance(result, ConjectureResult)
++            if choices is not None:
++                self._interesting_by_choices[_choices_key(choices)] = result
++            self._origin_by_key[origin_key] = origin
++            existing = self.interesting_test_cases.get(origin)
++            if existing is None:
++                self.interesting_test_cases[origin] = result
++            elif sort_key(result.nodes) < sort_key(existing.nodes):
++                self.shrinks += 1
++                self.interesting_test_cases[origin] = result
++        tc.mark_complete(_status(data.status), origin_key)
+diff --git a/hypothesis/src/hypothesis/internal/conjecture/providers.py b/hypothesis/src/hypothesis/internal/conjecture/providers.py
+index fd1951b5..3e8ba02c 100644
+--- a/hypothesis/src/hypothesis/internal/conjecture/providers.py
++++ b/hypothesis/src/hypothesis/internal/conjecture/providers.py
+@@ -130,6 +130,8 @@ INTEGERS_DISTRIBUTION = PiecewiseDistribution(
+ AVAILABLE_PROVIDERS: dict[str, str | type["PrimitiveProvider"]] = {
+     "hypothesis": "hypothesis.internal.conjecture.providers.HypothesisProvider",
+     "hypothesis-urandom": "hypothesis.internal.conjecture.providers.URandomProvider",
++    # EXPERIMENT: libhegel (Hegel's native Rust engine) driving generation.
++    "hegel": "hypothesis.internal.conjecture.hegel_provider.HegelProvider",
+ }
+ # cache the choice_permitted constants for a particular set of constraints.
+ CacheKeyT: TypeAlias = tuple[ChoiceTypeT, tuple[Any, ...]]
+diff --git a/hypothesis/tests/conjecture/test_hegel_ir.py b/hypothesis/tests/conjecture/test_hegel_ir.py
+new file mode 100644
+index 00000000..bce4c7cb
+--- /dev/null
++++ b/hypothesis/tests/conjecture/test_hegel_ir.py
+@@ -0,0 +1,161 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: whole strategies generated natively. ``hegel_ir`` compiles the
++declarative part of a strategy into a tree the libhegel interpreter walks;
++the check that matters is that a value generated that way is exactly what
++the Python engine draws from the same choice sequence.
++"""
++
++import math
++
++import pytest
++
++from hypothesis import Phase, given, settings, strategies as st
++from hypothesis.control import BuildContext
++from hypothesis.internal.conjecture.data import ConjectureData
++from hypothesis.internal.conjecture.hegel_ir import NOT_BATCHABLE, compile_strategy
++from hypothesis.internal.conjecture.hegel_runner import HegelCaseProvider, HegelRunner
++
++
++@pytest.fixture(autouse=True)
++def hegel_engine(monkeypatch):
++    monkeypatch.setenv("HYPOTHESIS_ENGINE", "hegel")
++    monkeypatch.delenv("HYPOTHESIS_HEGEL_BATCH", raising=False)
++
++
++@st.composite
++def pairs(draw):
++    n = draw(st.integers(0, 10))
++    return (n, draw(st.text(max_size=n)))
++
++
++JUST = st.just(7)
++DATA = st.data()
++BATCHABLE = [
++    st.integers(),
++    st.integers(0, 100),
++    st.integers(min_value=5),
++    st.integers(max_value=-(2**70)),
++    st.booleans(),
++    st.floats(),
++    st.floats(0, 1),
++    st.binary(max_size=5),
++    st.text(),
++    st.text(alphabet="ab", min_size=1, max_size=4),
++    st.characters(categories=["Lu"]),
++    st.lists(st.integers()),
++    st.lists(st.text(), min_size=2, max_size=5),
++    st.lists(st.lists(st.integers(0, 3)), max_size=4),
++    st.tuples(st.booleans(), st.binary(max_size=3)),
++    st.fixed_dictionaries({"a": st.integers(), "b": st.floats(allow_nan=False)}),
++    st.one_of(st.integers(), st.text(), st.none()),
++    st.sampled_from([1, 2, 3]),
++    st.sampled_from([1, 2, 3]).map(str),
++    JUST,
++    st.integers().map(str),
++    st.builds(dict, a=st.booleans(), b=st.lists(st.integers(), max_size=3)),
++    st.tuples(st.shared(st.integers(), key="k"), st.shared(st.integers(), key="k")),
++    st.integers().filter(lambda x: x % 2 == 0),
++    st.lists(st.integers().filter(lambda x: x > 3), max_size=3),
++    st.text().filter(lambda s: "a" not in s),
++]
++OPAQUE_ROOTS = [
++    pairs(),
++    DATA,
++    st.lists(st.integers(), unique=True),
++    st.datetimes(),
++    st.sampled_from([1, 2, 3]).filter(lambda x: x > 1),
++    st.fixed_dictionaries({}, optional={"a": st.integers()}),
++    st.recursive(st.integers(), st.lists),
++]
++MIXED = [
++    st.lists(pairs(), max_size=3),
++    st.lists(pairs(), min_size=2, max_size=3),
++    st.sampled_from(range(10)).filter(lambda x: x > 5),
++    st.fixed_dictionaries({"a": st.integers()}, optional={"b": st.booleans()}),
++    st.tuples(st.datetimes(), st.integers()),
++    st.dictionaries(st.text(), st.integers()),
++]
++
++
++@pytest.mark.parametrize("strategy", BATCHABLE, ids=repr)
++def test_declarative_strategies_compile(strategy):
++    assert compile_strategy(strategy) is not NOT_BATCHABLE
++
++
++@pytest.mark.parametrize("strategy", OPAQUE_ROOTS, ids=repr)
++def test_strategies_that_run_python_code_do_not(strategy):
++    assert compile_strategy(strategy) is NOT_BATCHABLE
++
++
++def _same(a, b):
++    if isinstance(a, float) and isinstance(b, float):
++        return (math.isnan(a) and math.isnan(b)) or (
++            a == b and math.copysign(1, a) == math.copysign(1, b)
++        )
++    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
++        return (
++            type(a) is type(b)
++            and len(a) == len(b)
++            and all(_same(x, y) for x, y in zip(a, b, strict=True))
++        )
++    if isinstance(a, dict) and isinstance(b, dict):
++        return list(a) == list(b) and all(_same(a[k], b[k]) for k in a)
++    return type(a) is type(b) and a == b
++
++
++@pytest.mark.parametrize(
++    "strategy",
++    BATCHABLE + [s for s in OPAQUE_ROOTS if s is not DATA] + MIXED,
++    ids=repr,
++)
++def test_a_batched_value_is_what_the_python_engine_draws_from_its_choices(strategy):
++    # libhegel generates the value and records the choice sequence; the Python
++    # engine, replaying that sequence through its own do_draw code, has to
++    # arrive at the same value
++    seen = []
++
++    def test_function(data):
++        with BuildContext(data, wrapped_test=lambda: None):
++            value = data.draw(strategy)
++        seen.append((data, value))
++
++    runner = HegelRunner(
++        test_function,
++        settings=settings(database=None, max_examples=60, phases=[Phase.generate]),
++    )
++    runner.run()
++    # a case without choices ends libhegel's run as exhausted
++    assert len(seen) >= (1 if strategy is JUST else 30)
++    for data, value in seen:
++        replay = ConjectureData.for_choices([n.value for n in data.nodes])
++        with BuildContext(replay, wrapped_test=lambda: None):
++            replayed = replay.draw(strategy)
++        assert _same(replayed, value), (value, replayed, data.nodes)
++        assert not replay.misaligned_at
++
++
++def test_most_draws_are_batched_and_the_switch_turns_it_off(monkeypatch):
++    @settings(database=None, max_examples=20, phases=[Phase.generate])
++    @given(st.lists(st.integers()), st.text(), st.datetimes())
++    def f(xs, s, d):
++        pass
++
++    before = (HegelCaseProvider.batched_draws, HegelCaseProvider.interactive_draws)
++    f()
++    assert HegelCaseProvider.batched_draws > before[0]
++    assert HegelCaseProvider.interactive_draws > before[1]
++
++    monkeypatch.setenv("HYPOTHESIS_HEGEL_BATCH", "0")
++    before = HegelCaseProvider.batched_draws
++    f()
++    assert HegelCaseProvider.batched_draws == before
+diff --git a/hypothesis/tests/conjecture/test_hegel_provider.py b/hypothesis/tests/conjecture/test_hegel_provider.py
+new file mode 100644
+index 00000000..b8e0772f
+--- /dev/null
++++ b/hypothesis/tests/conjecture/test_hegel_provider.py
+@@ -0,0 +1,207 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: the libhegel backend (``settings(backend="hegel")``), and the
++engine-equivalence checks it makes possible.
++"""
++
++import math
++import re
++
++import pytest
++
++from hypothesis import HealthCheck, given, settings, strategies as st
++from hypothesis.errors import BackendCannotProceed
++from hypothesis.internal.conjecture.choice import choice_equal, choice_permitted
++from hypothesis.internal.conjecture.data import ConjectureData
++from hypothesis.internal.conjecture.hegel_provider import (
++    HegelProvider,
++    encode_choices,
++    native,
++)
++from hypothesis.internal.intervalsets import IntervalSet
++
++from tests.common.debug import minimal
++from tests.conjecture.common import (
++    draw_value,
++    float_constr,
++    integer_constr,
++    nodes,
++    string_constr,
++)
++
++HEGEL = settings(backend="hegel", database=None)
++
++
++def test_libhegel_is_linked_in():
++    assert re.fullmatch(r"\d+\.\d+\.\d+", native().version())
++
++
++# -- the provider contract: every draw is permitted by its constraints -------
++
++
++@given(st.lists(nodes()), st.randoms())
++def test_provider_contract_hegel(nodes, random):
++    data = ConjectureData(random=random, provider=HegelProvider)
++    for node in nodes:
++        try:
++            value = getattr(data, f"draw_{node.type}")(**node.constraints)
++        except BackendCannotProceed:
++            return
++        assert choice_permitted(value, node.constraints)
++
++
++# -- through the whole pipeline -----------------------------------------------
++
++
++@HEGEL
++@given(
++    st.integers(),
++    st.text(),
++    st.floats(),
++    st.binary(),
++    st.lists(st.integers()),
++    st.booleans(),
++    st.text(alphabet=st.characters(exclude_characters="\n"), min_size=1),
++)
++def test_generates_every_kind_of_value(n, s, f, b, xs, flag, line):
++    assert isinstance(n, int)
++    assert isinstance(s, str)
++    assert isinstance(f, float)
++    assert isinstance(b, bytes)
++    assert all(isinstance(x, int) for x in xs)
++    assert isinstance(flag, bool)
++    assert line
++    assert "\n" not in line
++
++
++def test_uses_libhegel_for_generation():
++    seen = []
++
++    @HEGEL
++    @given(st.integers(0, 10**6))
++    def f(n):
++        seen.append(n)
++
++    f()
++    assert len(set(seen)) > 10
++
++
++@pytest.mark.parametrize(
++    "strategy, condition, expected",
++    [
++        (st.lists(st.integers()), lambda x: sum(x) > 10, [11]),
++        (st.integers(), lambda x: x > 100, 101),
++        (st.text(), lambda s: len(s) >= 3, "000"),
++        (st.floats(), lambda x: x > 1.5, 2.0),
++        (st.binary(), lambda b: len(b) >= 2, b"\x00\x00"),
++    ],
++)
++def test_minimal_matches_python_engine(strategy, condition, expected):
++    # libhegel generates, Hypothesis shrinks by replaying the recorded
++    # choices: the pipeline must end at the same minimal example as the
++    # all-Python engine.
++    assert minimal(strategy, condition, settings=HEGEL) == expected
++    assert minimal(strategy, condition) == expected
++
++
++@HEGEL
++@given(st.data())
++def test_assume_and_filter_are_reported_as_invalid(data):
++    # exercises the INVALID / OVERRUN completion paths
++    data.draw(st.integers().filter(lambda x: x % 2 == 0))
++
++
++# -- replay semantics: a Hypothesis choice sequence means the same to libhegel
++
++
++@st.composite
++def integer_weights(draw, lo, hi):
++    """A Hypothesis ``weights`` mapping over ``[lo, hi]``: a few keys whose
++    probabilities sum to strictly less than one."""
++    keys = draw(st.lists(st.integers(lo, hi), min_size=1, max_size=4, unique=True))
++    raw = draw(st.lists(st.floats(0.01, 1), min_size=len(keys), max_size=len(keys)))
++    total = draw(st.floats(0.05, 0.9))
++    return {k: w / sum(raw) * total for k, w in zip(keys, raw, strict=True)}
++
++
++@st.composite
++def direct_nodes(draw):
++    """Choice nodes whose draw maps one-to-one onto a libhegel primitive:
++    every kind of choice, with weights (within int64 bounds, where
++    libhegel's weighted draw applies), NaN alongside finite bounds, and
++    multi-range alphabets (any character that is not a surrogate, which a
++    libhegel string cannot hold)."""
++    kind = draw(st.sampled_from(["integer", "boolean", "float", "bytes", "string"]))
++    if kind == "integer":
++        lo = draw(st.none() | st.integers(-(2**70), 2**70))
++        hi = draw(st.none() | st.integers(lo if lo is not None else -(2**70), 2**70))
++        weights = None
++        if lo is not None and hi is not None and -(2**63) <= lo and hi < 2**63:
++            weights = draw(st.none() | integer_weights(lo, hi))
++        constraints = integer_constr(lo, hi, weights=weights)
++    elif kind == "boolean":
++        constraints = {"p": draw(st.floats(0, 1))}
++    elif kind == "float":
++        lo = draw(st.floats(allow_nan=False))
++        hi = draw(st.floats(min_value=lo, allow_nan=False))
++        constraints = float_constr(lo, hi, allow_nan=draw(st.booleans()))
++    elif kind == "bytes":
++        lo = draw(st.integers(0, 10))
++        constraints = {"min_size": lo, "max_size": draw(st.integers(lo, 20))}
++    else:
++        # Ranges never straddle the surrogate block: a lone surrogate is a
++        # valid Hypothesis string character but libhegel drops it.
++        low = sorted(draw(st.sets(st.integers(0, 0xD7FF), max_size=6)))
++        high = sorted(draw(st.sets(st.integers(0xE000, 0x10FFFF), max_size=6)))
++        ranges = [
++            (a, b)
++            for side in (low, high)
++            for a, b in zip(side[::2], side[1::2], strict=False)
++        ]
++        if not ranges:
++            ranges = [(97, 122)]
++        size = draw(st.integers(0, 10))
++        constraints = string_constr(
++            IntervalSet(ranges),
++            min_size=size,
++            max_size=draw(st.integers(size, 20)),
++        )
++    return kind, constraints, draw_value(kind, constraints)
++
++
++@given(st.lists(direct_nodes(), max_size=20))
++@settings(suppress_health_check=[HealthCheck.too_slow])
++def test_libhegel_replays_hypothesis_choices(sequence):
++    # A choice sequence recorded by Hypothesis, encoded as a libhegel reproduce
++    # blob and replayed through libhegel for the same draw calls, must come
++    # back value for value. This is the contract that makes databases and
++    # reproduce blobs portable between the two engines.
++    provider = HegelProvider(None)
++    provider._random = None  # no constant injection: pure replay
++    blob = encode_choices([value for _, _, value in sequence])
++    provider._tc = native().TestCase.from_blob(provider._settings, blob)
++    for kind, constraints, value in sequence:
++        replayed = getattr(provider, f"draw_{kind}")(**constraints)
++        assert choice_equal(replayed, value), (kind, constraints, value, replayed)
++    provider._tc.mark_complete(native().STATUS_VALID, None)
++
++
++def test_nan_and_negative_zero_round_trip_through_a_blob():
++    for value in [math.nan, -0.0, -math.nan, math.inf]:
++        provider = HegelProvider(None)
++        provider._random = None
++        provider._tc = native().TestCase.from_blob(
++            provider._settings, encode_choices([value])
++        )
++        assert choice_equal(
++            provider.draw_float(smallest_nonzero_magnitude=5e-324), value
++        )
+diff --git a/hypothesis/tests/conjecture/test_hegel_runner.py b/hypothesis/tests/conjecture/test_hegel_runner.py
+new file mode 100644
+index 00000000..ed18d1a8
+--- /dev/null
++++ b/hypothesis/tests/conjecture/test_hegel_runner.py
+@@ -0,0 +1,149 @@
++# This file is part of Hypothesis, which may be found at
++# https://github.com/HypothesisWorks/hypothesis/
++#
++# Copyright the Hypothesis Authors.
++# Individual contributors are listed in AUTHORS.rst and the git log.
++#
++# This Source Code Form is subject to the terms of the Mozilla Public License,
++# v. 2.0. If a copy of the MPL was not distributed with this file, You can
++# obtain one at https://mozilla.org/MPL/2.0/.
++
++"""
++EXPERIMENT: libhegel as the engine (``HYPOTHESIS_ENGINE=hegel``): the run
++loop, generation, shrinking and targeting are libhegel's, Hypothesis keeps
++``ConjectureData``, test execution and reporting.
++"""
++
++import pytest
++
++from hypothesis import (
++    HealthCheck,
++    Phase,
++    example,
++    given,
++    settings,
++    strategies as st,
++    target,
++)
++from hypothesis.errors import FailedHealthCheck
++from hypothesis.internal.conjecture.hegel_runner import (
++    HegelRunner,
++    hegel_engine_enabled,
++)
++
++from tests.common.debug import minimal
++
++
++@pytest.fixture(autouse=True)
++def hegel_engine(monkeypatch):
++    monkeypatch.setenv("HYPOTHESIS_ENGINE", "hegel")
++    assert hegel_engine_enabled()
++
++
++def test_runner_is_selected(monkeypatch):
++    seen = []
++    original = HegelRunner.run
++
++    def spy(self):
++        seen.append(self)
++        return original(self)
++
++    monkeypatch.setattr(HegelRunner, "run", spy)
++
++    @settings(database=None, max_examples=5)
++    @given(st.integers())
++    def f(x):
++        pass
++
++    f()
++    assert len(seen) == 1
++    assert seen[0].call_count >= 1
++
++
++@pytest.mark.parametrize(
++    "strategy, condition, expected",
++    [
++        (st.lists(st.integers()), lambda x: sum(x) > 10, [11]),
++        (st.integers(), lambda x: x > 100, 101),
++        (st.text(), lambda s: len(s) >= 3, "000"),
++        (st.floats(), lambda x: x > 1.5, 2.0),
++        (st.binary(), lambda b: len(b) >= 2, b"\x00\x00"),
++        (st.lists(st.integers(), min_size=2, unique=True), lambda x: True, [0, 1]),
++    ],
++)
++def test_libhegel_shrinks_to_the_python_engines_minimum(strategy, condition, expected):
++    assert minimal(strategy, condition) == expected
++
++
++def test_reports_every_bug_when_asked():
++    @settings(database=None, report_multiple_bugs=True)
++    @given(st.integers())
++    def f(x):
++        if x > 100:
++            raise ValueError
++        if x < -100:
++            raise KeyError
++
++    with pytest.raises(ExceptionGroup) as err:
++        f()
++    assert {type(e) for e in err.value.exceptions} == {ValueError, KeyError}
++
++
++def test_filtering_everything_fails_libhegels_health_check():
++    @settings(database=None)
++    @given(st.integers().filter(lambda x: False))
++    def f(x):
++        pass
++
++    with pytest.raises(FailedHealthCheck):
++        f()
++
++
++def test_suppressed_health_check_is_passed_to_libhegel():
++    @settings(
++        database=None,
++        suppress_health_check=[HealthCheck.filter_too_much],
++        max_examples=20,
++    )
++    @given(st.integers().filter(lambda x: x % 7 == 0))
++    def f(x):
++        assert x % 7 == 0
++
++    f()
++
++
++def test_targeting_climbs():
++    best = 0
++
++    @settings(database=None, max_examples=200, deadline=None)
++    @given(st.integers(0, 10**6), st.integers(0, 10**6))
++    def f(a, b):
++        nonlocal best
++        target(float(a + b))
++        best = max(best, a + b)
++
++    f()
++    assert best > 10**6
++
++
++def test_explicit_examples_still_run_before_the_engine():
++    seen = []
++
++    @settings(database=None, phases=[Phase.explicit], max_examples=5)
++    @example(42)
++    @given(st.integers())
++    def f(x):
++        seen.append(x)
++
++    f()
++    assert seen == [42]
++
++
++def test_other_backends_keep_the_python_runner():
++    # the runner flag only applies to the default backend
++    @settings(database=None, backend="hegel", max_examples=5)
++    @given(st.integers())
++    def f(x):
++        pass
++
++    f()
+diff --git a/hypothesis/tests/quality/test_discovery_ability.py b/hypothesis/tests/quality/test_discovery_ability.py
+index 2232bda8..21ca557a 100644
+--- a/hypothesis/tests/quality/test_discovery_ability.py
++++ b/hypothesis/tests/quality/test_discovery_ability.py
+@@ -27,6 +27,10 @@ from hypothesis.control import BuildContext
+ from hypothesis.errors import UnsatisfiedAssumption
+ from hypothesis.internal import reflection
+ from hypothesis.internal.conjecture.engine import ConjectureRunner
++from hypothesis.internal.conjecture.hegel_runner import (
++    HegelRunner,
++    hegel_engine_enabled,
++)
+ from hypothesis.strategies import (
+     binary,
+     booleans,
+@@ -82,7 +86,8 @@ def define_test(specifier, predicate, condition=None, p=0.5, suppress_health_che
+             # We choose the max_examples a bit larger than default so that we
+             # run at least 100 examples outside of the small example generation
+             # part of the generation phase.
+-            runner = ConjectureRunner(
++            runner_cls = HegelRunner if hegel_engine_enabled() else ConjectureRunner
++            runner = runner_cls(
+                 test_function,
+                 settings=Settings(
+                     max_examples=150,
+-- 
+2.43.0
+

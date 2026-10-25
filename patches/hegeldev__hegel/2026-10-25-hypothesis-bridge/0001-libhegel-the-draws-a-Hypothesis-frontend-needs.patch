@@ -1,0 +1,1222 @@
+From 35b93a3ecd6a9f1bc8a6bc5dbe7d129ecb228b29 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 17:53:34 +0000
+Subject: [PATCH 1/2] libhegel: the draws a Hypothesis frontend needs
+
+Ported onto 0.48.0 from the hegel-rust series: a weighted integer draw
+that also carries shrink_towards (hegel_generate_integer_weighted), NaN
+alongside finite float bounds, a text generator over explicit codepoint
+ranges (hegel_string_generator_text_ranges), a live case's choices as a
+reproduce blob (hegel_test_case_choices), a forced integer draw
+(hegel_generate_integer_forced), and the diffuse integer pool built only
+when selected. Header and frontend FFI list regenerated; C ABI tests.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
+---
+ frontends/rust/src/ffi/sys/fns.rs        |   4 +
+ libhegel/RELEASE.md                      |  11 +
+ libhegel/include/hegel.h                 | 104 ++++++-
+ libhegel/src/backend.rs                  |  39 +++
+ libhegel/src/lib.rs                      | 177 +++++++++++
+ libhegel/src/native/blob.rs              |  11 +
+ libhegel/src/native/core/state.rs        |  70 +++--
+ libhegel/src/native/data_source.rs       |  37 +++
+ libhegel/src/native/draws/mod.rs         | 127 +++++++-
+ libhegel/src/native/draws/text.rs        |  21 ++
+ libhegel/tests/c_abi_generate.rs         |  32 +-
+ libhegel/tests/c_abi_hypothesis_needs.rs | 366 +++++++++++++++++++++++
+ 12 files changed, 945 insertions(+), 54 deletions(-)
+ create mode 100644 libhegel/RELEASE.md
+ create mode 100644 libhegel/tests/c_abi_hypothesis_needs.rs
+
+diff --git a/frontends/rust/src/ffi/sys/fns.rs b/frontends/rust/src/ffi/sys/fns.rs
+index 8c13fa5c..36355fa8 100644
+--- a/frontends/rust/src/ffi/sys/fns.rs
++++ b/frontends/rust/src/ffi/sys/fns.rs
+@@ -28,6 +28,8 @@ macro_rules! for_each_hegel_fn {
+             fn hegel_generate_grammar(ctx: *mut HegelContext, tc: *mut HegelTestCase, grammar: *const HegelGrammar, max_size: u64, out_result: *mut hegel_owned_string_t) -> hegel_result_t;
+             fn hegel_generate_integer(ctx: *mut HegelContext, tc: *mut HegelTestCase, min_value: i64, max_value: i64, out_value: *mut i64) -> hegel_result_t;
+             fn hegel_generate_integer_big(ctx: *mut HegelContext, tc: *mut HegelTestCase, min_value: *const u8, min_value_len: usize, max_value: *const u8, max_value_len: usize, out_value: *mut u8, out_value_cap: usize, out_value_len: *mut usize) -> hegel_result_t;
++            fn hegel_generate_integer_forced(ctx: *mut HegelContext, tc: *mut HegelTestCase, min_value: i64, max_value: i64, forced: i64) -> hegel_result_t;
++            fn hegel_generate_integer_weighted(ctx: *mut HegelContext, tc: *mut HegelTestCase, min_value: i64, max_value: i64, shrink_towards: i64, keys: *const i64, weights: *const f64, len: usize, out_value: *mut i64) -> hegel_result_t;
+             fn hegel_generate_ipv4(ctx: *mut HegelContext, tc: *mut HegelTestCase, out_bytes: *mut u8) -> hegel_result_t;
+             fn hegel_generate_ipv6(ctx: *mut HegelContext, tc: *mut HegelTestCase, out_bytes: *mut u8) -> hegel_result_t;
+             fn hegel_generate_string(ctx: *mut HegelContext, tc: *mut HegelTestCase, generator: *const HegelStringGenerator, out_result: *mut hegel_owned_string_t) -> hegel_result_t;
+@@ -141,9 +143,11 @@ macro_rules! for_each_hegel_fn {
+             fn hegel_string_generator_free(ctx: *mut HegelContext, generator: *mut HegelStringGenerator) -> hegel_result_t;
+             fn hegel_string_generator_regex(ctx: *mut HegelContext, pattern: hegel_string_t, fullmatch: bool, alphabet: *const HegelStringGenerator, out_generator: *mut *mut HegelStringGenerator) -> hegel_result_t;
+             fn hegel_string_generator_text(ctx: *mut HegelContext, min_size: u64, max_size: u64, codec: *const hegel_string_t, min_codepoint: u32, max_codepoint: u32, categories: *const hegel_string_t, categories_len: usize, exclude_categories: *const hegel_string_t, exclude_categories_len: usize, include_characters: hegel_string_t, exclude_characters: hegel_string_t, out_generator: *mut *mut HegelStringGenerator) -> hegel_result_t;
++            fn hegel_string_generator_text_ranges(ctx: *mut HegelContext, min_size: u64, max_size: u64, ranges: *const u32, ranges_len: usize, out_generator: *mut *mut HegelStringGenerator) -> hegel_result_t;
+             fn hegel_string_generator_url(ctx: *mut HegelContext, out_generator: *mut *mut HegelStringGenerator) -> hegel_result_t;
+             fn hegel_target(ctx: *mut HegelContext, tc: *mut HegelTestCase, value: f64, label: hegel_string_t) -> hegel_result_t;
+             fn hegel_test_case_block(ctx: *mut HegelContext, tc: *const HegelTestCase, indent: u64, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
++            fn hegel_test_case_choices(ctx: *mut HegelContext, tc: *mut HegelTestCase, out_result: *mut hegel_owned_string_t) -> hegel_result_t;
+             fn hegel_test_case_clone(ctx: *mut HegelContext, tc: *const HegelTestCase, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
+             fn hegel_test_case_free(ctx: *mut HegelContext, tc: *mut HegelTestCase) -> hegel_result_t;
+             fn hegel_test_case_from_blob(ctx: *mut HegelContext, s: *const HegelSettings, blob: hegel_string_t, callback: hegel_output_callback_t, user_data: *mut c_void, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
+diff --git a/libhegel/RELEASE.md b/libhegel/RELEASE.md
+new file mode 100644
+index 00000000..2901cf90
+--- /dev/null
++++ b/libhegel/RELEASE.md
+@@ -0,0 +1,11 @@
++RELEASE_TYPE: patch
++
++This patch adds the draws a frontend needs to put libhegel behind an existing property-based testing API, prompted by an experiment running Hypothesis on libhegel:
++
++- `hegel_generate_integer_weighted(min_value, max_value, shrink_towards, keys, weights, len)`: one plain integer choice whose fresh draws take `keys[i]` with probability `weights[i]` and otherwise the ordinary distribution, and which shrinks toward `shrink_towards` rather than 0. Replay and shrinking never consult the weights.
++- `hegel_generate_integer_forced(min_value, max_value, forced)`: records a caller-chosen value as a forced integer choice, as `hegel_generate_boolean` already can for booleans, so a frontend whose own code decides a value at a choice position keeps its sequence aligned with the engine's.
++- `hegel_string_generator_text_ranges(min_size, max_size, ranges, ranges_len)`: a text generator over an alphabet given as explicit sorted, disjoint codepoint ranges, exactly as the caller computed it. Surrogates are removed as for `hegel_string_generator_text`.
++- `hegel_test_case_choices(tc, out)`: the choices a live test case has recorded so far, as the same base64 blob a failure's reproduction uses, for a frontend that generates whole values natively and learns the sequence after the fact.
++- `allow_nan` is now accepted alongside finite float bounds: NaN comes with the usual NaN probability and in-range values otherwise, where the combination used to be an invalid argument.
++
++It also builds the "diffuse" pool of a wide integer draw (up to 256 bignum powers of two) only when that category is selected, as the "interesting" pool already was; an integer draw over a range wider than `i128`, such as `integers()` clamped to `2**128`, goes from about 160 microseconds to about 3, with the same values from the same seed.
+diff --git a/libhegel/include/hegel.h b/libhegel/include/hegel.h
+index d81258ea..b2eb4a0f 100644
+--- a/libhegel/include/hegel.h
++++ b/libhegel/include/hegel.h
+@@ -745,19 +745,6 @@ typedef struct {
+  */
+ typedef void (*hegel_output_callback_t)(void *user_data, const char *line, size_t len);
+ 
+-/*
+- An engine-allocated byte buffer returned by `hegel_generate_bytes`.
+-
+- The caller owns the buffer and must release it with
+- `hegel_generate_bytes_result_free` (freeing through any other allocator
+- is undefined behaviour). `data` is never NULL after a successful draw,
+- even for `len == 0`.
+- */
+-typedef struct {
+-    uint8_t *data;
+-    size_t len;
+-} hegel_generate_bytes_result_t;
+-
+ /*
+  An owned UTF-8 string allocated by libhegel. Only strings explicitly
+  returned with ownership may be released with `hegel_owned_string_free`.
+@@ -772,6 +759,19 @@ typedef struct {
+  */
+ typedef hegel_string_t hegel_owned_string_t;
+ 
++/*
++ An engine-allocated byte buffer returned by `hegel_generate_bytes`.
++
++ The caller owns the buffer and must release it with
++ `hegel_generate_bytes_result_free` (freeing through any other allocator
++ is undefined behaviour). `data` is never NULL after a successful draw,
++ even for `len == 0`.
++ */
++typedef struct {
++    uint8_t *data;
++    size_t len;
++} hegel_generate_bytes_result_t;
++
+ /*
+  A drawn proleptic Gregorian calendar date: `year` in
+  `[-999999, 999999]` (bounded by the range passed to
+@@ -2201,6 +2201,66 @@ hegel_result_t hegel_generate_integer(hegel_context_t *ctx,
+                                       int64_t max_value,
+                                       int64_t *out_value);
+ 
++/*
++ Parameters:
++ `out_result`: Receives a libhegel-allocated `{char *data; size_t len;}`
++   holding the base64 reproduce blob of the choices this test case has
++   recorded so far, exactly as `hegel_failure_reproduction_blob` would
++   encode them. Release with `hegel_owned_string_free`.
++
++ Returns `HEGEL_OK`.
++
++ A frontend that generates whole values natively uses this to learn,
++ after the fact, which choices a case made, for its own bookkeeping and
++ for replaying the case through `hegel_test_case_from_blob`.
++ */
++hegel_result_t hegel_test_case_choices(hegel_context_t *ctx,
++                                       hegel_test_case_t *tc,
++                                       hegel_owned_string_t *out_result);
++
++/*
++ Parameters:
++ `min_value` / `max_value`: Inclusive bounds. Both required.
++ `forced`: The value to record, within the bounds.
++
++ Records `forced` as an ordinary integer choice without consulting the
++ choice sequence or the RNG; the node is marked forced, so replay and
++ shrinking leave it alone, and a reproduce blob carries it. For a
++ frontend whose own code decides a value at a choice position (e.g.
++ Hypothesis's filtered `sampled_from`), so its sequence stays aligned
++ with libhegel's.
++
++ Returns `HEGEL_OK`, `HEGEL_E_STOP_TEST`, or `HEGEL_E_INVALID_ARG`.
++ */
++hegel_result_t hegel_generate_integer_forced(hegel_context_t *ctx,
++                                             hegel_test_case_t *tc,
++                                             int64_t min_value,
++                                             int64_t max_value,
++                                             int64_t forced);
++
++/*
++ Parameters:
++ `min_value` / `max_value`: Inclusive bounds. Both required.
++ `shrink_towards`: The value the choice shrinks toward, clamped into the
++   bounds (`hegel_generate_integer` shrinks toward 0).
++ `keys` / `weights`: `len` integers in `[min_value, max_value]` and the
++   probability of drawing each. Weights must be finite, non-negative and
++   sum to strictly less than 1; the remaining mass is drawn the way
++   `hegel_generate_integer` draws. The result is one ordinary integer
++   choice: the weights steer generation only, never replay or shrinking.
++
++ Returns `HEGEL_OK`, `HEGEL_E_STOP_TEST`, or `HEGEL_E_INVALID_ARG`.
++ */
++hegel_result_t hegel_generate_integer_weighted(hegel_context_t *ctx,
++                                               hegel_test_case_t *tc,
++                                               int64_t min_value,
++                                               int64_t max_value,
++                                               int64_t shrink_towards,
++                                               const int64_t *keys,
++                                               const double *weights,
++                                               size_t len,
++                                               int64_t *out_value);
++
+ /*
+  Parameters:
+  `min_value` / `max_value`: Inclusive bounds as two's-complement
+@@ -2323,6 +2383,24 @@ hegel_result_t hegel_string_generator_text(hegel_context_t *ctx,
+                                            hegel_string_t exclude_characters,
+                                            hegel_string_generator_t **out_generator);
+ 
++/*
++ Parameters:
++ `min_size` / `max_size`: Inclusive length bounds, in characters.
++ `ranges`: `ranges_len` pairs of inclusive codepoint bounds (so
++   `2 * ranges_len` `uint32_t`s), sorted, disjoint and ascending: the
++   alphabet exactly as the caller computed it. Surrogates are always
++   removed.
++
++ Returns `HEGEL_OK`, or `HEGEL_E_INVALID_ARG` for malformed ranges or
++ ranges that leave no characters while `max_size > 0`.
++ */
++hegel_result_t hegel_string_generator_text_ranges(hegel_context_t *ctx,
++                                                  uint64_t min_size,
++                                                  uint64_t max_size,
++                                                  const uint32_t *ranges,
++                                                  size_t ranges_len,
++                                                  hegel_string_generator_t **out_generator);
++
+ /*
+  Parameters:
+  `pattern`: Borrowed UTF-8 string of
+diff --git a/libhegel/src/backend.rs b/libhegel/src/backend.rs
+index 8a22c154..2afee0b5 100644
+--- a/libhegel/src/backend.rs
++++ b/libhegel/src/backend.rs
+@@ -75,6 +75,45 @@ pub trait DataSource: Send + Sync {
+         max_value: &BigInt,
+     ) -> Result<BigInt, DataSourceError>;
+ 
++    /// Draw an integer from `[min_value, max_value]` where `keys[i]` is
++    /// drawn with probability `weights[i]` and the rest of the probability
++    /// mass falls to [`DataSource::generate_integer`]'s distribution,
++    /// shrinking toward `shrink_towards`. The default ignores both; the
++    /// native engine honours them.
++    fn generate_integer_weighted(
++        &self,
++        min_value: &BigInt,
++        max_value: &BigInt,
++        _shrink_towards: &BigInt,
++        _keys: &[BigInt],
++        _weights: &[f64],
++    ) -> Result<BigInt, DataSourceError> {
++        self.generate_integer(min_value, max_value)
++    }
++
++    /// Record `forced` as an integer choice in `[min_value, max_value]`
++    /// without consulting the choice sequence or the RNG: the position is
++    /// consumed, the node is marked forced so replay and shrinking leave it
++    /// alone. The default does not support it.
++    fn generate_integer_forced(
++        &self,
++        _min_value: &BigInt,
++        _max_value: &BigInt,
++        _forced: &BigInt,
++    ) -> Result<(), DataSourceError> {
++        Err(DataSourceError::InvalidArgument(
++            "this data source does not record forced draws".into(),
++        ))
++    }
++
++    /// The choices this test case has recorded so far, as a reproduce blob
++    /// (`hegel_test_case_from_blob` replays it). The default has none.
++    fn choices_blob(&self) -> Result<String, DataSourceError> {
++        Err(DataSourceError::InvalidArgument(
++            "this data source does not expose its choices".into(),
++        ))
++    }
++
+     /// Draw a float according to `spec` (bounds, width, NaN/infinity policy,
+     /// exclusive-bound handling). Errors with `InvalidArgument` for an
+     /// invalid spec.
+diff --git a/libhegel/src/lib.rs b/libhegel/src/lib.rs
+index 4f7db862..6eccf573 100644
+--- a/libhegel/src/lib.rs
++++ b/libhegel/src/lib.rs
+@@ -4484,6 +4484,138 @@ pub unsafe extern "C" fn hegel_generate_integer(
+     }
+ }
+ 
++/// Parameters:
++/// `out_result`: Receives a libhegel-allocated `{char *data; size_t len;}`
++///   holding the base64 reproduce blob of the choices this test case has
++///   recorded so far, exactly as `hegel_failure_reproduction_blob` would
++///   encode them. Release with `hegel_owned_string_free`.
++///
++/// Returns `HEGEL_OK`.
++///
++/// A frontend that generates whole values natively uses this to learn,
++/// after the fact, which choices a case made, for its own bookkeeping and
++/// for replaying the case through `hegel_test_case_from_blob`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn hegel_test_case_choices(
++    ctx: *mut HegelContext,
++    tc: *mut HegelTestCase,
++    out_result: *mut hegel_owned_string_t,
++) -> hegel_result_t {
++    clear_last_error(ctx);
++    let (tc, _guard) = match unsafe { tc_guard(ctx, "hegel_test_case_choices", tc) } {
++        Ok(t) => t,
++        Err(rc) => return rc,
++    };
++    if out_result.is_null() {
++        set_last_error(ctx, "hegel_test_case_choices: out parameter is null");
++        return HEGEL_E_INVALID_ARG;
++    }
++    match tc.stream.choices_blob() {
++        Ok(s) => unsafe { write_string_result(out_result, s) },
++        Err(e) => translate_ds_error(ctx, e),
++    }
++}
++
++/// Parameters:
++/// `min_value` / `max_value`: Inclusive bounds. Both required.
++/// `forced`: The value to record, within the bounds.
++///
++/// Records `forced` as an ordinary integer choice without consulting the
++/// choice sequence or the RNG; the node is marked forced, so replay and
++/// shrinking leave it alone, and a reproduce blob carries it. For a
++/// frontend whose own code decides a value at a choice position (e.g.
++/// Hypothesis's filtered `sampled_from`), so its sequence stays aligned
++/// with libhegel's.
++///
++/// Returns `HEGEL_OK`, `HEGEL_E_STOP_TEST`, or `HEGEL_E_INVALID_ARG`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn hegel_generate_integer_forced(
++    ctx: *mut HegelContext,
++    tc: *mut HegelTestCase,
++    min_value: i64,
++    max_value: i64,
++    forced: i64,
++) -> hegel_result_t {
++    unsafe {
++        typed_draw(
++            ctx,
++            tc,
++            "hegel_generate_integer_forced",
++            false,
++            |tc| {
++                tc.stream.generate_integer_forced(
++                    &BigInt::from(min_value),
++                    &BigInt::from(max_value),
++                    &BigInt::from(forced),
++                )
++            },
++            |()| {},
++        )
++    }
++}
++
++/// Parameters:
++/// `min_value` / `max_value`: Inclusive bounds. Both required.
++/// `shrink_towards`: The value the choice shrinks toward, clamped into the
++///   bounds (`hegel_generate_integer` shrinks toward 0).
++/// `keys` / `weights`: `len` integers in `[min_value, max_value]` and the
++///   probability of drawing each. Weights must be finite, non-negative and
++///   sum to strictly less than 1; the remaining mass is drawn the way
++///   `hegel_generate_integer` draws. The result is one ordinary integer
++///   choice: the weights steer generation only, never replay or shrinking.
++///
++/// Returns `HEGEL_OK`, `HEGEL_E_STOP_TEST`, or `HEGEL_E_INVALID_ARG`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn hegel_generate_integer_weighted(
++    ctx: *mut HegelContext,
++    tc: *mut HegelTestCase,
++    min_value: i64,
++    max_value: i64,
++    shrink_towards: i64,
++    keys: *const i64,
++    weights: *const f64,
++    len: usize,
++    out_value: *mut i64,
++) -> hegel_result_t {
++    const FN: &str = "hegel_generate_integer_weighted";
++    if len > 0 && (keys.is_null() || weights.is_null()) {
++        clear_last_error(ctx);
++        set_last_error(ctx, &format!("{FN}: keys / weights pointer is null"));
++        return HEGEL_E_INVALID_ARG;
++    }
++    let (keys, weights): (Vec<BigInt>, &[f64]) = if len == 0 {
++        (Vec::new(), &[])
++    } else {
++        // SAFETY: the caller promises `len` readable elements behind each pointer.
++        let k = unsafe { core::slice::from_raw_parts(keys, len) };
++        let w = unsafe { core::slice::from_raw_parts(weights, len) };
++        (k.iter().map(|&v| BigInt::from(v)).collect(), w)
++    };
++    unsafe {
++        typed_draw(
++            ctx,
++            tc,
++            FN,
++            out_value.is_null(),
++            |tc| {
++                let v = tc.stream.generate_integer_weighted(
++                    &BigInt::from(min_value),
++                    &BigInt::from(max_value),
++                    &BigInt::from(shrink_towards),
++                    &keys,
++                    weights,
++                )?;
++                let narrowed = i64::try_from(v).ok();
++                Ok(hegel_internal_unwrap!(
++                    narrowed,
++                    "hegel_generate_integer_weighted: drawn value does not fit the requested i64 bounds"
++                ))
++            },
++            |v| *out_value = v,
++        )
++    }
++}
++
+ /// Parameters:
+ /// `min_value` / `max_value`: Inclusive bounds as two's-complement
+ ///   little-endian signed byte buffers. Both required and must be
+@@ -4888,6 +5020,51 @@ pub unsafe extern "C" fn hegel_string_generator_text(
+     }
+ }
+ 
++/// Parameters:
++/// `min_size` / `max_size`: Inclusive length bounds, in characters.
++/// `ranges`: `ranges_len` pairs of inclusive codepoint bounds (so
++///   `2 * ranges_len` `uint32_t`s), sorted, disjoint and ascending: the
++///   alphabet exactly as the caller computed it. Surrogates are always
++///   removed.
++///
++/// Returns `HEGEL_OK`, or `HEGEL_E_INVALID_ARG` for malformed ranges or
++/// ranges that leave no characters while `max_size > 0`.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn hegel_string_generator_text_ranges(
++    ctx: *mut HegelContext,
++    min_size: u64,
++    max_size: u64,
++    ranges: *const u32,
++    ranges_len: usize,
++    out_generator: *mut *mut HegelStringGenerator,
++) -> hegel_result_t {
++    const FN: &str = "hegel_string_generator_text_ranges";
++    clear_last_error(ctx);
++    if out_generator.is_null() {
++        set_last_error(ctx, &format!("{FN}: out parameter is null"));
++        return HEGEL_E_INVALID_ARG;
++    }
++    if ranges_len > 0 && ranges.is_null() {
++        set_last_error(ctx, &format!("{FN}: ranges pointer is null"));
++        return HEGEL_E_INVALID_ARG;
++    }
++    let pairs: Vec<(u32, u32)> = if ranges_len == 0 {
++        Vec::new()
++    } else {
++        // SAFETY: the caller promises `2 * ranges_len` readable u32s.
++        let flat = unsafe { core::slice::from_raw_parts(ranges, ranges_len * 2) };
++        flat.chunks_exact(2).map(|p| (p[0], p[1])).collect()
++    };
++    match crate::native::draws::StringSpec::text_ranges(
++        &pairs,
++        size_arg(min_size),
++        size_arg(max_size),
++    ) {
++        Ok(spec) => unsafe { write_string_generator(out_generator, spec) },
++        Err(e) => translate_construct_error(ctx, e),
++    }
++}
++
+ /// Parameters:
+ /// `pattern`: Borrowed UTF-8 string of
+ ///   the pattern to match, in Python `re` syntax. Length-delimited so the
+diff --git a/libhegel/src/native/blob.rs b/libhegel/src/native/blob.rs
+index f24c0187..8997428a 100644
+--- a/libhegel/src/native/blob.rs
++++ b/libhegel/src/native/blob.rs
+@@ -96,6 +96,17 @@ const MAX_DECOMPRESSED_LEN: usize = 64 << 20;
+ /// for a sequence [`serialize_choices`] rejects (clone values nested deeper
+ /// than [`MAX_CLONE_DEPTH`](crate::native::core::MAX_CLONE_DEPTH)), which no
+ /// blob could represent.
++/// Encode a live test case's recorded nodes as a raw (uncompressed) blob of
++/// their values, in the same format as [`encode_failure`]: what a frontend
++/// needs to know, mid-run, which choices a case has made so far.
++pub fn encode_nodes(nodes: &[crate::native::core::ChoiceNode]) -> Option<String> {
++    let raw = crate::native::database::serialize_nodes(nodes)?;
++    let mut payload = Vec::with_capacity(raw.len() + 1);
++    payload.push(PREFIX_RAW);
++    payload.extend_from_slice(&raw);
++    Some(base64_encode(&payload))
++}
++
+ pub fn encode_failure(choices: &[ChoiceValue]) -> Option<String> {
+     let raw = serialize_choices(choices)?;
+     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, ZLIB_LEVEL);
+diff --git a/libhegel/src/native/core/state.rs b/libhegel/src/native/core/state.rs
+index e7496efa..82d24910 100644
+--- a/libhegel/src/native/core/state.rs
++++ b/libhegel/src/native/core/state.rs
+@@ -1084,23 +1084,6 @@ fn biguint_sample_in_range(
+         }
+     }
+ 
+-    // Diffuse category: powers of two spanning the range magnitude.
+-    let mut diffuse: Vec<BigInt> = Vec::new();
+-    {
+-        let mut push_diffuse = |v: BigInt| {
+-            if &v >= min && &v <= max {
+-                diffuse.push(v);
+-            }
+-        };
+-        for k in 1..=bits.min(128) {
+-            let p2 = BigInt::from(BigUint::from(1u32) << (k as usize));
+-            push_diffuse(-p2.clone());
+-            push_diffuse(p2);
+-        }
+-    }
+-    diffuse.sort();
+-    diffuse.dedup();
+-
+     // One shared draw selects the category by cumulative weight; an empty
+     // category is skipped so its mass flows to the next (finally the middle). A
+     // range beyond `i128` always has non-empty endpoints.
+@@ -1125,8 +1108,28 @@ fn biguint_sample_in_range(
+         }
+     }
+     acc += params.diffuse_probability;
+-    if u < acc && !diffuse.is_empty() {
+-        return Ok(diffuse[rng.random_range(0..diffuse.len())].clone());
++    if u < acc {
++        // Diffuse category (built only when selected, like the interesting
++        // one: it is up to 256 bignums): powers of two spanning the range
++        // magnitude.
++        let mut diffuse: Vec<BigInt> = Vec::new();
++        {
++            let mut push_diffuse = |v: BigInt| {
++                if &v >= min && &v <= max {
++                    diffuse.push(v);
++                }
++            };
++            for k in 1..=bits.min(128) {
++                let p2 = BigInt::from(BigUint::from(1u32) << (k as usize));
++                push_diffuse(-p2.clone());
++                push_diffuse(p2);
++            }
++        }
++        diffuse.sort();
++        diffuse.dedup();
++        if !diffuse.is_empty() {
++            return Ok(diffuse[rng.random_range(0..diffuse.len())].clone());
++        }
+     }
+ 
+     let below: BigUint = (center - min).magnitude();
+@@ -2663,6 +2666,35 @@ impl NativeTestCase {
+         ))
+     }
+ 
++    /// Draw an integer in `[min_value, max_value]`, taking `keys[i]` with
++    /// probability `weights[i]` and otherwise the ordinary shaped sample
++    /// over the range (see [`Self::draw_integer`]), shrinking toward
++    /// `shrink_towards`. Recorded as a plain integer choice: replay and
++    /// shrinking never consult the weights.
++    pub fn draw_integer_weighted(
++        &mut self,
++        min_value: BigInt,
++        max_value: BigInt,
++        shrink_towards: BigInt,
++        keys: &[BigInt],
++        weights: &[f64],
++    ) -> Result<BigInt, EngineError> {
++        hegel_internal_assert!(
++            min_value <= max_value,
++            "Invalid range [{min_value:?}, {max_value:?}]"
++        );
++        let kind = IntegerChoice::new(min_value, max_value, shrink_towards);
++        let params = self.family.generation_parameters().integer;
++        let total: f64 = weights.iter().sum();
++        self.draw_integer_from(kind, |kind, rng| {
++            if !keys.is_empty() && rng.random::<f64>() < total {
++                Ok(keys[weighted_index_sample(weights, rng)].clone())
++            } else {
++                biased_integer_sample(kind, rng, params)
++            }
++        })
++    }
++
+     /// [`Self::draw_integer`] for a range within `i64`, which nearly every
+     /// draw the engine's own generators make is: the same choice, the same
+     /// distribution and the same recorded node, but the bounds and the value
+diff --git a/libhegel/src/native/data_source.rs b/libhegel/src/native/data_source.rs
+index fb906e89..affaedc3 100644
+--- a/libhegel/src/native/data_source.rs
++++ b/libhegel/src/native/data_source.rs
+@@ -175,6 +175,43 @@ impl DataSource for NativeDataSource {
+         self.with_ntc(|ntc| draws::generate_integer(ntc, min_value, max_value))
+     }
+ 
++    fn generate_integer_weighted(
++        &self,
++        min_value: &BigInt,
++        max_value: &BigInt,
++        shrink_towards: &BigInt,
++        keys: &[BigInt],
++        weights: &[f64],
++    ) -> Result<BigInt, DataSourceError> {
++        self.with_ntc(|ntc| {
++            draws::generate_integer_weighted(
++                ntc,
++                min_value,
++                max_value,
++                shrink_towards,
++                keys,
++                weights,
++            )
++        })
++    }
++
++    fn generate_integer_forced(
++        &self,
++        min_value: &BigInt,
++        max_value: &BigInt,
++        forced: &BigInt,
++    ) -> Result<(), DataSourceError> {
++        self.with_ntc(|ntc| draws::generate_integer_forced(ntc, min_value, max_value, forced))
++    }
++
++    fn choices_blob(&self) -> Result<String, DataSourceError> {
++        self.with_ntc(|ntc| {
++            crate::native::blob::encode_nodes(&ntc.nodes).ok_or_else(|| {
++                EngineError::InvalidArgument("choices nest too deeply to encode".into())
++            })
++        })
++    }
++
+     fn generate_float(
+         &self,
+         spec: &crate::native::draws::FloatSpec,
+diff --git a/libhegel/src/native/draws/mod.rs b/libhegel/src/native/draws/mod.rs
+index 49b1a2bc..a884b469 100644
+--- a/libhegel/src/native/draws/mod.rs
++++ b/libhegel/src/native/draws/mod.rs
+@@ -88,11 +88,10 @@ pub fn generate_float(ntc: &mut NativeTestCase, spec: &FloatSpec) -> Result<f64,
+             "float bounds must not be NaN".to_string(),
+         ));
+     }
+-    if spec.allow_nan && (spec.min_value.is_finite() || spec.max_value.is_finite()) {
+-        return Err(EngineError::InvalidArgument(
+-            "Cannot have allow_nan=true with min_value or max_value".to_string(),
+-        ));
+-    }
++    // `allow_nan` is accepted alongside finite bounds: NaN is outside every
++    // range, so a bounded draw that allows it produces NaN with the usual
++    // NaN probability and in-range values otherwise (Hypothesis's rule;
++    // its `floats(0, 1, allow_nan=True)` is exactly this).
+     if spec.allow_infinity && spec.min_value.is_finite() && spec.max_value.is_finite() {
+         return Err(EngineError::InvalidArgument(
+             "Cannot have allow_infinity=true with both min_value and max_value".to_string(),
+@@ -197,6 +196,85 @@ pub fn generate_integer(
+     })
+ }
+ 
++/// Record `forced` as an integer choice in `[min_value, max_value]`,
++/// validating that it lies within the bounds. The choice position is
++/// consumed and the node marked forced; neither the replay prefix nor the
++/// RNG is consulted (a frontend's own forced draws, e.g. Hypothesis's
++/// filtered `sampled_from`, so its choice sequence stays aligned).
++pub fn generate_integer_forced(
++    ntc: &mut NativeTestCase,
++    min_value: &BigInt,
++    max_value: &BigInt,
++    forced: &BigInt,
++) -> Result<(), EngineError> {
++    if min_value > max_value {
++        return Err(EngineError::InvalidArgument(format!(
++            "generate_integer_forced requires min_value <= max_value, \
++             got [{min_value}, {max_value}]"
++        )));
++    }
++    if forced < min_value || forced > max_value {
++        return Err(EngineError::InvalidArgument(format!(
++            "generate_integer_forced: forced value {forced} outside [{min_value}, {max_value}]"
++        )));
++    }
++    spanned(ntc, LABEL_INTEGER, |ntc| {
++        ntc.draw_integer_forced(min_value.clone(), max_value.clone(), forced.clone())
++    })
++}
++
++/// Draw an integer in `[min_value, max_value]` where each `keys[i]` is
++/// drawn with probability `weights[i]` and the remaining mass
++/// (`1 - sum(weights)`, which must be positive) falls to the ordinary
++/// shaped draw over the whole range, shrinking toward `shrink_towards`
++/// (clamped into the range). The result is one integer choice, shrunk and
++/// replayed like any other: the weights only steer fresh generation. Port
++/// of HypothesisProvider's `weights` and `shrink_towards` handling.
++pub fn generate_integer_weighted(
++    ntc: &mut NativeTestCase,
++    min_value: &BigInt,
++    max_value: &BigInt,
++    shrink_towards: &BigInt,
++    keys: &[BigInt],
++    weights: &[f64],
++) -> Result<BigInt, EngineError> {
++    if min_value > max_value {
++        return Err(EngineError::InvalidArgument(format!(
++            "generate_integer_weighted requires min_value <= max_value, \
++             got [{min_value}, {max_value}]"
++        )));
++    }
++    if keys.len() != weights.len() {
++        return Err(EngineError::InvalidArgument(format!(
++            "generate_integer_weighted: {} keys but {} weights",
++            keys.len(),
++            weights.len()
++        )));
++    }
++    let total: f64 = weights.iter().sum();
++    if weights.iter().any(|w| !(w.is_finite() && *w >= 0.0)) || total.is_nan() || total >= 1.0 {
++        return Err(EngineError::InvalidArgument(
++            "generate_integer_weighted: weights must be finite, non-negative and sum to \
++             strictly less than 1"
++                .to_string(),
++        ));
++    }
++    if let Some(k) = keys.iter().find(|k| *k < min_value || *k > max_value) {
++        return Err(EngineError::InvalidArgument(format!(
++            "generate_integer_weighted: key {k} outside [{min_value}, {max_value}]"
++        )));
++    }
++    spanned(ntc, LABEL_INTEGER, |ntc| {
++        ntc.draw_integer_weighted(
++            min_value.clone(),
++            max_value.clone(),
++            shrink_towards.clone(),
++            keys,
++            weights,
++        )
++    })
++}
++
+ /// Draw an integer identifier unique within the test case's family,
+ /// recorded by value (see [`NativeTestCase::draw_fresh_id`]).
+ pub(crate) fn fresh_id(ntc: &mut NativeTestCase) -> Result<i64, EngineError> {
+@@ -303,6 +381,45 @@ impl StringSpec {
+         })
+     }
+ 
++    /// A text generator over an explicit, sorted, disjoint list of
++    /// inclusive codepoint ranges — the alphabet exactly as a frontend
++    /// computed it (Hypothesis's `IntervalSet`), with no codec, category or
++    /// include / exclude vocabulary in between. Surrogates are removed, as
++    /// for [`StringSpec::text`]. Errors when the ranges are malformed or,
++    /// unless `max_size == 0`, leave no characters.
++    pub fn text_ranges(
++        ranges: &[(u32, u32)],
++        min_size: usize,
++        max_size: usize,
++    ) -> Result<StringSpec, EngineError> {
++        if min_size > max_size {
++            return Err(EngineError::InvalidArgument(format!(
++                "text_ranges requires min_size <= max_size, got [{min_size}, {max_size}]"
++            )));
++        }
++        let mut last_end: Option<u32> = None;
++        for &(lo, hi) in ranges {
++            if lo > hi || hi > 0x10FFFF || last_end.is_some_and(|e| lo <= e) {
++                return Err(EngineError::InvalidArgument(format!(
++                    "text_ranges: ranges must be sorted, disjoint, ascending codepoint \
++                     pairs at most 0x10FFFF, got ({lo}, {hi})"
++                )));
++            }
++            last_end = Some(hi);
++        }
++        let intervals = text::ranges_minus_surrogates(ranges)?;
++        if intervals.is_empty() && max_size > 0 {
++            return Err(EngineError::InvalidArgument(
++                "InvalidArgument: No valid characters in the specified ranges.".to_string(),
++            ));
++        }
++        Ok(StringSpec::Text {
++            intervals: Arc::new(intervals),
++            min_size,
++            max_size,
++        })
++    }
++
+     /// A regex draw: strings matching `pattern`, whose categories, word
+     /// boundaries and case folding follow the Unicode tables of
+     /// `unicode_version`. `alphabet`, when given, must be a text spec; its
+diff --git a/libhegel/src/native/draws/text.rs b/libhegel/src/native/draws/text.rs
+index f2f1f942..9c2105c2 100644
+--- a/libhegel/src/native/draws/text.rs
++++ b/libhegel/src/native/draws/text.rs
+@@ -193,6 +193,27 @@ fn compute_intervals(alphabet: &TextAlphabet) -> Result<IntervalSet, EngineError
+     Ok(intervals)
+ }
+ 
++/// Build an [`IntervalSet`] from sorted, disjoint inclusive ranges with the
++/// surrogate block `U+D800..=U+DFFF` cut out of any range that covers it.
++pub(crate) fn ranges_minus_surrogates(ranges: &[(u32, u32)]) -> Result<IntervalSet, InternalError> {
++    const SURR_LO: u32 = 0xD800;
++    const SURR_HI: u32 = 0xDFFF;
++    let mut out = Vec::with_capacity(ranges.len() + 1);
++    for &(lo, hi) in ranges {
++        if hi < SURR_LO || lo > SURR_HI {
++            out.push((lo, hi));
++            continue;
++        }
++        if lo < SURR_LO {
++            out.push((lo, SURR_LO - 1));
++        }
++        if hi > SURR_HI {
++            out.push((SURR_HI + 1, hi));
++        }
++    }
++    IntervalSet::new(out)
++}
++
+ /// Build an [`IntervalSet`] containing `[min, max]` with the surrogate block
+ /// `[0xD800, 0xDFFF]` removed.
+ fn range_minus_surrogates(min: u32, max: u32) -> Result<IntervalSet, InternalError> {
+diff --git a/libhegel/tests/c_abi_generate.rs b/libhegel/tests/c_abi_generate.rs
+index 943214ce..6edd87ca 100644
+--- a/libhegel/tests/c_abi_generate.rs
++++ b/libhegel/tests/c_abi_generate.rs
+@@ -493,23 +493,21 @@ fn float_draws_respect_spec_and_validate_arguments() {
+                 HEGEL_E_INVALID_ARG
+             );
+             assert!(last_error(ctx).contains("NaN"));
+-            assert_eq!(
+-                hegel_generate_float(
+-                    ctx,
+-                    tc,
+-                    64,
+-                    0.0,
+-                    1.0,
+-                    true,
+-                    false,
+-                    false,
+-                    false,
+-                    f64::from_bits(1),
+-                    &mut out,
+-                ),
+-                HEGEL_E_INVALID_ARG
+-            );
+-            assert!(last_error(ctx).contains("allow_nan=true"));
++            // NaN alongside finite bounds: NaN or an in-range value
++            ok(hegel_generate_float(
++                ctx,
++                tc,
++                64,
++                0.0,
++                1.0,
++                true,
++                false,
++                false,
++                false,
++                f64::from_bits(1),
++                &mut out,
++            ));
++            assert!(out.is_nan() || (0.0..=1.0).contains(&out), "{out}");
+             assert_eq!(
+                 hegel_generate_float(
+                     ctx,
+diff --git a/libhegel/tests/c_abi_hypothesis_needs.rs b/libhegel/tests/c_abi_hypothesis_needs.rs
+new file mode 100644
+index 00000000..a3c0aa40
+--- /dev/null
++++ b/libhegel/tests/c_abi_hypothesis_needs.rs
+@@ -0,0 +1,366 @@
++//! In-process exercise of the draws added for the Hypothesis frontend:
++//! weighted integers, NaN alongside finite float bounds, text generators
++//! built from explicit codepoint ranges, a case's choices as a blob, and
++//! forced integer draws.
++mod common;
++
++use common::{last_error, make_settings_no_db, next_case, ok, start};
++use hegel_c::hegel_result_t::*;
++use hegel_c::{
++    HegelContext, HegelStringGenerator, HegelTestCase, hegel_context_free, hegel_context_new,
++    hegel_generate_float, hegel_generate_integer, hegel_generate_integer_forced,
++    hegel_generate_integer_weighted, hegel_generate_string, hegel_mark_complete,
++    hegel_owned_string_free, hegel_owned_string_t, hegel_run_free, hegel_settings_free,
++    hegel_settings_set_seed, hegel_settings_set_test_cases, hegel_status_t,
++    hegel_string_generator_free, hegel_string_generator_text_ranges, hegel_test_case_choices,
++    hegel_test_case_from_blob,
++};
++use std::ptr;
++
++unsafe fn complete_valid(ctx: *mut HegelContext, tc: *mut HegelTestCase) {
++    unsafe {
++        ok(hegel_mark_complete(
++            ctx,
++            tc,
++            hegel_status_t::HEGEL_STATUS_VALID as u32,
++            ptr::null(),
++        ));
++        ok(hegel_c::hegel_test_case_free(ctx, tc));
++    }
++}
++
++#[test]
++fn weighted_integers_honour_keys_and_validate_arguments() {
++    let ctx = hegel_context_new();
++    unsafe {
++        let s = make_settings_no_db(ctx);
++        ok(hegel_settings_set_test_cases(ctx, s, 400));
++        ok(hegel_settings_set_seed(ctx, s, 7, true));
++        let run = start(ctx, s);
++        let keys = [7i64, 42];
++        let weights = [0.3f64, 0.2];
++        let (mut sevens, mut forty_twos, mut others) = (0, 0, 0);
++        loop {
++            let tc = next_case(ctx, run);
++            if tc.is_null() {
++                break;
++            }
++            let mut out = 0i64;
++            // keys outside the bounds, weights summing to >= 1, and mismatched
++            // lengths are usage errors
++            assert_eq!(
++                hegel_generate_integer_weighted(
++                    ctx,
++                    tc,
++                    0,
++                    5,
++                    0,
++                    keys.as_ptr(),
++                    weights.as_ptr(),
++                    2,
++                    &mut out
++                ),
++                HEGEL_E_INVALID_ARG
++            );
++            assert!(last_error(ctx).contains("outside"));
++            let heavy = [0.6f64, 0.5];
++            assert_eq!(
++                hegel_generate_integer_weighted(
++                    ctx,
++                    tc,
++                    0,
++                    100,
++                    0,
++                    keys.as_ptr(),
++                    heavy.as_ptr(),
++                    2,
++                    &mut out
++                ),
++                HEGEL_E_INVALID_ARG
++            );
++            assert_eq!(
++                hegel_generate_integer_weighted(
++                    ctx,
++                    tc,
++                    0,
++                    100,
++                    0,
++                    keys.as_ptr(),
++                    weights.as_ptr(),
++                    2,
++                    ptr::null_mut()
++                ),
++                HEGEL_E_INVALID_ARG
++            );
++            ok(hegel_generate_integer_weighted(
++                ctx,
++                tc,
++                0,
++                100,
++                0,
++                keys.as_ptr(),
++                weights.as_ptr(),
++                2,
++                &mut out,
++            ));
++            assert!((0..=100).contains(&out));
++            match out {
++                7 => sevens += 1,
++                42 => forty_twos += 1,
++                _ => others += 1,
++            }
++            // no keys at all is just an ordinary draw
++            ok(hegel_generate_integer_weighted(
++                ctx,
++                tc,
++                -3,
++                3,
++                0,
++                ptr::null(),
++                ptr::null(),
++                0,
++                &mut out,
++            ));
++            assert!((-3..=3).contains(&out));
++            complete_valid(ctx, tc);
++        }
++        // The weights steer fresh draws only: a good share of a run's cases
++        // are mutations and replays of earlier ones, so over the whole run
++        // the keys show up well below 30% / 20% but far above the ~1% a
++        // plain draw over [0, 100] would give them.
++        assert!(sevens >= 40, "7 drawn {sevens} times");
++        assert!(forty_twos >= 25, "42 drawn {forty_twos} times");
++        assert!(others >= 60, "other values drawn {others} times");
++        ok(hegel_run_free(ctx, run));
++        ok(hegel_settings_free(ctx, s));
++        ok(hegel_context_free(ctx));
++    }
++}
++
++#[test]
++fn nan_is_allowed_alongside_finite_bounds() {
++    let ctx = hegel_context_new();
++    unsafe {
++        let s = make_settings_no_db(ctx);
++        ok(hegel_settings_set_test_cases(ctx, s, 600));
++        // the NaN share is a per-case drawn parameter: pin the run
++        ok(hegel_settings_set_seed(ctx, s, 7, true));
++        let run = start(ctx, s);
++        let mut nans = 0;
++        loop {
++            let tc = next_case(ctx, run);
++            if tc.is_null() {
++                break;
++            }
++            let mut out = 0f64;
++            ok(hegel_generate_float(
++                ctx, tc, 64, 0.0, 1.0, true, false, false, false, 5e-324, &mut out,
++            ));
++            assert!(out.is_nan() || (0.0..=1.0).contains(&out), "{out}");
++            nans += usize::from(out.is_nan());
++            ok(hegel_generate_float(
++                ctx, tc, 64, -2.0, 2.0, false, false, false, false, 5e-324, &mut out,
++            ));
++            assert!((-2.0..=2.0).contains(&out), "{out}");
++            complete_valid(ctx, tc);
++        }
++        assert!(
++            nans > 0,
++            "NaN never drawn from a bounded draw that allows it"
++        );
++        ok(hegel_run_free(ctx, run));
++        ok(hegel_settings_free(ctx, s));
++        ok(hegel_context_free(ctx));
++    }
++}
++
++#[test]
++fn text_ranges_draw_only_from_the_given_ranges() {
++    let ctx = hegel_context_new();
++    unsafe {
++        let mut generator: *mut HegelStringGenerator = ptr::null_mut();
++        // malformed: unsorted / overlapping / inverted / beyond the codespace
++        for bad in [
++            [98u32, 99, 97, 97],
++            [97, 99, 99, 100],
++            [99, 97, 0, 0],
++            [0, 0x110000, 0, 0],
++        ] {
++            assert_eq!(
++                hegel_string_generator_text_ranges(ctx, 0, 5, bad.as_ptr(), 2, &mut generator),
++                HEGEL_E_INVALID_ARG,
++                "{bad:?}"
++            );
++        }
++        // only surrogates: no characters left
++        let surr = [0xD800u32, 0xDFFF];
++        assert_eq!(
++            hegel_string_generator_text_ranges(ctx, 1, 5, surr.as_ptr(), 1, &mut generator),
++            HEGEL_E_INVALID_ARG
++        );
++        // a range straddling the surrogate block loses exactly that block
++        let ranges = [97u32, 99, 0xD7FE, 0xE001, 0x1F600, 0x1F601];
++        ok(hegel_string_generator_text_ranges(
++            ctx,
++            1,
++            4,
++            ranges.as_ptr(),
++            3,
++            &mut generator,
++        ));
++        let s = make_settings_no_db(ctx);
++        ok(hegel_settings_set_test_cases(ctx, s, 300));
++        ok(hegel_settings_set_seed(ctx, s, 7, true));
++        let run = start(ctx, s);
++        let mut seen = std::collections::BTreeSet::new();
++        loop {
++            let tc = next_case(ctx, run);
++            if tc.is_null() {
++                break;
++            }
++            let mut res = hegel_owned_string_t {
++                data: ptr::null_mut(),
++                len: 0,
++            };
++            ok(hegel_generate_string(ctx, tc, generator, &mut res));
++            let bytes = std::slice::from_raw_parts(res.data as *const u8, res.len);
++            let text = std::str::from_utf8(bytes).unwrap().to_owned();
++            ok(hegel_owned_string_free(ctx, &mut res));
++            assert!((1..=4).contains(&text.chars().count()), "{text:?}");
++            for c in text.chars() {
++                let cp = c as u32;
++                assert!(
++                    (97..=99).contains(&cp)
++                        || cp == 0xD7FE
++                        || cp == 0xD7FF
++                        || cp == 0xE000
++                        || cp == 0xE001
++                        || (0x1F600..=0x1F601).contains(&cp),
++                    "{cp:#x} is outside the ranges"
++                );
++                seen.insert(cp);
++            }
++            complete_valid(ctx, tc);
++        }
++        assert!(seen.len() >= 4, "too few distinct characters: {seen:?}");
++        ok(hegel_run_free(ctx, run));
++        ok(hegel_settings_free(ctx, s));
++        ok(hegel_string_generator_free(ctx, generator));
++        ok(hegel_context_free(ctx));
++    }
++}
++
++#[test]
++fn a_cases_choices_replay_through_their_blob() {
++    let ctx = hegel_context_new();
++    unsafe {
++        let s = make_settings_no_db(ctx);
++        ok(hegel_settings_set_test_cases(ctx, s, 20));
++        let run = start(ctx, s);
++        loop {
++            let tc = next_case(ctx, run);
++            if tc.is_null() {
++                break;
++            }
++            let mut drawn = Vec::new();
++            for _ in 0..3 {
++                let mut v = 0i64;
++                ok(hegel_generate_integer(ctx, tc, -1000, 1000, &mut v));
++                drawn.push(v);
++                let mut res = hegel_owned_string_t {
++                    data: ptr::null_mut(),
++                    len: 0,
++                };
++                ok(hegel_test_case_choices(ctx, tc, &mut res));
++                let bytes = std::slice::from_raw_parts(res.data as *const u8, res.len);
++                let blob = bytes.to_vec();
++                ok(hegel_owned_string_free(ctx, &mut res));
++                // the blob so far replays exactly the draws so far
++                let mut replay: *mut HegelTestCase = ptr::null_mut();
++                ok(hegel_test_case_from_blob(
++                    ctx,
++                    s,
++                    hegel_c::hegel_string_t {
++                        data: blob.as_ptr() as *const std::ffi::c_char,
++                        len: blob.len(),
++                    },
++                    None,
++                    ptr::null_mut(),
++                    &mut replay,
++                ));
++                for &expected in &drawn {
++                    let mut got = 0i64;
++                    ok(hegel_generate_integer(ctx, replay, -1000, 1000, &mut got));
++                    assert_eq!(got, expected);
++                }
++                complete_valid(ctx, replay);
++            }
++            assert_eq!(
++                hegel_test_case_choices(ctx, tc, ptr::null_mut()),
++                HEGEL_E_INVALID_ARG
++            );
++            complete_valid(ctx, tc);
++        }
++        ok(hegel_run_free(ctx, run));
++        ok(hegel_settings_free(ctx, s));
++        ok(hegel_context_free(ctx));
++    }
++}
++
++#[test]
++fn forced_integers_take_a_choice_position_and_replay() {
++    let ctx = hegel_context_new();
++    unsafe {
++        let s = make_settings_no_db(ctx);
++        ok(hegel_settings_set_test_cases(ctx, s, 20));
++        let run = start(ctx, s);
++        loop {
++            let tc = next_case(ctx, run);
++            if tc.is_null() {
++                break;
++            }
++            let (mut a, mut b) = (0i64, 0i64);
++            ok(hegel_generate_integer(ctx, tc, 0, 1000, &mut a));
++            assert_eq!(
++                hegel_generate_integer_forced(ctx, tc, 0, 2, 3),
++                HEGEL_E_INVALID_ARG
++            );
++            assert!(last_error(ctx).contains("outside"));
++            ok(hegel_generate_integer_forced(ctx, tc, 0, 2, 1));
++            ok(hegel_generate_integer(ctx, tc, 0, 1000, &mut b));
++            let mut res = hegel_owned_string_t {
++                data: ptr::null_mut(),
++                len: 0,
++            };
++            ok(hegel_test_case_choices(ctx, tc, &mut res));
++            let bytes = std::slice::from_raw_parts(res.data as *const u8, res.len);
++            let blob = bytes.to_vec();
++            ok(hegel_owned_string_free(ctx, &mut res));
++            complete_valid(ctx, tc);
++            // the blob holds three choices; the forced one is re-forced on
++            // replay (whatever the caller forces then) and the draws around
++            // it come back as recorded
++            let mut replay: *mut HegelTestCase = ptr::null_mut();
++            ok(hegel_test_case_from_blob(
++                ctx,
++                s,
++                hegel_c::hegel_string_t {
++                    data: blob.as_ptr() as *const std::ffi::c_char,
++                    len: blob.len(),
++                },
++                None,
++                ptr::null_mut(),
++                &mut replay,
++            ));
++            let (mut ra, mut rb) = (0i64, 0i64);
++            ok(hegel_generate_integer(ctx, replay, 0, 1000, &mut ra));
++            ok(hegel_generate_integer_forced(ctx, replay, 0, 2, 2));
++            ok(hegel_generate_integer(ctx, replay, 0, 1000, &mut rb));
++            assert_eq!((ra, rb), (a, b));
++            complete_valid(ctx, replay);
++        }
++        ok(hegel_run_free(ctx, run));
++        ok(hegel_settings_free(ctx, s));
++        ok(hegel_context_free(ctx));
++    }
++}
+-- 
+2.43.0
+
