@@ -1,8 +1,12 @@
 # Hypothesis on libhegel: from a draw-level backend to a runner-level engine
 
-Session notes for two patch series: this one against Hypothesis master
-(44b82b24, v6.168.3) and `patches/hegeldev__hegel-rust/2026-10-03-hypothesis-needs`
-against hegel-rust main (ebfd9d53, hegeltest 0.48.1 / libhegel 0.44.1).
+Session notes for the Hypothesis-on-libhegel experiment. The current
+series are this one against Hypothesis master (5057a16c, v6.170.9) and
+`patches/hegeldev__hegel/2026-10-25-hypothesis-bridge` against the Hegel
+monorepo (36f65de4, libhegel 0.48.0, hegeltest for Python 0.2.1); round four
+below describes them. Rounds one to three were cut against Hypothesis
+6.168.3 and the now-archived hegel-rust repository (libhegel 0.44.1); their
+series are superseded and removed, the notes stand.
 The question was whether Hypothesis's Python-to-Rust engine migration
 (HypothesisWorks/hypothesis issue #4740) can be solved by consuming Hegel's
 native engine, and how to check equivalence. Three rounds:
@@ -19,6 +23,99 @@ native engine, and how to check equivalence. Three rounds:
    per primitive; everything else falls back to the interactive path. Plus
    the forced-draw gap closed and a 50x fix to libhegel's unbounded
    integer draw. See "Round three" below.
+4. **The bridge on Hegel's own Python binding** (2026-10-25): the Rust half
+   moved into the Hegel monorepo (libhegel plus `hegel._native`, the pyo3
+   extension of Hegel's Python frontend), Hypothesis's half became Python
+   only over `hegeltest` as an optional dependency. See "Round four".
+
+## Round four: the bridge on Hegel's binding (2026-10-25)
+
+Rounds one to three linked libhegel into Hypothesis's own extension and
+grew a second pyo3 binding there. Hegel now ships a Python frontend whose
+extension, `hegel._native`, is that binding, built and released for every
+platform with the engine inside. So the bridge was redone on it:
+
+- **hegeldev/hegel, commit 1 (libhegel)**: the four engine additions of
+  rounds two and three, rebased onto 0.48.0: `hegel_generate_integer_weighted`
+  (with `shrink_towards`, which libhegel's `IntegerChoice::new` now takes
+  first-class), `hegel_generate_integer_forced`,
+  `hegel_string_generator_text_ranges`, `hegel_test_case_choices` (now
+  returning a `hegel_owned_string_t`), NaN with finite bounds, the lazy
+  diffuse pool. C ABI tests, header and FFI list regenerated, a
+  `RELEASE.md` in the monorepo's format.
+- **hegeldev/hegel, commit 2 (frontends/python)**: `TestCase.generate`,
+  the strategy interpreter of round three ported from `hegel_gen.rs` into
+  the frontend's crate as `interpret.rs`, made Hypothesis-agnostic: the
+  frontend passes its draw, record and invalid callbacks and its retry
+  exception, a text node carries a `StringGenerator` object instead of a
+  per-engine cache, big integers go through pyo3's bigint support. Plus
+  `generate_integer_weighted`, `generate_integer(forced=)`,
+  `StringGenerator.text_ranges`, `choices_blob` and `TestCase.from_blob`.
+  Tested from Python in `tests/test_native_bridge.py`.
+- **HypothesisWorks/hypothesis, one commit, Python only**: the provider,
+  runner and IR of rounds two and three against `hegel._native`:
+  `Settings.new()` plus `Run.start` replace the old `Engine`, errors are
+  `hegel._native.StopTest` / `AssumeFailed`, run errors are classified by
+  `RunResult.error_kind()` instead of by their message, failures come from
+  `RunResult.failure(i)`. `hegeltest` is the optional extra
+  `hypothesis[hegel]`; without it `backend="hegel"` and the engine flag
+  report the missing dependency. No Rust in Hypothesis.
+
+What it took: the libhegel port was mechanical except for the string ABI
+change of 0.46.0 and the new `IntegerChoice`; the binding port replaced
+the ~900-line in-tree `hegel.rs` by ~150 lines of additions to their
+`test_case.rs` and `strings.rs`, the interpreter moved with small edits;
+the Hypothesis side changed call names and lost its `rust/` diff. The 97
+hegel tests pass unchanged in substance. The same benchmarks through
+`hegeltest`'s binding (libhegel 0.48.0):
+
+| case | python | libhegel batched, round three | through hegeltest |
+|---|---|---|---|
+| generation, integers | 0.50 ms/ex | 0.27 | 0.33 |
+| generation, lists of ints | 1.04 ms/ex | 0.41 | 0.37 |
+| generation, dicts(text, floats) | 1.78 ms/ex | 0.90 | 0.95 |
+| generation, tuples / one_of / builds | 1.29 ms/ex | 0.35 | 0.35 |
+| 100-200 records | 76.3 ms/ex | 6.1 | 5.7 |
+| 30x30 matrix of integers | 30.3 ms/ex | 10.8 | 4.1 |
+| find + shrink `sum(list) > 1000` | 0.10 s, 50 calls | 1.13 s, 821 calls | 0.25 s, 191 calls |
+| find + shrink dict with 3 keys | 1.57 s, 429 calls | 3.89 s, 1438 calls | 3.89 s, 1439 calls |
+
+The matrix case gains from pyo3's native bigint conversion (no more
+`int.from_bytes` per element); the `sum(list)` shrink gains from libhegel
+0.48's own shrinker fixes (0.45.10's division steps, 0.48's regression
+fix), not from the bridge. Suites, same code, same flag:
+
+| suite | round three | round four (hegeltest binding, Hypothesis 6.170.9) |
+|---|---|---|
+| `tests/cover` (4017 tests now) | 3915 passed, 69 failed | 3921 passed, 70 failed |
+| `tests/quality` | 242 passed, 30 failed | 248 passed, 24 failed |
+
+The cover failures are the classes of round three (observability 11,
+flakiness and stateful 13, seed and statistics wording 11, custom reprs
+and error notes 10, explain 6, discovery, engine internals, database) with
+one more sampled_from note test. The quality gain is libhegel 0.48's: the
+three targeting cases and three of the five shrink-quality cases now pass,
+leaving widening (16), the six `large_factorial` discovery cases and two
+`lowering_together` cases.
+
+The cover failures are the classes of round three (observability 11,
+flakiness and stateful 13, seed and statistics wording 11, custom reprs
+and error notes 10, explain 6, discovery, engine internals, database) with
+one more sampled_from note test. The quality gain is libhegel 0.48's: the
+three targeting cases and three of the five shrink-quality cases now pass,
+leaving widening (16), the six `large_factorial` discovery cases and two
+`lowering_together` cases.
+
+What the move changes for the question: the engine is now the one
+Hegel's own frontend ships, from PyPI; the Hypothesis side is an
+optional-dependency backend like CrossHair's, which is the shape
+Hypothesis already accepts for alternative engines; and the two frontends
+that would share libhegel in Python, Hypothesis's and Hegel's, now share
+one binding, so an engine fix found through either reaches both. The
+pieces that are still experiment-shaped are the ones the earlier rounds
+named: the IR is a tuple protocol between two repositories, the
+interpreter skips what a `do_draw` does besides drawing, the database and
+the explain phase stay on the Python engine.
 
 ## The patches
 
