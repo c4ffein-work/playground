@@ -317,6 +317,52 @@ engine generate, let `do_draw` decorate.
   compiled tree against the strategy's `do_draw` source in the test suite
   when strategies change.
 
+## Upstream check (2026-10-25)
+
+- **hegel-rust is gone; Hegel is a monorepo**: `hegeldev/hegel` since
+  2026-10-19 (`libhegel/` is the engine, `frontends/{rust,python,typescript,
+  cpp,java,ocaml}`; history merged unchanged, tags `libhegel/<version>`).
+  libhegel is at 0.48.0 (from 0.44.1 here): borrowed `hegel_string_t`
+  arguments everywhere (0.46.0, an ABI break for `hegel.rs`), a grammar
+  builder, `stop_on_first_failure`, host Unicode version, a wide-integer
+  distribution fix, and a shrinking regression fixed. None of this
+  series' four additions (weighted + `shrink_towards` draw, text ranges,
+  choices blob, forced integer) is upstream; the series does not apply to
+  the new tree (the files moved and the string ABI changed under them), a
+  rebase by hand of about the same size.
+- **Hegel ships its own Python frontend**, `hegeltest` on PyPI (0.1.0 on
+  2026-10-19, 0.2.1 on 2026-10-20): a pyo3 extension over libhegel plus a
+  3.7k-line `hegel` package (`@hegel.test` with an explicit test case,
+  `generators`, explicit test cases, reproduce blobs, sequential and
+  concurrent stateful testing, a pytest plugin). It carries Hypothesis's
+  own test suite ported to the Hegel API (946 tests from Hypothesis
+  6.168.5, 8 xfails, the rest dropped as internals or missing features),
+  and a written comparison with Hypothesis 6.168. Its README on the
+  relationship: "still figuring that out"; keep Hypothesis for CI, use
+  Hegel for Antithesis workloads. Architecturally it is the draw-level
+  design: Python generators call one native draw at a time, no strategy
+  IR, no batching; `generate_integer` takes bigints directly, no weights.
+- **Hypothesis is at 6.170.9** (104 commits since 6.168.3). Nothing on the
+  Rust migration beyond a PyO3 bump to 0.30.1; the conjecture changes are
+  provider-conformance strengthening, a weights-reuse bug in
+  `PrimitiveProvider.draw_integer`, a shrinker fix for invalid
+  considerations, and two generation tweaks (no wasted element draws in
+  unique collections, no "continue" draws in simplest probes). Issue #4740
+  is open with no activity since August; its roadmap still has DRMacIver's
+  June suggestion "add a hegel backend and see how much of the test suite
+  passes under it", which is what rounds one and two did. This series
+  rebases onto 6.170.9 with two mechanical conflicts (the PyO3 bump in
+  `Cargo.toml`/`Cargo.lock`, and the forced-draw hook against the new
+  `if/elif/else` in `ConjectureData._draw`), resolved in a scratch
+  worktree in ten lines.
+- What this changes for the question of these notes: the "shared engine
+  behind Hypothesis" idea now has a second path, Hegel's own Python API
+  with Hypothesis's tests as its conformance suite. The two differ exactly
+  where this series spent its effort: Hypothesis's strategy objects,
+  `@given`, the database and observability stay; the Hegel frontend
+  replaces them. The equivalence tests and the IR here are still the
+  only bridge that keeps Hypothesis's API on libhegel's engine.
+
 ## What the engine-level flag taught
 
 - **Faithful replay is the whole contract.** The first runner build shrank
