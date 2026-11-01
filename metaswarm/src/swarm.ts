@@ -1,9 +1,13 @@
-// The swarm: runs one loop per agent, routes tool calls, enforces roles and budgets.
+// The swarm: one loop per agent. Delivers posts and harness notices, runs tools,
+// enforces budgets, and lets the user pause agents or end the run.
 import type Anthropic from "@anthropic-ai/sdk";
-import { Bus, type Message, type Role } from "./bus.ts";
+import { Chat } from "./chat.ts";
 import type { Model } from "./model.ts";
-import { INPUTS, isToolName, ROLE_BRIEF, ROLE_TOOLS, type ToolName } from "./roles.ts";
+import { Denied, Perms, USER } from "./perms.ts";
 import type { Sandbox, SandboxFactory } from "./sandbox.ts";
+import type { Store } from "./store.ts";
+import { fmtPost, runTool, type World } from "./tools.ts";
+import type { Wiki } from "./wiki.ts";
 
 type Param = Anthropic.Beta.BetaMessageParam;
 type UserBlock = Anthropic.Beta.BetaTextBlockParam | Anthropic.Beta.BetaToolResultBlockParam;
@@ -11,122 +15,216 @@ type UserBlock = Anthropic.Beta.BetaTextBlockParam | Anthropic.Beta.BetaToolResu
 export interface Limits {
   maxAgents: number;
   maxCallsPerAgent: number;
-  idleNudges: number; // how many times to poke idle overseers before giving up
+  idleNudges: number;
 }
 
-class Agent {
+export interface AgentSpec {
+  id: string;
+  brief: string;
+  rights: { right: string; delegable?: boolean }[];
+}
+
+export class Agent {
   messages: Param[] = [];
-  cursor = 0;
-  announced: Role | null = null;
+  notices: string[] = [];
+  wakeCursor = 0;
   sandbox: Sandbox | null = null;
   status: "running" | "idle" | "stopped" = "running";
+  paused = false;
   calls = 0;
-  constructor(public id: string, public role: Role, public spawnedBy: string) {}
+  constructor(public id: string, public spawnedBy: string, public brief: string) {}
 }
 
-const COLORS = [36, 33, 35, 32, 34, 31];
-const ROLE_TAG: Record<Role, string> = { overseer: "OVR", worker: "WRK" };
+const COLORS = [36, 33, 35, 32, 34, 31, 96, 93];
 
-export class Swarm {
-  private agents = new Map<string, Agent>();
+export class Swarm implements World {
+  readonly agents = new Map<string, Agent>();
   private loops: Promise<void>[] = [];
   private waiters = new Set<() => void>();
-  private done = false;
+  done = false;
   summary: string | null = null;
 
   constructor(
-    private bus: Bus,
+    readonly store: Store,
+    readonly perms: Perms,
+    readonly chat: Chat,
+    readonly wiki: Wiki,
     private model: Model,
     private sandboxes: SandboxFactory,
-    private limits: Limits,
+    readonly limits: Limits,
   ) {
-    bus.onMessage(() => this.wakeAll());
+    store.on((e) => {
+      if (e.type === "post" || e.type === "notice") this.wakeAll();
+    });
+    wiki.onDecided = (p) => {
+      const votes = p.votes.map((v) => `${v.judge}: ${v.approve ? "yes" : "no"} (${v.reason})`).join("; ");
+      this.notify(p.author, `Your proposal #${p.id} for ${p.path} was ${p.status.toUpperCase()}. Votes: ${votes}`);
+    };
   }
 
-  // --- public ---------------------------------------------------------------
+  // --- run ------------------------------------------------------------------
 
-  async run(goal: string, overseer = "boss"): Promise<string> {
-    this.spawn(overseer, "overseer", "human", `The human's goal:\n\n${goal}`);
+  async run(initial: AgentSpec[]): Promise<string> {
+    for (const s of initial) this.spawn(USER, s.id, s.brief, s.rights);
     const watchdog = this.watchdog();
-    while (this.loops.length) {
-      // Loops can be added while we wait (spawn_worker), so drain repeatedly.
-      const pending = this.loops.splice(0);
-      await Promise.all(pending);
-    }
+    while (this.loops.length) await Promise.all(this.loops.splice(0));
     clearInterval(watchdog);
     await this.sandboxes.shutdown();
     return this.summary ?? "(run ended without a summary)";
   }
 
-  // --- agents ---------------------------------------------------------------
+  // --- World (used by tools) -----------------------------------------------
 
-  private spawn(id: string, role: Role, by: string, intro: string) {
-    const a = new Agent(id, role, by);
+  agentIds() {
+    return [...this.agents.keys()];
+  }
+
+  agentInfo() {
+    return [...this.agents.values()].map((a) => ({ id: a.id, status: a.paused ? "paused" : a.status, spawnedBy: a.spawnedBy, calls: a.calls }));
+  }
+
+  budget(id: string) {
+    return { used: this.agents.get(id)?.calls ?? 0, max: this.limits.maxCallsPerAgent };
+  }
+
+  spawn(by: string, id: string, brief: string, rights: { right: string; delegable?: boolean }[]) {
+    if (this.agents.has(id)) throw new Denied(`agent ${id} already exists`);
+    if (this.agents.size >= this.limits.maxAgents) throw new Denied(`agent limit (${this.limits.maxAgents}) reached`);
+    const a = new Agent(id, by, brief);
     this.agents.set(id, a);
-    this.log("harness", `spawned ${id} as ${role} (by ${by})`);
-    this.bus.event(id, "spawn", { role, by });
+    for (const r of rights) this.perms.grant(by, id, r.right, { delegable: r.delegable });
+    this.store.log(by, "spawn", { id, brief, rights });
+    this.log("harness", `spawned ${id} (by ${by}) with ${rights.map((r) => r.right + (r.delegable ? "+" : "")).join(", ") || "no rights"}`);
+    const intro = `Your agent id is "${id}". You were started by ${by}.\n\n<brief>\n${brief}\n</brief>`;
     this.loops.push(
-      this.loop(a, `Your agent id is "${id}". You were started by ${by}.\n\n${intro}`).catch((e) => {
+      this.loop(a, intro).catch((e) => {
         a.status = "stopped";
         this.log(id, `crashed: ${e instanceof Error ? e.message : e}`);
-        this.bus.event(id, "crash", String(e));
-        this.bus.send("harness", "@overseer", "note", `${id} crashed and was stopped: ${e}`);
+        this.store.log(id, "crash", String(e));
       }),
     );
   }
 
+  notify(agent: string, text: string) {
+    const a = this.agents.get(agent);
+    if (!a) return;
+    a.notices.push(text);
+    this.store.log("harness", "notice", { agent, text });
+  }
+
+  async sandbox(agent: string): Promise<Sandbox> {
+    const a = this.agents.get(agent)!;
+    a.sandbox ??= await this.sandboxes.create(agent);
+    return a.sandbox;
+  }
+
+  async dropSandbox(agent: string) {
+    const a = this.agents.get(agent);
+    if (a?.sandbox) {
+      await a.sandbox.destroy();
+      a.sandbox = null;
+    }
+  }
+
+  finish(by: string, summary: string) {
+    this.log(by, `finished: ${summary}`);
+    this.store.log(by, "finish", { summary });
+    this.summary = summary;
+    this.done = true;
+    this.wakeAll();
+  }
+
+  setPaused(agent: string, paused: boolean) {
+    const a = this.agents.get(agent);
+    if (!a) throw new Denied(`no agent ${agent}`);
+    a.paused = paused;
+    this.store.log(USER, paused ? "pause" : "resume", { agent });
+    this.wakeAll();
+  }
+
+  // --- agent loop -----------------------------------------------------------
+
   private async loop(a: Agent, intro: string) {
     let pending: UserBlock[] = [{ type: "text", text: intro }];
+    a.wakeCursor = this.chat.lastPostId();
     while (!this.done) {
-      const inbox = this.bus.inbox(a.id, a.role, a.cursor);
-      if (inbox.length) {
-        a.cursor = inbox.at(-1)!.id;
-        pending.push({ type: "text", text: inbox.map(formatMessage).join("\n") });
-      }
-      if (!pending.length) {
+      if (a.paused) {
         a.status = "idle";
-        await this.waitForMail(a);
+        await this.waitFor(() => !a.paused);
+        continue;
+      }
+      const posts = this.chat.wakeups(a.id, a.wakeCursor);
+      if (posts.length) {
+        a.wakeCursor = posts.at(-1)!.id;
+        pending.push({ type: "text", text: this.deliver(a, posts) });
+      }
+      const notices = a.notices.splice(0);
+      if (!pending.length && !notices.length) {
+        a.status = "idle";
+        await this.waitFor(() => a.notices.length > 0 || this.chat.wakeups(a.id, a.wakeCursor).length > 0);
         a.status = "running";
         continue;
       }
-
       if (a.calls >= this.limits.maxCallsPerAgent) {
         a.status = "stopped";
         this.log(a.id, "budget exhausted, stopping");
-        this.bus.send("harness", "@overseer", "note", `${a.id} ran out of model calls and was stopped.`);
+        this.store.log(a.id, "budget", {});
         return;
       }
 
+      // A user turn must come first; notices then follow as a system message,
+      // the channel that only the harness can write to.
+      if (!pending.length) pending.push({ type: "text", text: "(harness notice below)" });
       a.messages.push({ role: "user", content: pending });
+      if (notices.length) a.messages.push({ role: "system", content: notices.map((n) => `- ${n}`).join("\n") });
       pending = [];
-      // Role announcements go in a system message: the harness's own channel,
-      // which peers cannot forge by writing text in a <message>.
-      if (a.announced !== a.role) {
-        a.messages.push({ role: "system", content: roleAnnouncement(a.role) });
-        a.announced = a.role;
-      }
 
       a.calls++;
       const turn = await this.model.next(a.id, a.messages);
       a.messages.push({ role: "assistant", content: turn.content });
-      this.bus.event(a.id, "turn", { stop_reason: turn.stop_reason, content: turn.content });
-
+      this.store.log(a.id, "turn", { stop_reason: turn.stop_reason, content: turn.content });
       for (const b of turn.content) if (b.type === "text" && b.text.trim()) this.log(a.id, b.text.trim());
       if (turn.stop_reason === "refusal") this.log(a.id, "(model declined this turn)");
 
       const uses = turn.content.filter((b): b is Anthropic.Beta.BetaToolUseBlock => b.type === "tool_use");
       if (uses.length && turn.stop_reason === "tool_use") {
-        // All results go back in one user message, as the API expects.
-        pending = await Promise.all(uses.map((u) => this.runTool(a, u)));
+        // Run in order: tools in one turn often depend on each other (create, then invite).
+        for (const u of uses) pending.push(await this.tool(a, u));
       }
     }
     a.status = "stopped";
   }
 
-  private waitForMail(a: Agent): Promise<void> {
+  private deliver(a: Agent, posts: ReturnType<Chat["wakeups"]>): string {
+    const byChannel = new Map<string, typeof posts>();
+    for (const p of posts) byChannel.set(p.channel, [...(byChannel.get(p.channel) ?? []), p]);
+    const parts: string[] = [];
+    for (const [cid, ps] of byChannel) {
+      const c = this.chat.channel(cid);
+      parts.push(`New in channel ${cid} "${c.topic}":\n${ps.slice(-10).map(fmtPost).join("\n")}`);
+      this.chat.read(a.id, cid, { limit: 1 }); // advance the read cursor
+    }
+    return parts.join("\n\n");
+  }
+
+  private async tool(a: Agent, u: Anthropic.Beta.BetaToolUseBlock): Promise<Anthropic.Beta.BetaToolResultBlockParam> {
+    try {
+      const out = await runTool(this, a.id, u.name, u.input);
+      this.log(a.id, `${u.name} ${short(u.input)} → ${short(out)}`);
+      this.store.log(a.id, "tool", { tool: u.name, input: u.input, output: out });
+      return { type: "tool_result", tool_use_id: u.id, content: out };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log(a.id, `✗ ${u.name} ${short(u.input)}: ${msg}`);
+      this.store.log(a.id, "tool_error", { tool: u.name, input: u.input, error: msg, denied: e instanceof Denied });
+      return { type: "tool_result", tool_use_id: u.id, is_error: true, content: msg };
+    }
+  }
+
+  private waitFor(cond: () => boolean): Promise<void> {
     return new Promise((resolve) => {
       const check = () => {
-        if (this.done || this.bus.inbox(a.id, a.role, a.cursor).length) {
+        if (this.done || cond()) {
           this.waiters.delete(check);
           resolve();
         }
@@ -140,134 +238,38 @@ export class Swarm {
     for (const w of [...this.waiters]) w();
   }
 
-  /** If everyone is idle with no mail, poke the overseers; give up after a few pokes. */
+  /** When nothing is happening, nudge whoever can finish; then give up. */
   private watchdog() {
-    let quietTicks = 0;
+    let quiet = 0;
     let nudges = 0;
     return setInterval(() => {
-      const live = [...this.agents.values()].filter((a) => a.status !== "stopped");
-      const stalled = live.every((a) => a.status === "idle" && !this.bus.inbox(a.id, a.role, a.cursor).length);
-      if (!stalled) return void (quietTicks = 0);
-      if (++quietTicks < 3) return;
-      quietTicks = 0;
-      if (++nudges > this.limits.idleNudges || !live.some((a) => a.role === "overseer")) {
-        this.log("harness", "swarm is stalled, ending run");
-        this.end("Run ended by the watchdog: every agent went idle.");
+      if (this.done) return;
+      const all = [...this.agents.values()].filter((a) => a.status !== "stopped");
+      if (all.some((a) => a.paused)) return void (quiet = 0); // the user is inspecting: don't end the run under them
+      const live = all;
+      const busy = live.some((a) => a.status === "running") || this.wiki.pendingVotes() > 0;
+      if (busy) return void (quiet = 0);
+      if (++quiet < 3) return;
+      quiet = 0;
+      const finishers = live.filter((a) => this.perms.can(a.id, "run:finish"));
+      if (++nudges > this.limits.idleNudges || !finishers.length) {
+        this.log("harness", "everyone is idle, ending run");
+        this.finish("harness", this.summary ?? "Run ended by the watchdog: every agent went idle.");
         return;
       }
-      this.bus.send("harness", "@overseer", "note", "Every agent is idle and no messages are pending. Call finish if the goal is met, or assign more work.");
+      for (const f of finishers) this.notify(f.id, "Every agent is idle. Call finish if the goal is met, or get things moving again.");
     }, 1000);
   }
 
-  private end(summary: string) {
-    this.done = true;
-    this.summary ??= summary;
-    this.wakeAll();
-  }
-
-  // --- tools ----------------------------------------------------------------
-
-  private async runTool(a: Agent, use: Anthropic.Beta.BetaToolUseBlock): Promise<Anthropic.Beta.BetaToolResultBlockParam> {
-    const fail = (msg: string) => {
-      this.log(a.id, `✗ ${use.name}: ${msg}`);
-      this.bus.event(a.id, "tool_error", { tool: use.name, input: use.input, error: msg });
-      return { type: "tool_result" as const, tool_use_id: use.id, is_error: true, content: msg };
-    };
-    if (!isToolName(use.name)) return fail(`unknown tool ${use.name}`);
-    if (!ROLE_TOOLS[a.role].has(use.name)) {
-      return fail(`${use.name} is not allowed for role ${a.role}. Allowed: ${[...ROLE_TOOLS[a.role]].join(", ")}`);
-    }
-    const parsed = INPUTS[use.name].safeParse(use.input);
-    if (!parsed.success) return fail(`invalid input: ${parsed.error.message}`);
-
-    try {
-      const out = await this.tool(a, use.name, parsed.data);
-      this.bus.event(a.id, "tool", { tool: use.name, input: use.input, output: out });
-      return { type: "tool_result", tool_use_id: use.id, content: out };
-    } catch (e) {
-      return fail(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  private async tool(a: Agent, name: ToolName, input: any): Promise<string> {
-    switch (name) {
-      case "send_message": {
-        const { to, kind, body } = input as { to: string; kind: string; body: string };
-        if (!["*", "@overseer", "@worker"].includes(to) && !this.agents.has(to)) throw new Error(`no agent named ${to}`);
-        const m = this.bus.send(a.id, to, kind, body);
-        this.log(a.id, `→ ${to} [${kind}] ${body}`);
-        return `sent (#${m.id})`;
-      }
-      case "request_role": {
-        const { role, reason } = input as { role: Role; reason: string };
-        if (role === a.role) throw new Error(`you already are a ${role}`);
-        this.bus.send(a.id, "@overseer", "role_request", `${a.id} asks to become ${role}: ${reason}`);
-        this.log(a.id, `asks to become ${role}`);
-        return "request sent to the overseers; wait for a role announcement";
-      }
-      case "spawn_worker": {
-        const { id, task } = input as { id: string; task: string };
-        if (this.agents.has(id)) throw new Error(`agent ${id} already exists`);
-        if (this.agents.size >= this.limits.maxAgents) throw new Error(`agent limit (${this.limits.maxAgents}) reached`);
-        this.spawn(id, "worker", a.id, "Your task will arrive as a message.");
-        this.bus.send(a.id, id, "task", task);
-        this.log(a.id, `→ ${id} [task] ${task}`);
-        return `spawned ${id}`;
-      }
-      case "set_role": {
-        const { agent, role } = input as { agent: string; role: Role };
-        const t = this.agents.get(agent);
-        if (!t || t.status === "stopped") throw new Error(`no live agent named ${agent}`);
-        if (t.role === role) return `${agent} already is a ${role}`;
-        const overseers = [...this.agents.values()].filter((x) => x.role === "overseer" && x.status !== "stopped");
-        if (t.role === "overseer" && overseers.length === 1) throw new Error("cannot demote the last overseer");
-        t.role = role;
-        // Overseers have no sandbox. A demoted agent gets a fresh one on its next bash call.
-        if (role === "overseer" && t.sandbox) {
-          await t.sandbox.destroy();
-          t.sandbox = null;
-        }
-        this.log("harness", `${agent} is now ${role} (set by ${a.id})`);
-        this.bus.send("harness", agent, "role_change", `${a.id} changed your role to ${role}.`);
-        return `${agent} is now a ${role}`;
-      }
-      case "finish": {
-        const { summary } = input as { summary: string };
-        this.log(a.id, `finished: ${summary}`);
-        this.summary = summary;
-        this.end(summary);
-        return "run finished";
-      }
-      case "bash": {
-        const { command } = input as { command: string };
-        a.sandbox ??= await this.sandboxes.create(a.id);
-        this.log(a.id, `$ ${command}`);
-        const r = await a.sandbox.exec(command);
-        const out = [`exit ${r.code}${r.timedOut ? " (timed out)" : ""}`, r.stdout && `stdout:\n${r.stdout}`, r.stderr && `stderr:\n${r.stderr}`]
-          .filter(Boolean)
-          .join("\n");
-        this.log(a.id, out.split("\n").map((l) => "  " + l).join("\n"));
-        return out;
-      }
-    }
-  }
-
-  // --- output ---------------------------------------------------------------
-
-  private log(who: string, text: string) {
-    const a = this.agents.get(who);
-    const idx = a ? [...this.agents.keys()].indexOf(who) : -1;
+  log(who: string, text: string) {
+    const idx = [...this.agents.keys()].indexOf(who);
     const color = idx >= 0 ? COLORS[idx % COLORS.length] : 90;
-    const tag = a ? ` ${ROLE_TAG[a.role]}` : "";
-    console.log(`\x1b[${color}m[${who}${tag}]\x1b[0m ${text}`);
+    console.log(`\x1b[${color}m[${who}]\x1b[0m ${text}`);
   }
 }
 
-function roleAnnouncement(role: Role): string {
-  return `Your role is now ${role.toUpperCase()}. ${ROLE_BRIEF[role]} Tools you may use: ${[...ROLE_TOOLS[role]].join(", ")}.`;
-}
-
-function formatMessage(m: Message): string {
-  const esc = (s: string) => s.replaceAll("</message>", "<\\/message>");
-  return `<message id="${m.id}" from="${m.from}" kind="${m.kind}" to="${m.to}">\n${esc(m.body)}\n</message>`;
+function short(v: unknown): string {
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  const one = s.replace(/\s+/g, " ");
+  return one.length > 140 ? one.slice(0, 140) + "…" : one;
 }
