@@ -8,6 +8,7 @@ import { Perms, USER } from "./perms.ts";
 import type { SandboxFactory } from "./sandbox.ts";
 import { Store } from "./store.ts";
 import { Swarm, type Limits } from "./swarm.ts";
+import { coreTools, ToolRegistry, type ToolProvider } from "./tools.ts";
 import type { Judge } from "./vote.ts";
 import { Wiki } from "./wiki.ts";
 
@@ -17,6 +18,8 @@ export interface RunOptions {
   judges: Judge[];
   sandboxes: SandboxFactory;
   limits?: Partial<Limits>;
+  /** Extra tool providers, after the core tools. */
+  providers?: ToolProvider[];
   /** Called once everything is set up, before agents start (e.g. to start the viewer). */
   onReady?: (s: Swarm) => void;
 }
@@ -30,7 +33,10 @@ export async function setup(demo: Demo, o: RunOptions): Promise<{ swarm: Swarm; 
   await wiki.init(demo.seed, demo.locked);
 
   const limits: Limits = { maxAgents: 8, maxCallsPerAgent: 30, idleNudges: 2, ...o.limits };
-  const swarm = new Swarm(store, perms, chat, wiki, o.model, o.sandboxes, limits);
+  const registry = new ToolRegistry([coreTools, ...(o.providers ?? [])]);
+  const runId = o.dir.split("/").filter(Boolean).pop()!;
+  const swarm = new Swarm(store, perms, chat, wiki, o.model, o.sandboxes, limits, registry, runId, o.dir);
+  await registry.init(swarm);
 
   const ids: Record<string, string> = {};
   for (const c of demo.channels) ids[c.name] = chat.create(USER, c.topic, c.visibility).id;

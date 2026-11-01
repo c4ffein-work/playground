@@ -8,8 +8,14 @@ export interface ExecResult {
   timedOut: boolean;
 }
 
+export interface ExecOptions {
+  timeoutS?: number; // default 30
+  stdin?: string;
+  signal?: AbortSignal;
+}
+
 export interface Sandbox {
-  exec(command: string, timeoutS?: number): Promise<ExecResult>;
+  exec(command: string, opts?: ExecOptions): Promise<ExecResult>;
   destroy(): Promise<void>;
 }
 
@@ -21,19 +27,26 @@ export interface SandboxFactory {
 
 const MAX_OUTPUT = 8_000;
 
-async function run(args: string[], timeoutMs = 60_000): Promise<ExecResult> {
-  const proc = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe" });
+async function run(args: string[], timeoutMs = 60_000, opts: { stdin?: string; signal?: AbortSignal } = {}): Promise<ExecResult> {
+  const proc = Bun.spawn(["docker", ...args], { stdout: "pipe", stderr: "pipe", stdin: opts.stdin !== undefined ? "pipe" : "ignore" });
+  if (opts.stdin !== undefined && proc.stdin) {
+    proc.stdin.write(opts.stdin);
+    proc.stdin.end();
+  }
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     proc.kill("SIGKILL");
   }, timeoutMs);
+  const onAbort = () => proc.kill("SIGKILL");
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
   clearTimeout(timer);
+  opts.signal?.removeEventListener("abort", onAbort);
   return { code, stdout, stderr, timedOut };
 }
 
@@ -104,12 +117,16 @@ export class DockerSandboxes implements SandboxFactory {
 class DockerSandbox implements Sandbox {
   constructor(private name: string, private onDestroy: () => void) {}
 
-  async exec(command: string, timeoutS = 30): Promise<ExecResult> {
+  async exec(command: string, opts: ExecOptions = {}): Promise<ExecResult> {
+    const timeoutS = opts.timeoutS ?? 30;
+    if (opts.signal?.aborted) return { code: 130, stdout: "", stderr: "interrupted", timedOut: false };
     // `timeout` inside the container kills the command itself; the outer
-    // timer is a backstop in case docker exec hangs.
+    // timer is a backstop in case docker exec hangs. Aborting kills the
+    // docker exec client; `timeout` still bounds the command inside.
     const r = await run(
-      ["exec", "-w", "/workspace", this.name, "timeout", "-s", "KILL", String(timeoutS), "sh", "-c", command],
+      ["exec", ...(opts.stdin !== undefined ? ["-i"] : []), "-w", "/workspace", this.name, "timeout", "-s", "KILL", String(timeoutS), "sh", "-c", command],
       (timeoutS + 10) * 1000,
+      { stdin: opts.stdin, signal: opts.signal },
     );
     return { ...r, timedOut: r.timedOut || r.code === 137, stdout: clip(r.stdout), stderr: clip(r.stderr) };
   }

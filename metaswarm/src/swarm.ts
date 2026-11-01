@@ -6,7 +6,7 @@ import type { Model } from "./model.ts";
 import { Denied, Perms, USER } from "./perms.ts";
 import type { Sandbox, SandboxFactory } from "./sandbox.ts";
 import type { Store } from "./store.ts";
-import { fmtPost, runTool, type World } from "./tools.ts";
+import { fmtPost, type ToolRegistry, type World } from "./tools.ts";
 import type { Wiki } from "./wiki.ts";
 
 type Param = Anthropic.Beta.BetaMessageParam;
@@ -32,6 +32,8 @@ export class Agent {
   status: "running" | "idle" | "stopped" = "running";
   paused = false;
   calls = 0;
+  /** Aborts the current model call or tool when the user interrupts. */
+  abort = new AbortController();
   constructor(public id: string, public spawnedBy: string, public brief: string) {}
 }
 
@@ -52,6 +54,9 @@ export class Swarm implements World {
     private model: Model,
     private sandboxes: SandboxFactory,
     readonly limits: Limits,
+    readonly registry: ToolRegistry,
+    readonly runId: string,
+    readonly dir: string,
   ) {
     store.on((e) => {
       if (e.type === "post" || e.type === "notice") this.wakeAll();
@@ -69,6 +74,7 @@ export class Swarm implements World {
     const watchdog = this.watchdog();
     while (this.loops.length) await Promise.all(this.loops.splice(0));
     clearInterval(watchdog);
+    await this.registry.shutdown();
     await this.sandboxes.shutdown();
     return this.summary ?? "(run ended without a summary)";
   }
@@ -180,7 +186,7 @@ export class Swarm implements World {
       pending = [];
 
       a.calls++;
-      const turn = await this.model.next(a.id, a.messages);
+      const turn = await this.model.next(a.id, a.messages, { system: this.registry.systemPrompt(), tools: this.registry.tools(), signal: a.abort.signal });
       a.messages.push({ role: "assistant", content: turn.content });
       this.store.log(a.id, "turn", { stop_reason: turn.stop_reason, content: turn.content });
       for (const b of turn.content) if (b.type === "text" && b.text.trim()) this.log(a.id, b.text.trim());
@@ -209,7 +215,7 @@ export class Swarm implements World {
 
   private async tool(a: Agent, u: Anthropic.Beta.BetaToolUseBlock): Promise<Anthropic.Beta.BetaToolResultBlockParam> {
     try {
-      const out = await runTool(this, a.id, u.name, u.input);
+      const out = await this.registry.run({ world: this, agent: a.id, signal: a.abort.signal }, u.name, u.input);
       this.log(a.id, `${u.name} ${short(u.input)} → ${short(out)}`);
       this.store.log(a.id, "tool", { tool: u.name, input: u.input, output: out });
       return { type: "tool_result", tool_use_id: u.id, content: out };

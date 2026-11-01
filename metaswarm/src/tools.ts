@@ -3,7 +3,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import type { Chat, Notify } from "./chat.ts";
-import { Denied, type Perms } from "./perms.ts";
+import { covers, Denied, type Perms } from "./perms.ts";
 import type { Sandbox } from "./sandbox.ts";
 import type { Wiki } from "./wiki.ts";
 
@@ -71,10 +71,94 @@ const DEFS = {
 export type ToolName = keyof typeof DEFS;
 export const isToolName = (n: string): n is ToolName => n in DEFS;
 
-export const TOOLS: Anthropic.Beta.BetaTool[] = Object.entries(DEFS).map(([name, [description, schema]]) => {
-  const { $schema, ...input_schema } = z.toJSONSchema(schema) as Record<string, unknown>;
-  return { name, description, input_schema: input_schema as Anthropic.Beta.BetaTool.InputSchema };
-});
+// --- providers ----------------------------------------------------------------
+//
+// Tools come from providers: the core set below, plus file tools, MCP servers,
+// skills, web access... The full list is fixed once the run starts, so every
+// agent sees the same tools (and the prompt prefix stays cacheable).
+
+export interface ToolContext {
+  world: World;
+  agent: string;
+  /** Aborted when the user interrupts the agent. */
+  signal: AbortSignal;
+}
+
+export interface ToolProvider {
+  id: string;
+  /** Called once before agents start (connect to servers, scan folders...). */
+  init?(world: World): Promise<void>;
+  /** Tool definitions. Read after init. */
+  tools(): Anthropic.Beta.BetaTool[];
+  /** Extra text for the system prompt, after init. */
+  prompt?(): string;
+  run(ctx: ToolContext, name: string, input: unknown): Promise<string>;
+  shutdown?(): Promise<void>;
+}
+
+type Defs = Record<string, readonly [string, z.ZodObject]>;
+
+/** Turn `{ name: [description, zodSchema] }` into API tool definitions. */
+export function toolDefs(defs: Defs): Anthropic.Beta.BetaTool[] {
+  return Object.entries(defs).map(([name, [description, schema]]) => {
+    const { $schema, ...input_schema } = z.toJSONSchema(schema) as Record<string, unknown>;
+    return { name, description, input_schema: input_schema as Anthropic.Beta.BetaTool.InputSchema };
+  });
+}
+
+/** Validate input against a provider's schema; throws Denied with the zod message. */
+export function parseInput<D extends Defs, N extends keyof D & string>(defs: D, name: N, raw: unknown): z.infer<D[N][1]> {
+  const parsed = defs[name]![1].safeParse(raw);
+  if (!parsed.success) throw new Denied(`invalid input: ${parsed.error.message}`);
+  return parsed.data as z.infer<D[N][1]>;
+}
+
+export const TOOLS = toolDefs(DEFS);
+
+export const coreTools: ToolProvider = {
+  id: "core",
+  tools: () => TOOLS,
+  run: (ctx, name, input) => runTool(ctx, name, input),
+};
+
+export class ToolRegistry {
+  private owner = new Map<string, ToolProvider>();
+  private list: Anthropic.Beta.BetaTool[] = [];
+  private system = SYSTEM_PROMPT;
+
+  constructor(readonly providers: ToolProvider[]) {}
+
+  async init(world: World) {
+    for (const p of this.providers) await p.init?.(world);
+    for (const p of this.providers) {
+      for (const t of p.tools()) {
+        if (this.owner.has(t.name)) throw new Error(`tool ${t.name} defined twice (${this.owner.get(t.name)!.id}, ${p.id})`);
+        this.owner.set(t.name, p);
+        this.list.push(t);
+      }
+    }
+    const extra = this.providers.map((p) => p.prompt?.()).filter(Boolean);
+    this.system = [SYSTEM_PROMPT, ...extra].join("\n\n");
+  }
+
+  tools() {
+    return this.list;
+  }
+
+  systemPrompt() {
+    return this.system;
+  }
+
+  run(ctx: ToolContext, name: string, input: unknown): Promise<string> {
+    const p = this.owner.get(name);
+    if (!p) throw new Denied(`unknown tool ${name}`);
+    return p.run(ctx, name, input);
+  }
+
+  async shutdown() {
+    for (const p of this.providers) await p.shutdown?.().catch(() => {});
+  }
+}
 
 // --- handlers ---------------------------------------------------------------
 
@@ -88,6 +172,9 @@ export interface World {
   budget(agent: string): { used: number; max: number };
   spawn(by: string, id: string, brief: string, rights: { right: string; delegable?: boolean }[]): void;
   notify(agent: string, text: string): void;
+  readonly runId: string;
+  /** Run directory on the host (db, vault). */
+  readonly dir: string;
   sandbox(agent: string): Promise<Sandbox>;
   dropSandbox(agent: string): Promise<void>;
   finish(by: string, summary: string): void;
@@ -97,11 +184,10 @@ const fmtPost = (p: { id: number; thread: number | null; author: string; body: s
   `<post id="${p.id}"${p.thread ? ` thread="${p.thread}"` : ""} from="${p.author}"${p.kind !== "post" ? ` kind="${p.kind}"` : ""} ts="${p.ts.slice(11, 19)}">\n${p.body.replaceAll("</post>", "<\\/post>")}\n</post>`;
 export { fmtPost };
 
-export async function runTool(w: World, agent: string, name: string, raw: unknown): Promise<string> {
+async function runTool(ctx: ToolContext, name: string, raw: unknown): Promise<string> {
+  const { world: w, agent } = ctx;
   if (!isToolName(name)) throw new Denied(`unknown tool ${name}`);
-  const parsed = DEFS[name][1].safeParse(raw);
-  if (!parsed.success) throw new Denied(`invalid input: ${parsed.error.message}`);
-  const input = parsed.data as any;
+  const input = parseInput(DEFS, name, raw) as any;
   const { perms, chat, wiki } = w;
 
   switch (name) {
@@ -196,7 +282,7 @@ export async function runTool(w: World, agent: string, name: string, raw: unknow
     case "bash": {
       perms.check(agent, "bash");
       const sb = await w.sandbox(agent);
-      const r = await sb.exec(input.command);
+      const r = await sb.exec(input.command, { signal: ctx.signal });
       return [`exit ${r.code}${r.timedOut ? " (timed out)" : ""}`, r.stdout && `stdout:\n${r.stdout}`, r.stderr && `stderr:\n${r.stderr}`].filter(Boolean).join("\n");
     }
     case "finish":
@@ -206,4 +292,3 @@ export async function runTool(w: World, agent: string, name: string, raw: unknow
   }
 }
 
-import { covers } from "./perms.ts";

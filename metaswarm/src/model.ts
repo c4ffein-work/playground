@@ -1,7 +1,6 @@
 // Model backends. ClaudeModel calls the API; ScriptedModel plays back a demo
 // script so the harness runs and can be tested with no API key.
 import Anthropic from "@anthropic-ai/sdk";
-import { SYSTEM_PROMPT, TOOLS } from "./tools.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type Msgs = Anthropic.Beta.BetaMessageParam[];
@@ -9,8 +8,13 @@ export interface Turn {
   content: Block[];
   stop_reason: string | null;
 }
+export interface ModelRequest {
+  system: string;
+  tools: Anthropic.Beta.BetaTool[];
+  signal?: AbortSignal;
+}
 export interface Model {
-  next(agent: string, messages: Msgs): Promise<Turn>;
+  next(agent: string, messages: Msgs, req: ModelRequest): Promise<Turn>;
 }
 
 export class ClaudeModel implements Model {
@@ -20,12 +24,12 @@ export class ClaudeModel implements Model {
     private effort: "low" | "medium" | "high" | "xhigh" | "max" = "medium",
   ) {}
 
-  async next(_agent: string, messages: Msgs): Promise<Turn> {
+  async next(_agent: string, messages: Msgs, req: ModelRequest): Promise<Turn> {
     const res = await this.client.beta.messages.create({
       model: this.model,
       max_tokens: 16000,
-      system: SYSTEM_PROMPT,
-      tools: TOOLS,
+      system: req.system,
+      tools: req.tools,
       messages,
       thinking: { type: "adaptive" },
       output_config: { effort: this.effort },
@@ -34,7 +38,7 @@ export class ClaudeModel implements Model {
       // fallback model inside the same call.
       betas: ["server-side-fallback-2026-07-01"],
       fallbacks: "default",
-    });
+    }, { signal: req.signal });
     return { content: res.content, stop_reason: res.stop_reason };
   }
 }
@@ -86,7 +90,7 @@ export class ScriptedModel implements Model {
   private done = new Map<string, Set<number>>();
   constructor(private script: Script, private delayMs = 120) {}
 
-  async next(agent: string, messages: Msgs): Promise<Turn> {
+  async next(agent: string, messages: Msgs, _req?: ModelRequest): Promise<Turn> {
     await Bun.sleep(this.delayMs);
     const ctx = ctxOf(messages);
     const done = this.done.get(agent) ?? new Set<number>();
