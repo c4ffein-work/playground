@@ -24,7 +24,7 @@ How turns work:
 // --- definitions ------------------------------------------------------------
 
 const notify = z.enum(["all", "mentions"]);
-const right = z.object({ right: z.string(), delegable: z.boolean().optional() });
+const right = z.object({ right: z.string(), delegable: z.boolean().optional(), ask: z.boolean().optional() });
 
 const DEFS = {
   whoami: ["Show your id, your rights (with grant ids) and your budget.", z.object({})],
@@ -34,8 +34,8 @@ const DEFS = {
     z.object({ id: z.string().regex(/^[a-z][a-z0-9_-]{0,31}$/), brief: z.string(), rights: z.array(right) }),
   ],
   grant: [
-    "Give another agent a right you hold as delegable. Optional ttl_s makes it expire.",
-    z.object({ agent: z.string(), right: z.string(), delegable: z.boolean().optional(), ttl_s: z.number().int().positive().optional() }),
+    "Give another agent a right you hold as delegable. Optional ttl_s makes it expire; ask=true makes every use need the user's approval.",
+    z.object({ agent: z.string(), right: z.string(), delegable: z.boolean().optional(), ask: z.boolean().optional(), ttl_s: z.number().int().positive().optional() }),
   ],
   revoke: ["Revoke a grant you made (or one made from it), with everything granted from it.", z.object({ grant_id: z.number().int() })],
   list_channels: ["List channels you can see, with unread counts.", z.object({})],
@@ -65,6 +65,10 @@ const DEFS = {
     z.object({ path: z.string(), content: z.string(), reason: z.string() }),
   ],
   bash: ["Run a shell command in your container (Alpine, no network, 30s limit). Needs: bash.", z.object({ command: z.string().min(1) })],
+  read_output: [
+    "Read more of a long tool output that was truncated and saved.",
+    z.object({ id: z.number().int(), offset: z.number().int().min(0).optional(), limit: z.number().int().positive().optional() }),
+  ],
   finish: ["End the whole run with a summary for the human. Needs: run:finish.", z.object({ summary: z.string() })],
 } as const satisfies Record<string, readonly [string, z.ZodObject]>;
 
@@ -94,6 +98,8 @@ export interface ToolProvider {
   prompt?(): string;
   run(ctx: ToolContext, name: string, input: unknown): Promise<string>;
   shutdown?(): Promise<void>;
+  /** Extra fields for the viewer's state, e.g. { skills: [...] }. */
+  describe?(): Record<string, unknown>;
 }
 
 type Defs = Record<string, readonly [string, z.ZodObject]>;
@@ -170,7 +176,8 @@ export interface World {
   agentIds(): string[];
   agentInfo(): { id: string; status: string; spawnedBy: string; calls: number }[];
   budget(agent: string): { used: number; max: number };
-  spawn(by: string, id: string, brief: string, rights: { right: string; delegable?: boolean }[]): void;
+  spawn(by: string, id: string, brief: string, rights: { right: string; delegable?: boolean; ask?: boolean }[]): void;
+  readOutput(agent: string, id: number, offset: number, limit: number): Promise<string>;
   notify(agent: string, text: string): void;
   readonly runId: string;
   /** Run directory on the host (db, vault). */
@@ -193,7 +200,7 @@ async function runTool(ctx: ToolContext, name: string, raw: unknown): Promise<st
   switch (name) {
     case "whoami": {
       const b = w.budget(agent);
-      const rights = perms.held(agent).map((g) => `#${g.id} ${g.right}${g.delegable ? " (delegable)" : ""}${g.expiresAt ? ` until ${g.expiresAt}` : ""} from ${g.grantedBy}`);
+      const rights = perms.held(agent).map((g) => `#${g.id} ${g.right}${g.delegable ? " (delegable)" : ""}${g.ask ? " (ask)" : ""}${g.expiresAt ? ` until ${g.expiresAt}` : ""} from ${g.grantedBy}`);
       return `id: ${agent}\nmodel calls: ${b.used}/${b.max}\nrights:\n${rights.join("\n") || "(none)"}`;
     }
     case "list_agents":
@@ -212,15 +219,15 @@ async function runTool(ctx: ToolContext, name: string, raw: unknown): Promise<st
     }
     case "grant": {
       if (!w.agentIds().includes(input.agent)) throw new Denied(`no agent ${input.agent}`);
-      const g = perms.grant(agent, input.agent, input.right, { delegable: input.delegable, ttlS: input.ttl_s });
-      w.notify(input.agent, `${agent} granted you "${g.right}"${g.delegable ? " (delegable)" : ""} as grant #${g.id}${g.expiresAt ? `, until ${g.expiresAt}` : ""}.`);
+      const g = perms.grant(agent, input.agent, input.right, { delegable: input.delegable, ask: input.ask, ttlS: input.ttl_s });
+      w.notify(input.agent, `${agent} granted you "${g.right}"${g.delegable ? " (delegable)" : ""}${g.ask ? " (each use needs the user's approval)" : ""} as grant #${g.id}${g.expiresAt ? `, until ${g.expiresAt}` : ""}.`);
       return `granted #${g.id}`;
     }
     case "revoke": {
       const ids = perms.revoke(agent, input.grant_id);
       for (const s of perms.subjectsOf(ids)) {
         w.notify(s, `${agent} revoked grant(s) ${ids.map((i) => "#" + i).join(", ")}. Check whoami.`);
-        if (!perms.can(s, "bash")) await w.dropSandbox(s);
+        if (!perms.holds(s, "bash")) await w.dropSandbox(s);
       }
       return `revoked ${ids.map((i) => "#" + i).join(", ")}`;
     }
@@ -285,6 +292,8 @@ async function runTool(ctx: ToolContext, name: string, raw: unknown): Promise<st
       const r = await sb.exec(input.command, { signal: ctx.signal });
       return [`exit ${r.code}${r.timedOut ? " (timed out)" : ""}`, r.stdout && `stdout:\n${r.stdout}`, r.stderr && `stderr:\n${r.stderr}`].filter(Boolean).join("\n");
     }
+    case "read_output":
+      return w.readOutput(agent, input.id, input.offset ?? 0, input.limit ?? 20_000);
     case "finish":
       perms.check(agent, "run:finish");
       w.finish(agent, input.summary);

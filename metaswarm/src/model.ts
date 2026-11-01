@@ -7,6 +7,7 @@ type Msgs = Anthropic.Beta.BetaMessageParam[];
 export interface Turn {
   content: Block[];
   stop_reason: string | null;
+  usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number | null; cache_creation_input_tokens?: number | null };
 }
 export interface ModelRequest {
   system: string;
@@ -34,12 +35,15 @@ export class ClaudeModel implements Model {
       thinking: { type: "adaptive" },
       output_config: { effort: this.effort },
       cache_control: { type: "ephemeral" },
+      // Long runs: the API summarizes old context itself and returns a
+      // compaction block, which we keep in the transcript like any content.
+      context_management: { edits: [{ type: "compact_20260112" }] },
       // If a safety classifier declines, the API retries on a recommended
       // fallback model inside the same call.
-      betas: ["server-side-fallback-2026-07-01"],
+      betas: ["server-side-fallback-2026-07-01", "compact-2026-01-12"],
       fallbacks: "default",
     }, { signal: req.signal });
-    return { content: res.content, stop_reason: res.stop_reason };
+    return { content: res.content, stop_reason: res.stop_reason, usage: res.usage };
   }
 }
 

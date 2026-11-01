@@ -12,9 +12,13 @@ export function serve(s: Swarm, runId: string, mode: string, port = 7777) {
   const state = () => ({
     run: { id: runId, done: s.done, summary: s.summary, mode },
     agents: [...s.agents.values()].map((a) => ({
-      id: a.id, status: a.status, paused: a.paused, calls: a.calls, maxCalls: s.limits.maxCallsPerAgent, spawnedBy: a.spawnedBy,
+      id: a.id, status: a.status, paused: a.paused, interrupted: a.interrupted, error: a.error, calls: a.calls, maxCalls: s.limits.maxCallsPerAgent,
+      spawnedBy: a.spawnedBy, queued: a.userQueue.length, context: { ...a.context, limit: s.limits.contextLimit },
     })),
     grants: s.perms.all(),
+    approvals: s.approvals.all(50),
+    hooks: s.hooks.configs.map((h) => ({ event: h.event, matcher: h.matcher ?? null, command: h.command, source: h.source ?? "config" })),
+    ...Object.assign({}, ...s.registry.providers.map((p) => p.describe?.() ?? {})),
     channels: s.chat.channels().map((c) => ({ ...c, members: s.chat.members(c.id), posts: s.chat.all(c.id).length })),
     pages: s.wiki.list(USER),
     proposals: s.wiki.proposals(),
@@ -24,14 +28,19 @@ export function serve(s: Swarm, runId: string, mode: string, port = 7777) {
     post: (b) => s.chat.post(USER, String(b.channel), String(b.body), { thread: b.thread ?? null }),
     lock: (b) => s.wiki.setLock(USER, String(b.path), !!b.locked),
     grant: (b) => {
-      const g = s.perms.grant(USER, String(b.agent), String(b.right), { delegable: !!b.delegable });
-      s.notify(g.subject, `user granted you "${g.right}"${g.delegable ? " (delegable)" : ""} as grant #${g.id}.`);
+      if (!s.agents.has(String(b.agent))) throw new Denied(`no agent ${b.agent}`);
+      const g = s.perms.grant(USER, String(b.agent), String(b.right), { delegable: !!b.delegable, ask: !!b.ask });
+      s.notify(g.subject, `user granted you "${g.right}"${g.delegable ? " (delegable)" : ""}${g.ask ? " (each use needs the user's approval)" : ""} as grant #${g.id}.`);
     },
+    approve: (b) => s.approvals.decide(Number(b.id), !!b.approve, b.note ? String(b.note) : undefined),
+    message: (b) => s.message(String(b.agent), String(b.body ?? "").trim() || (() => { throw new Denied("empty message"); })()),
+    interrupt: (b) => s.interrupt(String(b.agent)),
+    retry: (b) => s.retry(String(b.agent)),
     revoke: async (b) => {
       const ids = s.perms.revoke(USER, Number(b.grant));
       for (const a of s.perms.subjectsOf(ids)) {
         s.notify(a, `user revoked grant(s) ${ids.map((i) => "#" + i).join(", ")}. Check whoami.`);
-        if (!s.perms.can(a, "bash")) await s.dropSandbox(a);
+        if (!s.perms.holds(a, "bash")) await s.dropSandbox(a);
       }
     },
     pause: (b) => s.setPaused(String(b.agent), !!b.paused),

@@ -121,7 +121,9 @@ export class Wiki {
   // --- writing --------------------------------------------------------------
 
   private canWriteDirect(agent: string, p: string): boolean {
-    return agent === USER || p.startsWith(`scratch/${agent}/`) || this.perms.can(agent, `page:${p}:write`);
+    if (agent === USER || p.startsWith(`scratch/${agent}/`)) return true;
+    if (this.perms.mode(agent, `page:${p}:write`) === "ask") this.perms.check(agent, `page:${p}:write`); // throws NeedsApproval
+    return this.perms.can(agent, `page:${p}:write`);
   }
 
   async write(agent: string, path: string, content: string, message: string) {
@@ -134,9 +136,7 @@ export class Wiki {
   propose(agent: string, path: string, content: string, reason: string): Proposal {
     const p = this.norm(path);
     if (this.isLocked(p)) throw new Denied(`${p} is locked by the user`);
-    if (!this.perms.can(agent, "wiki:propose") && !this.perms.can(agent, `page:${p}:propose`)) {
-      throw new Denied(`${agent} lacks right "wiki:propose"`);
-    }
+    if (!this.perms.can(agent, `page:${p}:propose`)) this.perms.check(agent, "wiki:propose");
     const { id } = this.store.db
       .query(`INSERT INTO proposals (path, author, reason, content, status, votes, ts) VALUES (?, ?, ?, ?, 'voting', '[]', ?) RETURNING id`)
       .get(p, agent, reason, content, now()) as { id: number };

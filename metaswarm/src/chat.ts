@@ -78,7 +78,7 @@ export class Chat {
   join(agent: string, id: string, notify: Notify = "all") {
     const c = this.channel(id);
     if (this.isMember(id, agent)) return;
-    if (!this.perms.can(agent, `channel:${id}:read`)) {
+    if (!this.perms.holds(agent, `channel:${id}:read`)) {
       if (c.visibility !== "open") throw new Denied(`channel ${id} is invite-only`);
       this.perms.check(agent, "channel:join");
       this.perms.grant(USER, agent, `channel:${id}:read`);
@@ -92,8 +92,8 @@ export class Chat {
     this.perms.check(by, `channel:${id}:invite`);
     // The invitee's rights hang under the inviter's grant, so revoking the
     // inviter also removes everyone they let in.
-    if (!this.perms.can(agent, `channel:${id}:read`)) this.perms.grant(by, agent, `channel:${id}:read`);
-    if (post && !this.perms.can(agent, `channel:${id}:post`)) this.perms.grant(by, agent, `channel:${id}:post`);
+    if (!this.perms.holds(agent, `channel:${id}:read`)) this.perms.grant(by, agent, `channel:${id}:read`);
+    if (post && !this.perms.holds(agent, `channel:${id}:post`)) this.perms.grant(by, agent, `channel:${id}:post`);
     this.addMember(id, agent, "all");
     this.store.log(by, "channel.invite", { id, agent });
   }

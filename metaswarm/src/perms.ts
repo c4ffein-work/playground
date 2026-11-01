@@ -9,6 +9,8 @@
 //   The new grant hangs under that parent grant in a tree.
 // - Revoking a grant revokes everything granted from it, recursively.
 // - Expired or revoked grants count for nothing.
+// - An "ask" grant means the right is held, but every use needs the user's
+//   approval. Anything delegated from an ask grant is ask too.
 // So rights can move around between agents but never grow beyond what the user gave out.
 import { now, type Store } from "./store.ts";
 
@@ -19,6 +21,7 @@ export interface Grant {
   subject: string;
   right: string;
   delegable: boolean;
+  ask: boolean;
   grantedBy: string;
   parent: number | null;
   revoked: boolean;
@@ -44,11 +47,16 @@ export class Perms {
       id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT NOT NULL, "right" TEXT NOT NULL,
       delegable INTEGER NOT NULL, granted_by TEXT NOT NULL, parent INTEGER,
       revoked INTEGER NOT NULL DEFAULT 0, expires_at TEXT, ts TEXT NOT NULL)`);
+    const cols = store.db.query(`PRAGMA table_info(grants)`).all() as { name: string }[];
+    if (!cols.some((c) => c.name === "ask")) store.db.run(`ALTER TABLE grants ADD COLUMN ask INTEGER NOT NULL DEFAULT 0`);
   }
+
+  /** Rights approved by the user for the call in progress, per agent (an agent runs one tool at a time). */
+  private approved = new Map<string, Set<string>>();
 
   private rows(where: string, ...args: any[]): Grant[] {
     return (this.store.db.query(`SELECT * FROM grants ${where}`).all(...args) as any[]).map((r) => ({
-      id: r.id, subject: r.subject, right: r.right, delegable: !!r.delegable, grantedBy: r.granted_by,
+      id: r.id, subject: r.subject, right: r.right, delegable: !!r.delegable, ask: !!r.ask, grantedBy: r.granted_by,
       parent: r.parent, revoked: !!r.revoked, expiresAt: r.expires_at, ts: r.ts,
     }));
   }
@@ -63,17 +71,43 @@ export class Perms {
     return this.rows("WHERE subject = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > ?) ORDER BY id", subject, t);
   }
 
+  /** "allow": usable now; "ask": held, but each use needs the user's approval; "deny": not held. */
+  mode(subject: string, right: string): "allow" | "ask" | "deny" {
+    if (subject === USER) return "allow";
+    const gs = this.held(subject).filter((g) => covers(g.right, right));
+    if (gs.some((g) => !g.ask)) return "allow";
+    if (this.approved.get(subject)?.has(right)) return "allow";
+    return gs.length ? "ask" : "deny";
+  }
+
+  /** Usable right now, without asking. */
   can(subject: string, right: string): boolean {
-    if (subject === USER) return true;
-    return this.held(subject).some((g) => covers(g.right, right));
+    return this.mode(subject, right) === "allow";
   }
 
-  /** Throws unless `subject` holds `right`. */
+  /** Held at all (possibly needing approval). */
+  holds(subject: string, right: string): boolean {
+    return this.mode(subject, right) !== "deny";
+  }
+
+  /** Throws Denied, or NeedsApproval for ask rights. */
   check(subject: string, right: string) {
-    if (!this.can(subject, right)) throw new Denied(`${subject} lacks right "${right}"`);
+    const m = this.mode(subject, right);
+    if (m === "ask") throw new NeedsApproval(subject, right);
+    if (m === "deny") throw new Denied(`${subject} lacks right "${right}"`);
   }
 
-  grant(by: string, subject: string, right: string, opts: { delegable?: boolean; ttlS?: number } = {}): Grant {
+  /** Run `fn` with `rights` approved for `subject`. */
+  async withApproved<T>(subject: string, rights: string[], fn: () => Promise<T>): Promise<T> {
+    this.approved.set(subject, new Set(rights));
+    try {
+      return await fn();
+    } finally {
+      this.approved.delete(subject);
+    }
+  }
+
+  grant(by: string, subject: string, right: string, opts: { delegable?: boolean; ttlS?: number; ask?: boolean } = {}): Grant {
     if (!RIGHT_RE.test(right)) throw new Denied(`malformed right "${right}"`);
     const delegable = opts.delegable ?? false;
     let parent: number | null = null;
@@ -86,12 +120,13 @@ export class Perms {
     // A child grant never outlives its parent.
     let expiresAt = opts.ttlS ? new Date(Date.now() + opts.ttlS * 1000).toISOString() : null;
     const pg = parent !== null ? this.rows("WHERE id = ?", parent)[0] : undefined;
+    const ask = !!opts.ask || !!pg?.ask;
     if (pg?.expiresAt && (!expiresAt || pg.expiresAt < expiresAt)) expiresAt = pg.expiresAt;
 
     const { id } = this.store.db
-      .query(`INSERT INTO grants (subject, "right", delegable, granted_by, parent, expires_at, ts) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`)
-      .get(subject, right, delegable ? 1 : 0, by, parent, expiresAt, now()) as { id: number };
-    this.store.log(by, "grant", { id, subject, right, delegable, parent, expiresAt });
+      .query(`INSERT INTO grants (subject, "right", delegable, ask, granted_by, parent, expires_at, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
+      .get(subject, right, delegable ? 1 : 0, ask ? 1 : 0, by, parent, expiresAt, now()) as { id: number };
+    this.store.log(by, "grant", { id, subject, right, delegable, ask, parent, expiresAt });
     return this.rows("WHERE id = ?", id)[0]!;
   }
 
@@ -129,4 +164,12 @@ export class Perms {
 
 export class Denied extends Error {
   override name = "Denied";
+}
+
+/** The agent holds the right through an "ask" grant: the user must approve this use. */
+export class NeedsApproval extends Error {
+  override name = "NeedsApproval";
+  constructor(readonly agent: string, readonly right: string) {
+    super(`"${right}" needs the user's approval`);
+  }
 }
