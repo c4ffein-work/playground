@@ -1,79 +1,87 @@
 # charity-trail
 
-A proof of concept for traceable charity money. Each charity *event*, such as
-"Clean water for Kayes 2026", is a contract holding donations in stablecoins.
-Money only leaves for a stated purpose (a **milestone**), and only after
-independent, verified organizations have publicly signed off with evidence.
-Events can fund other events, and the real-world result (a well, say) gets a
-public report that nobody else can claim.
+A proof of concept for traceable charity money, on an Ethereum L2 (Base;
+testnet Base Sepolia).
 
-Target: an Ethereum L2 (Base). Testnet: Base Sepolia.
+- Each charity *event* is an escrow contract holding stablecoins.
+- Money leaves only through milestones signed off by independent, verified
+  organizations.
+- Events can fund other events, and money is traced hop by hop down to a
+  public report of the work ("a well in Village A").
+- **Nobody can freeze money.** The check on bad behaviour is that everything
+  is public and donors' *next* gifts can go elsewhere: monthly giving,
+  one-transaction redirects, curators to follow, and open argument weighted
+  by money actually given.
 
 ## Flow
 
 ```
-donors ──USDC/EURC──▶ CharityEvent (escrow)
-                         │
- organizer proposes      ▼
- milestone ───────▶ [Proposed] ── N-of-M verified signers sign with evidence hash/URI
-                         ▼
-                    [Approved] ── challenge window (e.g. 7 days)
-                     │      │
-     undisputed ─────┘      └──── donor/signer challenges ──▶ [Disputed]
-         ▼                                                       │
-    [Released] ◀──── arbiter upholds ────────────────────────────┤
-     payee paid, or                                              ▼
-     child event funded                          arbiter rejects ─▶ [Rejected]
-         │                                       (funds back in the pool)
-         ▼
- ImpactRegistry: payee/organizer files a deed report (photos + report by sha256,
- GPS spot locked) ──▶ anyone confirms or disputes it on site
-
-arbiter can cancel the event ──▶ donors claim unreleased funds back, pro rata
+donor ──deposit──▶ GivingVaults ──monthly, by own split or a curator's──▶ CharityEvent (escrow)
+                     ▲  redirect / follow / withdraw: 1 tx                       │
+                     │                                       organizer proposes milestone
+                     │                                                           ▼
+                     │                                N-of-M verified signers sign (evidence hash)
+                     │                                                           ▼
+                     │                                 paid to payee, or into a child event
+                     │                                                           ▼
+                     │                           ImpactRegistry: report with photos by sha256;
+                     │                           overlapping claims flagged "contested"
+                     │                                                           ▼
+                     └──── donors & curators read ◀── Forum: posts with stance + evidence,
+                                                     weighted off-chain by money given
 ```
+
+## Contracts
+
+| File | Role |
+|---|---|
+| `contracts/CharityEvent.sol` | Escrow, milestones, sign-offs (pays at threshold), withdraw, close + refunds, child events |
+| `contracts/EventRegistry.sol` | Creates events after checking signer identity and independence; public index |
+| `contracts/IdentityRegistry.sol` | Trusted issuers vouch "wallet W belongs to org O" |
+| `contracts/GivingVaults.sol` | Monthly giving: balance, monthly amount, own split or follow a curator, withdraw |
+| `contracts/ImpactRegistry.sol` | Deed reports; overlaps (same spot, reused photo) flagged as contested; sensitive mode |
+| `contracts/Forum.sol` | Posts on any deed/milestone/org with a stance and evidence hash; delegation |
+| `contracts/MockStablecoin.sol` | 6-decimal test token for local runs |
 
 ## Rules enforced on-chain
 
-- **Verified identities:** organizers, signers and arbiters need a credential
-  from a trusted issuer (a charity register, auditor or vLEI issuer) in
-  `IdentityRegistry`. Credentials can be revoked.
-- **Independent signers:** each signer must be a different organization from
-  the organizer and from the other signers. Several wallets of one org count
-  as one.
+- **Verified identities:** organizers and signers need a credential from a
+  trusted issuer. Credentials can be revoked.
+- **Independent signers:** signers must be different organizations from the
+  organizer and from each other. Several wallets of one org count as one.
 - **Conflicts of interest:**
   - the organizer can't be a signer
   - a payee can't sign off their own payment
   - the organizer of a child event can't sign a grant into it
 - **No over-commitment:** a milestone can only earmark money that has been
   donated and not yet committed.
-- **Several stablecoins:** whitelisted per event, each with its own books.
-- **Every sign-off carries evidence:** a hash pinning the document, plus a
-  URI pointing to it.
-- **Challenges:** any donor (in that token) or signer can challenge during
-  the window, which freezes the payout until the arbiter rules.
-- **Multi-org flows:** a milestone can pay into another event, e.g. a global
-  NGO funding a local NGO's event. The money lands there as a donation, so it
-  can be followed hop by hop. If that child event is cancelled, the parent
-  pulls its share back.
-- **Impact reports:** a report of real-world work (a "deed") needs a paid
-  milestone and pins its report and photos by sha256. The same work can't be
-  claimed twice:
-  - the deed locks its ~11 m map cell and the 8 neighbouring cells for its
-    category
-  - each photo hash can back one deed only
-  - each milestone can back one deed only
-- **Public checks:** anyone can confirm or dispute a deed once. Votes from
-  verified orgs are counted separately.
+- **Gates, not freezes:** a milestone pays out with the signature that
+  reaches the threshold. If signers refuse, the organizer can withdraw it.
+- **One report per paid milestone:** a report needs a paid milestone.
+- **Overlaps are flagged, not blocked:** a report in the same ~11 m cell (or
+  its 8 neighbours) as another of the same category, or reusing a photo hash,
+  marks both as contested. A hard lock would let a fast copycat block the
+  real builder.
+- **Sensitive reports:** stored at 0.1° (~11 km) precision and never matched
+  by place.
+- **Monthly giving:**
+  - at most one payment per 28 days, triggered by anyone (a keeper)
+  - a split can only target registered events
+  - closed events are skipped, and their share stays in the vault
 
-## Contracts
+## Off-chain, reproducible from logs
 
-| File | Role |
-|---|---|
-| `contracts/CharityEvent.sol` | Escrow, milestones, sign-offs, disputes, refunds, child events |
-| `contracts/EventRegistry.sol` | Creates events after checking signer identity and independence; public index |
-| `contracts/IdentityRegistry.sol` | Trusted issuers vouch "wallet W belongs to org O" |
-| `contracts/ImpactRegistry.sol` | Deed reports, duplicate-claim locks, public confirmations |
-| `contracts/MockStablecoin.sol` | 6-decimal test token for local runs |
+- **Money tracing (`site/flow.js`):** each pool is replayed in time order. A
+  payment is drawn pro rata from every donor's *unspent* money at that
+  moment, so later gifts never get credit for earlier payments. Grants into
+  child events are followed the same way.
+- **Discussion weight:** an author's weight is what they gave that was paid
+  out through signed milestones. Each author's latest stance counts.
+  Delegators who didn't post themselves add their weight to their delegate.
+  The site shows three separate lanes:
+  - weighted by money given
+  - verified organizations, excluding the claimant's own org
+  - other wallets, shown but not counted
 
 ## Run it
 
@@ -84,39 +92,49 @@ npm run demo      # 8-month story on a local chain, writes site/data.js
 npm run site      # same, then serves the tracker at http://localhost:8000
 ```
 
+The demo story uses fictional organizations and generated photos:
+
+- **Donors and curators:**
+  - a crowd of one-off donors
+  - you (20 USDC a month)
+  - Bob (EURC)
+  - two curators: Sahel Watch and GiveWise
+- **Overpriced truck quote:** argued down in public. Signers refuse, the
+  organizer withdraws it, and Bob redirects his monthly gift to the local
+  collective.
+- **Curator shift:** Sahel Watch moves its split toward the local
+  organization, and you start following it.
+- **Copycat claim:** Dune Aid claims Well A as its own work. The claim is
+  flagged and argued out: it has zero weighted support, and the signers and
+  village dispute it.
+- **Broken pump:** Well B's pump breaks. It's disputed, repaired with signed
+  spare parts, and confirmed again.
+- **Protected location:** a shelter's water tank is reported at coarse
+  precision, with the partner's name withheld.
+
 ## Tracker site (`site/`)
 
-A static page that follows a donation to the work it paid for:
-
-- **Your money:**
-  - pick a donor and see their share split into: built and reported, paid
-    for services, signed but waiting, and not spent yet
-  - follow the path as a flow diagram and step by step, through every
-    organization, down to the well
-- **Impact:** each deed shows:
-  - its photos and report, with sha256 re-checked live in the browser against
-    the on-chain hash
-  - the locked map cells
-  - who paid for it
-  - on-site confirmations and disputes
-  - refused duplicate claims
-- **Events:** escrow balances, milestones, sign-offs, challenges and rulings.
-- **Safeguards:** every refused attempt to break the rules, and the list of
-  verified organizations.
-
-`scripts/lib/snapshot.js` rebuilds everything from chain logs. The site only
-reads that snapshot plus the off-chain files, so it could point at any
-network. The demo uses fictional organizations, and its photos are generated
-illustrations.
-
-Money tracing is pro rata (`site/flow.js`): your part of each payment is what
-you gave, divided by the pool, times the payment. This repeats at every hop.
+- **Your money:** what you gave and where it went, your monthly split and its
+  history, how to redirect, the flow diagram, and every hop down to the
+  reports.
+- **Impact:** photos and reports re-hashed live in the browser, the map
+  overlap zone, contested claims, who paid, and the weighted public checks.
+- **Events:** escrow balances, new money per month by source (one-off,
+  monthly, grants), milestones with their discussions.
+- **Curators:** current split, history, followers, and followers' money per
+  month.
+- **How it works:**
+  - the levers
+  - protections for field workers
+  - the hard rules, with refused attempts
+  - verified orgs
+  - known limits
 
 ## Deploy to Base Sepolia
 
 ```sh
 export PRIVATE_KEY=0x...            # throwaway testnet key
-npm run deploy                      # 3 registries; deployer becomes an issuer
+npm run deploy                      # all contracts; deployer becomes an issuer
 EVENT=0x... npm run trail           # print an event's trail
 ```
 
@@ -124,21 +142,23 @@ Get test ETH from a Base Sepolia faucet and test USDC/EURC from
 <https://faucet.circle.com>. Stablecoin addresses are in `scripts/deploy.js`.
 Check them against Circle's docs first.
 
-## Not done yet (PoC limits)
+## Known limits
 
-- **Arbiter and registry admin:** single addresses. Should become Safe
-  multisigs, or a staked/elected panel.
-- **Signers:** fixed per event, with no stake or reputation. Next step:
-  mirror sign-offs to [EAS](https://attest.org) so reputation carries over
-  between events.
-- **Deed locks are heuristics:**
-  - a different well 15 m away is refused
-  - re-encoding a photo changes its hash
-  - production needs perceptual photo hashes and human review
-- **Off-chain files:** the demo inlines them. Real use needs IPFS pinning or
-  similar.
-- **Privacy:** beneficiaries must never be identifiable on-chain. Use
-  aggregate payees (local partner wallets) and zero-knowledge proofs for
-  individual aid.
-- **Off-ramp:** the trail ends when the payee converts to fiat.
-- **Audit:** none. Don't hold real money with this.
+- **Money already given stays given.** Only the organizer closing the event
+  returns unspent money. Exit protects future money only.
+- **Weight from giving favours big donors.** Square-root weighting would
+  soften it but needs proof of unique personhood. Self-dealing (giving to
+  your own event and paying yourself) still needs complicit independent
+  signers.
+- **Signing rings** (orgs signing for each other) are visible, not prevented.
+- **Hashes prove a file is unchanged, not that it's true.** Paid, independent
+  site visits are the real check.
+- **Admins:** the identity registry admin and issuers are single addresses.
+  They should become multisigs, or be chosen by donor-weighted votes.
+- **Permanence:** the record can't be deleted. Never post anything that
+  identifies beneficiaries or could endanger field staff later.
+- **Other gaps:** no anonymous-but-verified posting yet (zero-knowledge
+  membership proofs), no audit, no IPFS pinning. Don't hold real money with
+  this.
+- **Legal:** donor control over spending can affect tax deductibility in
+  some countries.

@@ -26,6 +26,9 @@
   --font-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
   --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --c1: #0a6c88;
+  --c2: #7a52c7;
+  --c3: #b5541e;
   --radius: 10px;
   color-scheme: light;
 }
@@ -34,6 +37,7 @@
     --bg: #0e161b; --surface: #152127; --ink: #e2ebee; --muted: #93a6ae; --line: #263840;
     --accent: #52b6d4; --accent-soft: #15313b; --ok: #62c48f; --ok-soft: #15301f;
     --warn: #e2a64c; --warn-soft: #33270f; --bad: #ee7d7d; --bad-soft: #3a1b1b;
+    --c1: #52b6d4; --c2: #a98be8; --c3: #e58a55;
     color-scheme: dark;
   }
 }
@@ -41,6 +45,7 @@
   --bg: #0e161b; --surface: #152127; --ink: #e2ebee; --muted: #93a6ae; --line: #263840;
   --accent: #52b6d4; --accent-soft: #15313b; --ok: #62c48f; --ok-soft: #15301f;
   --warn: #e2a64c; --warn-soft: #33270f; --bad: #ee7d7d; --bad-soft: #3a1b1b;
+  --c1: #52b6d4; --c2: #a98be8; --c3: #e58a55;
   color-scheme: dark;
 }
 
@@ -162,9 +167,9 @@ pre.doc { white-space: pre-wrap; font: 14px/1.55 var(--font-body); margin: 0; ba
 .kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .votes { display: grid; gap: 8px; }
 .vote { display: grid; grid-template-columns: 26px 1fr; gap: 8px; align-items: start; }
-.vote .mark { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 13px; }
-.vote .mark.yes { background: var(--ok-soft); color: var(--ok); }
-.vote .mark.no { background: var(--bad-soft); color: var(--bad); }
+.post .mark, .vote .mark { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 13px; }
+.mark.yes { background: var(--ok-soft); color: var(--ok); }
+.mark.no { background: var(--bad-soft); color: var(--bad); }
 .cells svg { max-width: 100%; height: auto; display: block; }
 .cells text { font: 11px var(--font-body); fill: var(--muted); }
 
@@ -172,6 +177,29 @@ pre.doc { white-space: pre-wrap; font: 14px/1.55 var(--font-body); margin: 0; ba
 .ms { border-top: 1px solid var(--line); padding-top: 12px; display: grid; gap: 6px; }
 .ms:first-of-type { border-top: 0; padding-top: 0; }
 .note { border-left: 3px solid var(--c, var(--line)); padding: 4px 10px; font-size: 13px; background: var(--bg); border-radius: 0 6px 6px 0; }
+
+/* Charts, discussion, curators */
+.chart svg { display: block; width: 100%; height: auto; }
+.chart text { font: 11px var(--font-body); fill: var(--muted); }
+.chart text.v { fill: var(--ink); font-weight: 600; }
+.legend { display: flex; gap: 12px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; background: var(--c); margin-right: 5px; vertical-align: -1px; }
+.split { display: grid; gap: 6px; }
+.split-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; font-size: 14px; }
+.split-bar { grid-column: 1 / -1; height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.split-bar i { display: block; height: 100%; background: var(--c); }
+.history { display: grid; gap: 8px; border-left: 2px solid var(--line); padding-left: 12px; font-size: 14px; }
+.lanes { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.lane { border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: grid; gap: 4px; background: var(--bg); }
+.lane b { font-family: var(--font-display); font-size: 18px; }
+.tug { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--line); }
+.tug i { display: block; background: var(--c); }
+.post { display: grid; grid-template-columns: 26px 1fr; gap: 8px; align-items: start; }
+.post .mark.zero { background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+.weight { font-size: 12px; color: var(--muted); }
+.weight b { color: var(--ink); }
+details > summary { cursor: pointer; color: var(--accent); font-size: 13px; }
+pre.code { margin: 0; background: var(--bg); border-radius: 8px; padding: 10px; overflow-x: auto; font: 12px/1.5 var(--font-mono); }
 
 /* Rules */
 .blocked { display: grid; grid-template-columns: 4px 1fr; gap: 12px; }
@@ -216,7 +244,8 @@ dialog::backdrop { background: rgba(8, 16, 20, 0.55); }
       <a href="#trace">Your money</a>
       <a href="#impact">Impact</a>
       <a href="#events">Events</a>
-      <a href="#rules">Safeguards</a>
+      <a href="#curators">Curators</a>
+      <a href="#rules">How it works</a>
     </nav>
   </div>
 </header>

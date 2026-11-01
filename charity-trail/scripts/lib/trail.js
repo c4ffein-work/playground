@@ -23,13 +23,9 @@ async function printTrail(event, labels = {}) {
       MilestoneProposed: () =>
         `milestone  #${a.id} proposed: ${amt(a.token, a.amount)} -> ${who(a.payee)}  [${a.descriptionURI}]`,
       Attested: () => `attest     #${a.id} signed by ${who(a.attester)}  [${a.evidenceURI}]`,
-      AttestationRevoked: () => `revoke     #${a.id} by ${who(a.attester)}  [${a.reasonURI}]`,
-      MilestoneApproved: () =>
-        `approved   #${a.id}, challenge window until ${new Date(Number(a.challengeDeadline) * 1000).toISOString()}`,
-      Challenged: () => `CHALLENGE  #${a.id} by ${who(a.by)}  [${a.reasonURI}]`,
-      DisputeResolved: () => `ruling     #${a.id} ${a.upheld ? "upheld" : "REJECTED"}  [${a.reasonURI}]`,
+      MilestoneWithdrawn: () => `withdrawn  #${a.id}  [${a.reasonURI}]`,
       Released: () => `PAID       #${a.id} ${amt(a.token, a.amount)} -> ${who(a.payee)}`,
-      Cancelled: () => `CANCELLED  [${a.reasonURI}]`,
+      Closed: () => `CLOSED     [${a.reasonURI}]`,
       Refunded: () => `refund     ${amt(a.token, a.amount)} -> ${who(a.donor)}`,
     }[name];
     if (line) console.log(`blk ${String(log.blockNumber).padStart(4)}  ${line()}`);

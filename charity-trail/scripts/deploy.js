@@ -1,4 +1,4 @@
-// Deploys the three registries, and makes the deployer a trusted issuer so
+// Deploys every contract, and makes the deployer a trusted issuer so
 // you can verify test organizations right away.
 //   PRIVATE_KEY=0x... npx hardhat run scripts/deploy.js --network baseSepolia
 const { ethers, network } = require("hardhat");
@@ -20,16 +20,20 @@ async function main() {
   await identity.waitForDeployment();
   const registry = await (await ethers.getContractFactory("EventRegistry")).deploy(await identity.getAddress());
   await registry.waitForDeployment();
-  const impact = await (await ethers.getContractFactory("ImpactRegistry")).deploy(
-    await registry.getAddress(),
-    await identity.getAddress()
-  );
+  const R = await registry.getAddress();
+  const impact = await (await ethers.getContractFactory("ImpactRegistry")).deploy(R);
   await impact.waitForDeployment();
+  const vaults = await (await ethers.getContractFactory("GivingVaults")).deploy(R);
+  await vaults.waitForDeployment();
+  const forum = await (await ethers.getContractFactory("Forum")).deploy();
+  await forum.waitForDeployment();
   await (await identity.setIssuer(deployer.address, true, "Testnet issuer")).wait();
 
   console.log(`IdentityRegistry: ${await identity.getAddress()}`);
   console.log(`EventRegistry:    ${await registry.getAddress()}`);
   console.log(`ImpactRegistry:   ${await impact.getAddress()}`);
+  console.log(`GivingVaults:     ${await vaults.getAddress()}`);
+  console.log(`Forum:            ${await forum.getAddress()}`);
   console.log(`Stablecoins:      ${JSON.stringify(TOKENS[network.name] || {})}`);
   console.log("Next: identity.issue(wallet, orgId, name, uri) for each org, then registry.createEvent(...) from the organizer.");
 }

@@ -10,12 +10,13 @@ interface IEventIndex {
 }
 
 /// @title CharityEvent
-/// @notice Escrow for one charity event (e.g. "Flood relief, Region X").
+/// @notice Escrow for one charity event (e.g. "Clean water for Kayes").
 /// Donations in whitelisted stablecoins sit here. Money leaves only through
-/// milestones, and a milestone pays out only when:
-///   1. `threshold` independent attesters signed it off with evidence, and
-///   2. a challenge window passed with no open dispute.
-/// Every step emits an event, so the whole trail can be rebuilt from logs.
+/// milestones, and a milestone pays out as soon as `threshold` independent
+/// signers have signed it off with evidence.
+///
+/// Nobody can freeze money. The check on bad behaviour is that everything is
+/// public and donors' future money can go elsewhere (see GivingVaults).
 ///
 /// A milestone's payee can be another CharityEvent from the same registry
 /// (e.g. a global NGO funding a local NGO's event). The money then lands in
@@ -24,21 +25,18 @@ contract CharityEvent is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     enum Status {
-        Proposed, // waiting for attestations
-        Approved, // threshold reached, challenge window running
-        Disputed, // challenged, waiting for the arbiter
-        Released, // paid out
-        Rejected  // refused, funds back in the pool
+        Proposed, // waiting for signatures
+        Released, // signed off and paid
+        Withdrawn // pulled by the organizer, funds back in the pool
     }
 
     struct Milestone {
-        string descriptionURI; // what the money is for (IPFS doc, budget line...)
+        string descriptionURI; // what the money is for (budget line, quote...)
         address payee;
         address token;
         uint256 amount;
         Status status;
         uint32 approvals;
-        uint64 challengeDeadline;
     }
 
     string public name;
@@ -46,10 +44,8 @@ contract CharityEvent is ReentrancyGuard {
     /// The registry that created this event (used to recognise child events).
     address public immutable registry;
     address public immutable organizer;
-    address public immutable arbiter;
     uint32 public immutable threshold;
-    uint64 public immutable challengeWindow;
-    bool public cancelled;
+    bool public closed;
 
     address[] private _attesters;
     mapping(address => bool) public isAttester;
@@ -57,45 +53,37 @@ contract CharityEvent is ReentrancyGuard {
     mapping(address => bool) public isAcceptedToken;
 
     Milestone[] private _milestones;
-    /// milestone => attester => evidence hash (zero = not attested)
+    /// milestone => attester => evidence hash (zero = not signed)
     mapping(uint256 => mapping(address => bytes32)) public evidenceOf;
 
     // Per-token accounting.
     mapping(address => uint256) public totalDonated;
-    mapping(address => uint256) public committed; // earmarked by live milestones (incl. released)
+    mapping(address => uint256) public committed; // earmarked by open + released milestones
     mapping(address => uint256) public released;
     mapping(address => mapping(address => uint256)) public donatedBy; // token => donor => amount
     mapping(address => mapping(address => bool)) public refunded; // token => donor => done
 
-    event Donated(address indexed donor, address indexed token, uint256 amount);
+    event Donated(address indexed donor, address indexed token, uint256 amount, address indexed via);
     event MilestoneProposed(
         uint256 indexed id, address indexed payee, address indexed token, uint256 amount, string descriptionURI
     );
     event Attested(uint256 indexed id, address indexed attester, bytes32 evidenceHash, string evidenceURI);
-    event AttestationRevoked(uint256 indexed id, address indexed attester, string reasonURI);
-    event MilestoneApproved(uint256 indexed id, uint64 challengeDeadline);
-    event Challenged(uint256 indexed id, address indexed by, string reasonURI);
-    event DisputeResolved(uint256 indexed id, bool upheld, string reasonURI);
+    event MilestoneWithdrawn(uint256 indexed id, string reasonURI);
     event Released(uint256 indexed id, address indexed payee, address indexed token, uint256 amount);
-    event Cancelled(string reasonURI);
+    event Closed(string reasonURI);
     event Refunded(address indexed donor, address indexed token, uint256 amount);
     event ReclaimedFromChild(uint256 indexed id, address indexed child, address indexed token, uint256 amount);
 
     error NotOrganizer();
-    error NotArbiter();
     error NotAttester();
-    error NotAllowedToChallenge();
     error ConflictOfInterest();
-    error EventCancelled();
-    error EventNotCancelled();
+    error EventClosed();
+    error EventNotClosed();
     error TokenNotAccepted();
     error ZeroAmount();
     error InsufficientUncommittedFunds();
     error BadStatus();
     error AlreadyAttested();
-    error NotAttested();
-    error ChallengeWindowOpen();
-    error ChallengeWindowClosed();
     error NothingToRefund();
     error BadConfig();
     error NotAChildEvent();
@@ -106,13 +94,8 @@ contract CharityEvent is ReentrancyGuard {
         _;
     }
 
-    modifier onlyArbiter() {
-        if (msg.sender != arbiter) revert NotArbiter();
-        _;
-    }
-
-    modifier notCancelled() {
-        if (cancelled) revert EventCancelled();
+    modifier notClosed() {
+        if (closed) revert EventClosed();
         _;
     }
 
@@ -120,13 +103,11 @@ contract CharityEvent is ReentrancyGuard {
         string memory name_,
         string memory metadataURI_,
         address organizer_,
-        address arbiter_,
         address[] memory attesters_,
         uint32 threshold_,
-        uint64 challengeWindow_,
         address[] memory tokens_
     ) {
-        if (organizer_ == address(0) || arbiter_ == address(0)) revert BadConfig();
+        if (organizer_ == address(0)) revert BadConfig();
         if (threshold_ == 0 || threshold_ > attesters_.length) revert BadConfig();
         if (tokens_.length == 0) revert BadConfig();
 
@@ -134,9 +115,7 @@ contract CharityEvent is ReentrancyGuard {
         metadataURI = metadataURI_;
         registry = msg.sender;
         organizer = organizer_;
-        arbiter = arbiter_;
         threshold = threshold_;
-        challengeWindow = challengeWindow_;
 
         for (uint256 i; i < attesters_.length; ++i) {
             address a = attesters_[i];
@@ -155,13 +134,24 @@ contract CharityEvent is ReentrancyGuard {
 
     // ---------------------------------------------------------------- donate
 
-    function donate(address token, uint256 amount) external nonReentrant notCancelled {
+    function donate(address token, uint256 amount) external {
+        _donate(msg.sender, token, amount);
+    }
+
+    /// @notice Pay from the caller, credit `donor`. Used by giving vaults so
+    /// the real donor shows up in the books.
+    function donateFor(address donor, address token, uint256 amount) external {
+        if (donor == address(0)) revert BadConfig();
+        _donate(donor, token, amount);
+    }
+
+    function _donate(address donor, address token, uint256 amount) private nonReentrant notClosed {
         if (!isAcceptedToken[token]) revert TokenNotAccepted();
         if (amount == 0) revert ZeroAmount();
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         totalDonated[token] += amount;
-        donatedBy[token][msg.sender] += amount;
-        emit Donated(msg.sender, token, amount);
+        donatedBy[token][donor] += amount;
+        emit Donated(donor, token, amount, msg.sender);
     }
 
     // ------------------------------------------------------------ milestones
@@ -170,7 +160,7 @@ contract CharityEvent is ReentrancyGuard {
     function proposeMilestone(string calldata descriptionURI, address payee, address token, uint256 amount)
         external
         onlyOrganizer
-        notCancelled
+        notClosed
         returns (uint256 id)
     {
         if (!isAcceptedToken[token]) revert TokenNotAccepted();
@@ -181,29 +171,30 @@ contract CharityEvent is ReentrancyGuard {
 
         committed[token] += amount;
         id = _milestones.length;
-        _milestones.push(
-            Milestone({
-                descriptionURI: descriptionURI,
-                payee: payee,
-                token: token,
-                amount: amount,
-                status: Status.Proposed,
-                approvals: 0,
-                challengeDeadline: 0
-            })
-        );
+        _milestones.push(Milestone(descriptionURI, payee, token, amount, Status.Proposed, 0));
         emit MilestoneProposed(id, payee, token, amount, descriptionURI);
     }
 
+    /// @notice The organizer pulls a milestone signers won't sign (e.g. after
+    /// a public argument showed it was overpriced).
+    function withdrawMilestone(uint256 id, string calldata reasonURI) external onlyOrganizer {
+        Milestone storage m = _milestones[id];
+        if (m.status != Status.Proposed) revert BadStatus();
+        m.status = Status.Withdrawn;
+        committed[m.token] -= m.amount;
+        emit MilestoneWithdrawn(id, reasonURI);
+    }
+
     /// @notice Sign off a milestone. `evidenceHash` pins the justification
-    /// document (photos, invoices, field report) pointed to by `evidenceURI`.
-    function attest(uint256 id, bytes32 evidenceHash, string calldata evidenceURI) external notCancelled {
+    /// document. The payment goes out with the signature that reaches the
+    /// threshold.
+    function attest(uint256 id, bytes32 evidenceHash, string calldata evidenceURI) external nonReentrant notClosed {
         if (!isAttester[msg.sender]) revert NotAttester();
         Milestone storage m = _milestones[id];
         if (msg.sender == m.payee) revert ConflictOfInterest();
         // Nor can the organizer of a child event sign a grant into it.
         if (_isChildEvent(m.payee) && CharityEvent(m.payee).organizer() == msg.sender) revert ConflictOfInterest();
-        if (m.status != Status.Proposed && m.status != Status.Approved) revert BadStatus();
+        if (m.status != Status.Proposed) revert BadStatus();
         if (evidenceHash == bytes32(0)) revert ZeroAmount();
         if (evidenceOf[id][msg.sender] != bytes32(0)) revert AlreadyAttested();
 
@@ -211,59 +202,7 @@ contract CharityEvent is ReentrancyGuard {
         m.approvals += 1;
         emit Attested(id, msg.sender, evidenceHash, evidenceURI);
 
-        if (m.status == Status.Proposed && m.approvals >= threshold) {
-            m.status = Status.Approved;
-            m.challengeDeadline = uint64(block.timestamp) + challengeWindow;
-            emit MilestoneApproved(id, m.challengeDeadline);
-        }
-    }
-
-    /// @notice An attester changes their mind before the money moves.
-    function revokeAttestation(uint256 id, string calldata reasonURI) external {
-        Milestone storage m = _milestones[id];
-        if (m.status != Status.Proposed && m.status != Status.Approved) revert BadStatus();
-        if (evidenceOf[id][msg.sender] == bytes32(0)) revert NotAttested();
-
-        delete evidenceOf[id][msg.sender];
-        m.approvals -= 1;
-        emit AttestationRevoked(id, msg.sender, reasonURI);
-
-        if (m.status == Status.Approved && m.approvals < threshold) {
-            m.status = Status.Proposed;
-            m.challengeDeadline = 0;
-        }
-    }
-
-    /// @notice Donors and attesters can freeze an approved milestone during
-    /// its challenge window. The arbiter then decides.
-    function challenge(uint256 id, string calldata reasonURI) external {
-        Milestone storage m = _milestones[id];
-        if (m.status != Status.Approved) revert BadStatus();
-        if (block.timestamp >= m.challengeDeadline) revert ChallengeWindowClosed();
-        if (!isAttester[msg.sender] && donatedBy[m.token][msg.sender] == 0) revert NotAllowedToChallenge();
-
-        m.status = Status.Disputed;
-        emit Challenged(id, msg.sender, reasonURI);
-    }
-
-    function resolveDispute(uint256 id, bool upheld, string calldata reasonURI) external onlyArbiter nonReentrant {
-        Milestone storage m = _milestones[id];
-        if (m.status != Status.Disputed) revert BadStatus();
-        emit DisputeResolved(id, upheld, reasonURI);
-        if (upheld && !cancelled) {
-            _release(id, m);
-        } else {
-            m.status = Status.Rejected;
-            committed[m.token] -= m.amount;
-        }
-    }
-
-    /// @notice Anyone can trigger payout once the window closed undisputed.
-    function release(uint256 id) external nonReentrant notCancelled {
-        Milestone storage m = _milestones[id];
-        if (m.status != Status.Approved) revert BadStatus();
-        if (block.timestamp < m.challengeDeadline) revert ChallengeWindowOpen();
-        _release(id, m);
+        if (m.approvals >= threshold) _release(id, m);
     }
 
     function _release(uint256 id, Milestone storage m) private {
@@ -279,16 +218,33 @@ contract CharityEvent is ReentrancyGuard {
         emit Released(id, m.payee, m.token, m.amount);
     }
 
-    // ------------------------------------------------------ cancel / refund
+    // ------------------------------------------------------- close / refund
 
-    /// @notice Stop the event. Unreleased money goes back to donors pro rata.
-    function cancel(string calldata reasonURI) external onlyArbiter notCancelled {
-        cancelled = true;
-        emit Cancelled(reasonURI);
+    /// @notice The organizer winds the event down. Unspent money goes back to
+    /// donors pro rata; open milestones can no longer be paid.
+    function close(string calldata reasonURI) external onlyOrganizer notClosed {
+        closed = true;
+        emit Closed(reasonURI);
     }
 
-    /// @notice If a funded child event gets cancelled, pull our share back.
-    /// The money returns to this event's free pool. Anyone can call this.
+    function refundableOf(address token, address donor) public view returns (uint256) {
+        if (!closed || refunded[token][donor]) return 0;
+        uint256 total = totalDonated[token];
+        if (total == 0) return 0;
+        return (donatedBy[token][donor] * (total - released[token])) / total;
+    }
+
+    function claimRefund(address token) external nonReentrant {
+        if (!closed) revert EventNotClosed();
+        uint256 amount = refundableOf(token, msg.sender);
+        if (amount == 0) revert NothingToRefund();
+        refunded[token][msg.sender] = true;
+        IERC20(token).safeTransfer(msg.sender, amount);
+        emit Refunded(msg.sender, token, amount);
+    }
+
+    /// @notice If a funded child event closes, pull our share back into this
+    /// event's pool. Anyone can call this.
     function reclaimFromChild(uint256 id) external nonReentrant {
         Milestone storage m = _milestones[id];
         if (m.status != Status.Released || !_isChildEvent(m.payee)) revert NotAChildEvent();
@@ -303,22 +259,6 @@ contract CharityEvent is ReentrancyGuard {
 
     function _isChildEvent(address a) private view returns (bool) {
         return registry.code.length > 0 && IEventIndex(registry).isEvent(a);
-    }
-
-    function refundableOf(address token, address donor) public view returns (uint256) {
-        if (!cancelled || refunded[token][donor]) return 0;
-        uint256 total = totalDonated[token];
-        if (total == 0) return 0;
-        return (donatedBy[token][donor] * (total - released[token])) / total;
-    }
-
-    function claimRefund(address token) external nonReentrant {
-        if (!cancelled) revert EventNotCancelled();
-        uint256 amount = refundableOf(token, msg.sender);
-        if (amount == 0) revert NothingToRefund();
-        refunded[token][msg.sender] = true;
-        IERC20(token).safeTransfer(msg.sender, amount);
-        emit Refunded(msg.sender, token, amount);
     }
 
     // ----------------------------------------------------------------- views

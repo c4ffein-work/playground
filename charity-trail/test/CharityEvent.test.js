@@ -1,249 +1,114 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { loadFixture, time } = require("@nomicfoundation/hardhat-network-helpers");
-
+const { loadFixture } = require("@nomicfoundation/hardhat-network-helpers");
 const { usd, hash, deployWorld, createEvent } = require("./helpers");
-const WINDOW = 3 * 24 * 3600; // 3 days
 
 async function deployFixture() {
-  const signers = await ethers.getSigners();
-  const [, , organizer, arbiter, ngo, partner, auditor, donor1, donor2, payee, stranger] = signers;
+  const [, , organizer, ngo, partner, auditor, donor1, donor2, payee, stranger] = await ethers.getSigners();
   const world = await deployWorld({
     Organizer: [organizer, "org-main"],
-    Arbiter: [arbiter, "org-arbiter"],
     NGO: [ngo, "org-ngo"],
     Partner: [partner, "org-partner"],
     Auditor: [auditor, "org-auditor"],
   });
   const { registry, usdc, eurc } = world;
   const event = await createEvent(registry, organizer, {
-    name: "Flood relief - Region X",
-    arbiter: arbiter.address,
+    name: "Flood relief",
     attesters: [ngo.address, partner.address, auditor.address],
-    window: WINDOW,
     tokens: [await usdc.getAddress(), await eurc.getAddress()],
   });
-
   for (const d of [donor1, donor2]) {
     for (const t of [usdc, eurc]) {
       await t.mint(d.address, usd(10_000));
       await t.connect(d).approve(await event.getAddress(), ethers.MaxUint256);
     }
   }
-
-  return { ...world, event, organizer, arbiter, ngo, partner, auditor, donor1, donor2, payee, stranger };
+  return { ...world, event, organizer, ngo, partner, auditor, donor1, donor2, payee, stranger };
 }
 
 async function fundedWithMilestone() {
   const f = await deployFixture();
   const { event, usdc, organizer, donor1, donor2, payee } = f;
-  await event.connect(donor1).donate(await usdc.getAddress(), usd(3000));
-  await event.connect(donor2).donate(await usdc.getAddress(), usd(1000));
-  await event.connect(organizer).proposeMilestone("ipfs://water-pumps", payee.address, await usdc.getAddress(), usd(2500));
-  return f;
+  const U = await usdc.getAddress();
+  await event.connect(donor1).donate(U, usd(3000));
+  await event.connect(donor2).donate(U, usd(1000));
+  await event.connect(organizer).proposeMilestone("ipfs://water-pumps", payee.address, U, usd(2500));
+  return { ...f, U };
 }
 
 describe("EventRegistry", function () {
   it("indexes created events", async function () {
     const { registry, event, organizer } = await loadFixture(deployFixture);
     expect(await registry.eventCount()).to.equal(1);
-    expect(await registry.events(0)).to.equal(await event.getAddress());
+    expect(await registry.isEvent(await event.getAddress())).to.equal(true);
     expect(await event.organizer()).to.equal(organizer.address);
   });
 });
 
 describe("CharityEvent", function () {
-  describe("setup", function () {
-    it("rejects a threshold above the number of attesters", async function () {
-      const { usdc, organizer, arbiter, ngo } = await loadFixture(deployFixture);
-      const E = await ethers.getContractFactory("CharityEvent");
-      await expect(
-        E.deploy("x", "", organizer.address, arbiter.address, [ngo.address], 2, WINDOW, [await usdc.getAddress()])
-      ).to.be.revertedWithCustomError(E, "BadConfig");
-    });
-
-    it("forbids the organizer from being an attester", async function () {
-      const { usdc, organizer, arbiter, ngo } = await loadFixture(deployFixture);
-      const E = await ethers.getContractFactory("CharityEvent");
-      await expect(
-        E.deploy("x", "", organizer.address, arbiter.address, [ngo.address, organizer.address], 1, WINDOW, [
-          await usdc.getAddress(),
-        ])
-      ).to.be.revertedWithCustomError(E, "BadConfig");
-    });
+  it("forbids the organizer from being a signer and a threshold above the signer count", async function () {
+    const { usdc, organizer, ngo } = await loadFixture(deployFixture);
+    const E = await ethers.getContractFactory("CharityEvent");
+    const U = await usdc.getAddress();
+    await expect(E.deploy("x", "", organizer.address, [ngo.address, organizer.address], 1, [U])).to.be.revertedWithCustomError(E, "BadConfig");
+    await expect(E.deploy("x", "", organizer.address, [ngo.address], 2, [U])).to.be.revertedWithCustomError(E, "BadConfig");
   });
 
-  describe("donations", function () {
-    it("accepts several stablecoins and tracks them separately", async function () {
-      const { event, usdc, eurc, donor1 } = await loadFixture(deployFixture);
-      await expect(event.connect(donor1).donate(await usdc.getAddress(), usd(100)))
-        .to.emit(event, "Donated")
-        .withArgs(donor1.address, await usdc.getAddress(), usd(100));
-      await event.connect(donor1).donate(await eurc.getAddress(), usd(50));
-      expect(await event.totalDonated(await usdc.getAddress())).to.equal(usd(100));
-      expect(await event.totalDonated(await eurc.getAddress())).to.equal(usd(50));
-    });
-
-    it("rejects tokens that aren't whitelisted", async function () {
-      const { event, donor1 } = await loadFixture(deployFixture);
-      const Token = await ethers.getContractFactory("MockStablecoin");
-      const rogue = await Token.deploy("Rogue", "RGE");
-      await expect(event.connect(donor1).donate(await rogue.getAddress(), 1)).to.be.revertedWithCustomError(
-        event,
-        "TokenNotAccepted"
-      );
-    });
+  it("accepts several stablecoins, and credits the real donor when someone pays for them", async function () {
+    const { event, usdc, eurc, donor1, donor2 } = await loadFixture(deployFixture);
+    const U = await usdc.getAddress();
+    await event.connect(donor1).donate(U, usd(100));
+    await event.connect(donor1).donate(await eurc.getAddress(), usd(50));
+    await expect(event.connect(donor2).donateFor(donor1.address, U, usd(10)))
+      .to.emit(event, "Donated")
+      .withArgs(donor1.address, U, usd(10), donor2.address);
+    expect(await event.donatedBy(U, donor1.address)).to.equal(usd(110));
+    expect(await event.totalDonated(await eurc.getAddress())).to.equal(usd(50));
   });
 
-  describe("milestones", function () {
-    it("can't earmark more than was donated", async function () {
-      const { event, usdc, organizer, payee } = await loadFixture(fundedWithMilestone);
-      // 4000 donated, 2500 already committed.
-      await expect(
-        event.connect(organizer).proposeMilestone("ipfs://too-much", payee.address, await usdc.getAddress(), usd(1501))
-      ).to.be.revertedWithCustomError(event, "InsufficientUncommittedFunds");
-    });
-
-    it("only the organizer proposes", async function () {
-      const { event, usdc, stranger, payee } = await loadFixture(fundedWithMilestone);
-      await expect(
-        event.connect(stranger).proposeMilestone("ipfs://x", payee.address, await usdc.getAddress(), 1)
-      ).to.be.revertedWithCustomError(event, "NotOrganizer");
-    });
-
-    it("pays out after threshold attestations and an undisputed window", async function () {
-      const { event, usdc, ngo, auditor, payee, stranger } = await loadFixture(fundedWithMilestone);
-
-      await event.connect(ngo).attest(0, hash("invoice"), "ipfs://invoice");
-      expect((await event.milestone(0)).status).to.equal(0); // Proposed
-
-      await expect(event.connect(auditor).attest(0, hash("site-visit"), "ipfs://site-visit")).to.emit(
-        event,
-        "MilestoneApproved"
-      );
-      expect((await event.milestone(0)).status).to.equal(1); // Approved
-
-      await expect(event.connect(stranger).release(0)).to.be.revertedWithCustomError(event, "ChallengeWindowOpen");
-
-      await time.increase(WINDOW);
-      await expect(event.connect(stranger).release(0))
-        .to.emit(event, "Released")
-        .withArgs(0, payee.address, await usdc.getAddress(), usd(2500));
-      expect(await usdc.balanceOf(payee.address)).to.equal(usd(2500));
-      expect((await event.milestone(0)).status).to.equal(3); // Released
-    });
-
-    it("blocks non-attesters, double attestation and self-attestation by the payee", async function () {
-      const { event, usdc, organizer, ngo, partner, stranger } = await loadFixture(fundedWithMilestone);
-      await expect(event.connect(stranger).attest(0, hash("x"), "")).to.be.revertedWithCustomError(
-        event,
-        "NotAttester"
-      );
-      await event.connect(ngo).attest(0, hash("x"), "");
-      await expect(event.connect(ngo).attest(0, hash("y"), "")).to.be.revertedWithCustomError(
-        event,
-        "AlreadyAttested"
-      );
-
-      // The partner is an attester; a milestone paying the partner can't be signed by them.
-      await event.connect(organizer).proposeMilestone("ipfs://partner-fee", partner.address, await usdc.getAddress(), 1);
-      await expect(event.connect(partner).attest(1, hash("me"), "")).to.be.revertedWithCustomError(
-        event,
-        "ConflictOfInterest"
-      );
-    });
-
-    it("revoking an attestation drops an approved milestone back to proposed", async function () {
-      const { event, ngo, auditor } = await loadFixture(fundedWithMilestone);
-      await event.connect(ngo).attest(0, hash("a"), "");
-      await event.connect(auditor).attest(0, hash("b"), "");
-      await event.connect(auditor).revokeAttestation(0, "ipfs://changed-my-mind");
-      const m = await event.milestone(0);
-      expect(m.status).to.equal(0);
-      expect(m.approvals).to.equal(1);
-    });
+  it("can't earmark more than was donated", async function () {
+    const { event, organizer, payee, U } = await loadFixture(fundedWithMilestone);
+    await expect(event.connect(organizer).proposeMilestone("x", payee.address, U, usd(1501))).to.be.revertedWithCustomError(
+      event,
+      "InsufficientUncommittedFunds"
+    );
   });
 
-  describe("disputes", function () {
-    async function approved() {
-      const f = await fundedWithMilestone();
-      await f.event.connect(f.ngo).attest(0, hash("a"), "");
-      await f.event.connect(f.auditor).attest(0, hash("b"), "");
-      return f;
-    }
-
-    it("a donor can freeze a milestone and the arbiter can reject it", async function () {
-      const { event, usdc, donor2, arbiter } = await loadFixture(approved);
-      await expect(event.connect(donor2).challenge(0, "ipfs://pumps-never-arrived"))
-        .to.emit(event, "Challenged")
-        .withArgs(0, donor2.address, "ipfs://pumps-never-arrived");
-
-      await time.increase(WINDOW);
-      await expect(event.release(0)).to.be.revertedWithCustomError(event, "BadStatus");
-
-      await event.connect(arbiter).resolveDispute(0, false, "ipfs://ruling");
-      expect((await event.milestone(0)).status).to.equal(4); // Rejected
-      expect(await event.committed(await usdc.getAddress())).to.equal(0);
-    });
-
-    it("the arbiter can uphold a challenged milestone and pay it", async function () {
-      const { event, usdc, donor1, arbiter, payee } = await loadFixture(approved);
-      await event.connect(donor1).challenge(0, "ipfs://doubt");
-      await event.connect(arbiter).resolveDispute(0, true, "ipfs://checked-ok");
-      expect(await usdc.balanceOf(payee.address)).to.equal(usd(2500));
-    });
-
-    it("strangers can't challenge, and nobody can after the window", async function () {
-      const { event, donor1, stranger } = await loadFixture(approved);
-      await expect(event.connect(stranger).challenge(0, "")).to.be.revertedWithCustomError(
-        event,
-        "NotAllowedToChallenge"
-      );
-      await time.increase(WINDOW);
-      await expect(event.connect(donor1).challenge(0, "")).to.be.revertedWithCustomError(
-        event,
-        "ChallengeWindowClosed"
-      );
-    });
+  it("pays out with the signature that reaches the threshold", async function () {
+    const { event, usdc, ngo, auditor, payee } = await loadFixture(fundedWithMilestone);
+    await event.connect(ngo).attest(0, hash("invoice"), "ipfs://invoice");
+    expect(await usdc.balanceOf(payee.address)).to.equal(0);
+    await expect(event.connect(auditor).attest(0, hash("visit"), "ipfs://visit")).to.emit(event, "Released");
+    expect(await usdc.balanceOf(payee.address)).to.equal(usd(2500));
+    expect((await event.milestone(0)).status).to.equal(1); // Released
   });
 
-  describe("cancel and refund", function () {
-    it("refunds unreleased funds to donors pro rata", async function () {
-      const { event, usdc, ngo, auditor, arbiter, donor1, donor2 } = await loadFixture(fundedWithMilestone);
-      const usdcAddr = await usdc.getAddress();
+  it("blocks outsiders, double signing and the payee signing for themselves", async function () {
+    const { event, organizer, ngo, partner, stranger, U } = await loadFixture(fundedWithMilestone);
+    await expect(event.connect(stranger).attest(0, hash("x"), "")).to.be.revertedWithCustomError(event, "NotAttester");
+    await event.connect(ngo).attest(0, hash("x"), "");
+    await expect(event.connect(ngo).attest(0, hash("y"), "")).to.be.revertedWithCustomError(event, "AlreadyAttested");
+    await event.connect(organizer).proposeMilestone("fee", partner.address, U, 1);
+    await expect(event.connect(partner).attest(1, hash("me"), "")).to.be.revertedWithCustomError(event, "ConflictOfInterest");
+  });
 
-      // Release 2500 of 4000, then cancel: 1500 left, split 3:1.
-      await event.connect(ngo).attest(0, hash("a"), "");
-      await event.connect(auditor).attest(0, hash("b"), "");
-      await time.increase(WINDOW);
-      await event.release(0);
+  it("lets the organizer withdraw a milestone nobody will sign, freeing the money", async function () {
+    const { event, organizer, ngo, U } = await loadFixture(fundedWithMilestone);
+    await event.connect(organizer).withdrawMilestone(0, "ipfs://overpriced");
+    expect(await event.committed(U)).to.equal(0);
+    await expect(event.connect(ngo).attest(0, hash("x"), "")).to.be.revertedWithCustomError(event, "BadStatus");
+  });
 
-      await event.connect(arbiter).cancel("ipfs://organizer-vanished");
-      expect(await event.refundableOf(usdcAddr, donor1.address)).to.equal(usd(1125));
-      expect(await event.refundableOf(usdcAddr, donor2.address)).to.equal(usd(375));
-
-      await expect(event.connect(donor1).claimRefund(usdcAddr))
-        .to.emit(event, "Refunded")
-        .withArgs(donor1.address, usdcAddr, usd(1125));
-      await expect(event.connect(donor1).claimRefund(usdcAddr)).to.be.revertedWithCustomError(
-        event,
-        "NothingToRefund"
-      );
-      await event.connect(donor2).claimRefund(usdcAddr);
-      expect(await usdc.balanceOf(await event.getAddress())).to.equal(0);
-    });
-
-    it("stops donations and releases once cancelled", async function () {
-      const { event, usdc, ngo, auditor, arbiter, donor1 } = await loadFixture(fundedWithMilestone);
-      await event.connect(ngo).attest(0, hash("a"), "");
-      await event.connect(auditor).attest(0, hash("b"), "");
-      await event.connect(arbiter).cancel("");
-      await time.increase(WINDOW);
-      await expect(event.release(0)).to.be.revertedWithCustomError(event, "EventCancelled");
-      await expect(event.connect(donor1).donate(await usdc.getAddress(), 1)).to.be.revertedWithCustomError(
-        event,
-        "EventCancelled"
-      );
-    });
+  it("when closed, refunds unspent money to donors pro rata", async function () {
+    const { event, usdc, ngo, auditor, organizer, donor1, donor2, U } = await loadFixture(fundedWithMilestone);
+    await event.connect(ngo).attest(0, hash("a"), "");
+    await event.connect(auditor).attest(0, hash("b"), "");
+    await event.connect(organizer).close("ipfs://done");
+    expect(await event.refundableOf(U, donor1.address)).to.equal(usd(1125));
+    await event.connect(donor1).claimRefund(U);
+    await expect(event.connect(donor1).claimRefund(U)).to.be.revertedWithCustomError(event, "NothingToRefund");
+    await event.connect(donor2).claimRefund(U);
+    expect(await usdc.balanceOf(await event.getAddress())).to.equal(0);
+    await expect(event.connect(donor1).donate(U, 1)).to.be.revertedWithCustomError(event, "EventClosed");
   });
 });

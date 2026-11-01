@@ -6,7 +6,7 @@ import {IdentityRegistry} from "./IdentityRegistry.sol";
 
 /// @title EventRegistry
 /// @notice One public index of every charity event. It only creates events
-/// whose organizer, arbiter and signers are verified organizations, with
+/// whose organizer and signers are verified organizations, with
 /// every signer from a different org than the organizer and each other.
 contract EventRegistry {
     IdentityRegistry public immutable identity;
@@ -25,26 +25,23 @@ contract EventRegistry {
     function createEvent(
         string calldata name,
         string calldata metadataURI,
-        address arbiter,
         address[] calldata attesters,
         uint32 threshold,
-        uint64 challengeWindow,
         address[] calldata tokens
     ) external returns (address eventAddress) {
-        _checkSigners(arbiter, attesters);
+        _checkSigners(attesters);
 
         CharityEvent e =
-            new CharityEvent(name, metadataURI, msg.sender, arbiter, attesters, threshold, challengeWindow, tokens);
+            new CharityEvent(name, metadataURI, msg.sender, attesters, threshold, tokens);
         eventAddress = address(e);
         events.push(eventAddress);
         isEvent[eventAddress] = true;
         emit EventCreated(eventAddress, msg.sender, name, metadataURI);
     }
 
-    function _checkSigners(address arbiter, address[] calldata attesters) private view {
+    function _checkSigners(address[] calldata attesters) private view {
         bytes32 organizerOrg = identity.orgOf(msg.sender);
         if (organizerOrg == bytes32(0)) revert Unverified(msg.sender);
-        if (identity.orgOf(arbiter) == bytes32(0)) revert Unverified(arbiter);
 
         bytes32[] memory seen = new bytes32[](attesters.length);
         for (uint256 i; i < attesters.length; ++i) {
