@@ -99,6 +99,7 @@ function listFiles(dir: string): string[] {
 export function skillsProvider(opts: { dirs: string[]; log?: (msg: string) => void }): ToolProvider {
   const log = opts.log ?? ((m: string) => console.error(m));
   const builtins = new Map<string, Builtin>();
+  let world: ToolContext["world"] | undefined;
 
   async function vaultSkills(ctx: ToolContext): Promise<Map<string, SkillMeta & { files: string[] }>> {
     const out = new Map<string, SkillMeta & { files: string[] }>();
@@ -116,7 +117,20 @@ export function skillsProvider(opts: { dirs: string[]; log?: (msg: string) => vo
   return {
     id: "skills",
 
-    async init() {
+    describe() {
+      const vault = (world?.wiki.list("user") ?? [])
+        .map((p) => p.path.match(/^skills\/([^/]+)\/SKILL\.md$/)?.[1])
+        .filter((n): n is string => !!n && !builtins.has(n));
+      return {
+        skills: [
+          ...[...builtins.values()].map((b) => ({ name: b.name, description: b.description, source: "builtin" })),
+          ...vault.map((name) => ({ name, description: "", source: "vault" })),
+        ],
+      };
+    },
+
+    async init(w) {
+      world = w;
       for (const d of opts.dirs) {
         for (const s of scanDir(resolve(d), log)) {
           const { data } = parseFrontmatter(await Bun.file(join(s.dir, "SKILL.md")).text());

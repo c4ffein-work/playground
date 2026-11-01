@@ -10,16 +10,24 @@ import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import { DEMOS, type Demo } from "./demos.ts";
 import type { HookConfig } from "./hooks.ts";
+import { mcpProvider, type McpServerConfig } from "./mcp.ts";
 import { ClaudeModel, ScriptedModel, type Model } from "./model.ts";
+import { loadPlugins } from "./plugins.ts";
 import { resumeRun, runDemo, type RunOptions } from "./run.ts";
 import { DockerSandboxes } from "./sandbox.ts";
 import { serve } from "./server.ts";
 import type { Swarm } from "./swarm.ts";
+import { skillsProvider } from "./skills.ts";
 import type { ToolProvider } from "./tools.ts";
 import { ClaudeJudge, scriptedJudges } from "./vote.ts";
 
 export interface Config {
   hooks?: HookConfig[];
+  /** Folders of SKILL.md skills. */
+  skills?: string[];
+  /** Plugin folders (skills/, mcp.json, hooks.json). */
+  plugins?: string[];
+  mcpServers?: Record<string, McpServerConfig>;
   limits?: RunOptions["limits"];
   image?: string;
 }
@@ -72,7 +80,15 @@ const judges = useClaude ? judgeModels.map((m) => new ClaudeJudge(m.trim())) : s
 const dir = resumeDir ?? join("runs", new Date().toISOString().replace(/[:.]/g, "-"));
 const runId = basename(dir);
 const sandboxes = new DockerSandboxes({ image: process.env.METASWARM_IMAGE ?? config.image ?? "alpine:3.20", runId });
-const providers: ToolProvider[] = [];
+const plugins = await loadPlugins(config.plugins ?? []);
+const mcpServers = { ...plugins.mcpServers };
+for (const [name, cfg] of Object.entries(config.mcpServers ?? {})) {
+  if (mcpServers[name]) console.error(`mcp: config server "${name}" overrides the plugin server with the same name`);
+  mcpServers[name] = cfg;
+}
+const providers: ToolProvider[] = [skillsProvider({ dirs: [...(config.skills ?? []), ...plugins.skillDirs] })];
+if (Object.keys(mcpServers).length) providers.push(mcpProvider(mcpServers, { runId }));
+if (plugins.names.length) console.log(`plugins: ${plugins.names.join(", ")}`);
 
 let swarm: Swarm | undefined;
 process.on("SIGINT", async () => {
@@ -84,7 +100,7 @@ process.on("SIGINT", async () => {
 
 const options: RunOptions = {
   dir, model, judges, sandboxes, providers,
-  hooks: config.hooks,
+  hooks: [...(config.hooks ?? []), ...plugins.hooks],
   limits: config.limits,
   onReady: (s) => {
     swarm = s;

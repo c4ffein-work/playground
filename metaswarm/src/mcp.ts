@@ -113,6 +113,7 @@ export function mcpProvider(servers: Record<string, McpServerConfig>, opts: McpO
   const entries = new Map<string, Entry>();
   const defs: Anthropic.Beta.BetaTool[] = [];
   const failed: string[] = [];
+  const errors = new Map<string, string>();
 
   async function connect(name: string, cfg: McpServerConfig): Promise<void> {
     if (!SERVER_RE.test(name)) throw new Error(`bad server name (use letters, digits, _ and -)`);
@@ -176,6 +177,7 @@ export function mcpProvider(servers: Record<string, McpServerConfig>, opts: McpO
       results.forEach((r, i) => {
         if (r.status === "rejected") {
           failed.push(names[i]!);
+          errors.set(names[i]!, r.reason instanceof Error ? r.reason.message : String(r.reason));
           log(`mcp: server ${names[i]} failed to start, skipped: ${r.reason instanceof Error ? r.reason.message : r.reason}`);
         }
       });
@@ -184,6 +186,15 @@ export function mcpProvider(servers: Record<string, McpServerConfig>, opts: McpO
     },
 
     tools: () => defs,
+
+    describe() {
+      return {
+        mcp: [
+          ...live.map((sv) => ({ server: sv.name, ok: true, tools: [...entries].filter(([, e]) => e.server === sv).map(([n]) => n) })),
+          ...failed.map((n) => ({ server: n, ok: false, tools: [], error: errors.get(n) })),
+        ],
+      };
+    },
 
     prompt() {
       if (!live.length && !failed.length) return "";

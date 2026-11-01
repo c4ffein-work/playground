@@ -111,7 +111,10 @@ esac
   expect(r[0].error).toContain("no rm");
   expect(r[1]).toMatchObject({ type: "tool", output: expect.stringContaining("ran: rewritten") });
   expect(r[2]).toMatchObject({ type: "tool", output: expect.stringContaining("ran: please-ask") });
-  expect((await Bun.file(log).text()).split("\n").filter(Boolean).length).toBeGreaterThanOrEqual(4);
+  // PostToolUse hooks run in the background: give the last one a moment.
+  const lines = async () => (await Bun.file(log).text().catch(() => "")).split("\n").filter(Boolean).length;
+  for (let i = 0; i < 100 && (await lines()) < 4; i++) await Bun.sleep(20);
+  expect(await lines()).toBeGreaterThanOrEqual(4);
 });
 
 test("big outputs are saved and paged with read_output", async () => {
