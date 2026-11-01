@@ -2,34 +2,27 @@ const { expect } = require("chai");
 const { ethers } = require("hardhat");
 const { loadFixture, time } = require("@nomicfoundation/hardhat-network-helpers");
 
-const usd = (n) => ethers.parseUnits(String(n), 6);
-const hash = (s) => ethers.keccak256(ethers.toUtf8Bytes(s));
+const { usd, hash, deployWorld, createEvent } = require("./helpers");
 const WINDOW = 3 * 24 * 3600; // 3 days
 
 async function deployFixture() {
-  const [organizer, arbiter, ngo, partner, auditor, donor1, donor2, payee, stranger] = await ethers.getSigners();
-
-  const Token = await ethers.getContractFactory("MockStablecoin");
-  const usdc = await Token.deploy("USD Coin", "USDC");
-  const eurc = await Token.deploy("Euro Coin", "EURC");
-
-  const Registry = await ethers.getContractFactory("EventRegistry");
-  const registry = await Registry.deploy();
-
-  const tx = await registry
-    .connect(organizer)
-    .createEvent(
-      "Flood relief - Region X",
-      "ipfs://event-metadata",
-      arbiter.address,
-      [ngo.address, partner.address, auditor.address],
-      2,
-      WINDOW,
-      [await usdc.getAddress(), await eurc.getAddress()]
-    );
-  const receipt = await tx.wait();
-  const created = receipt.logs.map((l) => registry.interface.parseLog(l)).find((l) => l?.name === "EventCreated");
-  const event = await ethers.getContractAt("CharityEvent", created.args.eventAddress);
+  const signers = await ethers.getSigners();
+  const [, , organizer, arbiter, ngo, partner, auditor, donor1, donor2, payee, stranger] = signers;
+  const world = await deployWorld({
+    Organizer: [organizer, "org-main"],
+    Arbiter: [arbiter, "org-arbiter"],
+    NGO: [ngo, "org-ngo"],
+    Partner: [partner, "org-partner"],
+    Auditor: [auditor, "org-auditor"],
+  });
+  const { registry, usdc, eurc } = world;
+  const event = await createEvent(registry, organizer, {
+    name: "Flood relief - Region X",
+    arbiter: arbiter.address,
+    attesters: [ngo.address, partner.address, auditor.address],
+    window: WINDOW,
+    tokens: [await usdc.getAddress(), await eurc.getAddress()],
+  });
 
   for (const d of [donor1, donor2]) {
     for (const t of [usdc, eurc]) {
@@ -38,7 +31,7 @@ async function deployFixture() {
     }
   }
 
-  return { registry, event, usdc, eurc, organizer, arbiter, ngo, partner, auditor, donor1, donor2, payee, stranger };
+  return { ...world, event, organizer, arbiter, ngo, partner, auditor, donor1, donor2, payee, stranger };
 }
 
 async function fundedWithMilestone() {

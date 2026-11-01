@@ -6,7 +6,8 @@
     "test": "hardhat test",
     "demo": "hardhat run scripts/demo.js",
     "deploy": "hardhat run scripts/deploy.js --network baseSepolia",
-    "trail": "hardhat run scripts/trail.js --network baseSepolia"
+    "trail": "hardhat run scripts/lib/trail.js --network baseSepolia",
+    "site": "hardhat run scripts/demo.js && python3 -m http.server 8000 --directory site"
   },
   "license": "ISC",
   "devDependencies": {

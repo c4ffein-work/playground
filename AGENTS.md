@@ -8,7 +8,7 @@ commit and push freely without asking for confirmation.
 - `README.md` + `hello.svg` — the animated intro for people discovering the repo.
 - `patches/` — the patch drop-box (see below).
 - `scripts/new-patch.sh`, `scripts/apply-patch.sh` — export / apply a series.
-- `charity-trail/` — PoC: traceable charity escrow on Ethereum L2 (Hardhat; see its README).
+- `charity-trail/` — PoC: traceable charity escrow on Ethereum L2 + tracker site (Hardhat; see its README).
 - `clones/` — **gitignored**. Put local clones of patch-target repos here
   (`clones/<repo>`), not in the repo root and not in `/tmp`. Anything under
   it is scratch: delete freely, never commit.

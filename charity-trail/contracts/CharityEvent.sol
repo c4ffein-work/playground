@@ -5,6 +5,10 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
+interface IEventIndex {
+    function isEvent(address) external view returns (bool);
+}
+
 /// @title CharityEvent
 /// @notice Escrow for one charity event (e.g. "Flood relief, Region X").
 /// Donations in whitelisted stablecoins sit here. Money leaves only through
@@ -12,6 +16,10 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 ///   1. `threshold` independent attesters signed it off with evidence, and
 ///   2. a challenge window passed with no open dispute.
 /// Every step emits an event, so the whole trail can be rebuilt from logs.
+///
+/// A milestone's payee can be another CharityEvent from the same registry
+/// (e.g. a global NGO funding a local NGO's event). The money then lands in
+/// that event's escrow as a donation, so it can be followed hop by hop.
 contract CharityEvent is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -35,6 +43,8 @@ contract CharityEvent is ReentrancyGuard {
 
     string public name;
     string public metadataURI;
+    /// The registry that created this event (used to recognise child events).
+    address public immutable registry;
     address public immutable organizer;
     address public immutable arbiter;
     uint32 public immutable threshold;
@@ -69,6 +79,7 @@ contract CharityEvent is ReentrancyGuard {
     event Released(uint256 indexed id, address indexed payee, address indexed token, uint256 amount);
     event Cancelled(string reasonURI);
     event Refunded(address indexed donor, address indexed token, uint256 amount);
+    event ReclaimedFromChild(uint256 indexed id, address indexed child, address indexed token, uint256 amount);
 
     error NotOrganizer();
     error NotArbiter();
@@ -87,6 +98,8 @@ contract CharityEvent is ReentrancyGuard {
     error ChallengeWindowClosed();
     error NothingToRefund();
     error BadConfig();
+    error NotAChildEvent();
+    error ChildRejectsToken();
 
     modifier onlyOrganizer() {
         if (msg.sender != organizer) revert NotOrganizer();
@@ -119,6 +132,7 @@ contract CharityEvent is ReentrancyGuard {
 
         name = name_;
         metadataURI = metadataURI_;
+        registry = msg.sender;
         organizer = organizer_;
         arbiter = arbiter_;
         threshold = threshold_;
@@ -161,7 +175,8 @@ contract CharityEvent is ReentrancyGuard {
     {
         if (!isAcceptedToken[token]) revert TokenNotAccepted();
         if (amount == 0) revert ZeroAmount();
-        if (payee == address(0)) revert BadConfig();
+        if (payee == address(0) || payee == address(this)) revert BadConfig();
+        if (_isChildEvent(payee) && !CharityEvent(payee).isAcceptedToken(token)) revert ChildRejectsToken();
         if (committed[token] + amount > totalDonated[token]) revert InsufficientUncommittedFunds();
 
         committed[token] += amount;
@@ -186,6 +201,8 @@ contract CharityEvent is ReentrancyGuard {
         if (!isAttester[msg.sender]) revert NotAttester();
         Milestone storage m = _milestones[id];
         if (msg.sender == m.payee) revert ConflictOfInterest();
+        // Nor can the organizer of a child event sign a grant into it.
+        if (_isChildEvent(m.payee) && CharityEvent(m.payee).organizer() == msg.sender) revert ConflictOfInterest();
         if (m.status != Status.Proposed && m.status != Status.Approved) revert BadStatus();
         if (evidenceHash == bytes32(0)) revert ZeroAmount();
         if (evidenceOf[id][msg.sender] != bytes32(0)) revert AlreadyAttested();
@@ -252,7 +269,13 @@ contract CharityEvent is ReentrancyGuard {
     function _release(uint256 id, Milestone storage m) private {
         m.status = Status.Released;
         released[m.token] += m.amount;
-        IERC20(m.token).safeTransfer(m.payee, m.amount);
+        if (_isChildEvent(m.payee)) {
+            // Donate into the child's escrow so its books record the inflow.
+            IERC20(m.token).forceApprove(m.payee, m.amount);
+            CharityEvent(m.payee).donate(m.token, m.amount);
+        } else {
+            IERC20(m.token).safeTransfer(m.payee, m.amount);
+        }
         emit Released(id, m.payee, m.token, m.amount);
     }
 
@@ -262,6 +285,24 @@ contract CharityEvent is ReentrancyGuard {
     function cancel(string calldata reasonURI) external onlyArbiter notCancelled {
         cancelled = true;
         emit Cancelled(reasonURI);
+    }
+
+    /// @notice If a funded child event gets cancelled, pull our share back.
+    /// The money returns to this event's free pool. Anyone can call this.
+    function reclaimFromChild(uint256 id) external nonReentrant {
+        Milestone storage m = _milestones[id];
+        if (m.status != Status.Released || !_isChildEvent(m.payee)) revert NotAChildEvent();
+        IERC20 token = IERC20(m.token);
+        uint256 before = token.balanceOf(address(this));
+        CharityEvent(m.payee).claimRefund(m.token);
+        uint256 got = token.balanceOf(address(this)) - before;
+        released[m.token] -= got;
+        committed[m.token] -= got;
+        emit ReclaimedFromChild(id, m.payee, m.token, got);
+    }
+
+    function _isChildEvent(address a) private view returns (bool) {
+        return registry.code.length > 0 && IEventIndex(registry).isEvent(a);
     }
 
     function refundableOf(address token, address donor) public view returns (uint256) {
