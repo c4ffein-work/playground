@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "echo": {
+      "image": "mirror.gcr.io/library/node:22-alpine",
+      "command": ["node", "/srv/server.mjs"],
+      "mounts": [{ "host": "../../mcp-echo", "container": "/srv", "readonly": true }]
+    },
+    "remote": { "url": "https://example.invalid/mcp", "headers": { "Authorization": "Bearer x" } }
+  }
+}

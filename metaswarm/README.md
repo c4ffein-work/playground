@@ -93,6 +93,19 @@ The server only listens on 127.0.0.1.
 With `--scripted`, agents and judges follow fixed scripts and rules, so everything runs without an API key.
 With a real model, the demos use the same setup and briefs, and the agents decide for themselves.
 
+## MCP servers, skills, plugins (`src/mcp.ts`, `src/skills.ts`, `src/plugins.ts`)
+
+- **MCP:** each server tool becomes `mcp__<server>__<tool>` and needs the right `mcp:<server>:<tool>` (so `mcp:github:*` or `mcp:*` work).
+  - stdio servers run in a container: `docker run -i --rm`, no network unless `network: "bridge"`, read-only root, all capabilities dropped, 512m memory, 128 processes. Env values go through the environment, not argv.
+  - HTTP servers (Streamable HTTP) are reached from the harness.
+  - A server that fails to start is logged and skipped. Interrupting an agent cancels its MCP call. Shutdown removes the containers.
+- **Skills:** folders with a `SKILL.md` (frontmatter `name`, `description`; the body holds the instructions). Agents use `list_skills` and `load_skill {name, file?}`, which needs `skill:<name>`.
+  - Builtin skills come from host folders.
+  - **Vault skills** are wiki pages `skills/<name>/SKILL.md`. Agents propose them like any other page, and once the judges approve one, every agent with `wiki:read` can load it. A vault skill can't shadow a builtin.
+- **Plugins:** a plugin is a folder with an optional `plugin.json` (`{name, description}`), `skills/`, `mcp.json` (`{"mcpServers": {...}}`) and `hooks.json` (`{"hooks": [...]}`).
+  - Relative paths resolve against the plugin folder, and `${PLUGIN_DIR}` expands to it.
+  - If a server name is already taken, the plugin's server is renamed `<plugin>-<server>`.
+
 ## Not done yet
 
 - Long-run memory: compaction or summarized hand-offs.

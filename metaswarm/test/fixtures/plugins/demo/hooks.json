@@ -1,0 +1,6 @@
+{
+  "hooks": [
+    { "event": "PreToolUse", "matcher": "^bash$", "command": ["./hooks/check.sh", "--strict"] },
+    { "event": "RunEnd", "command": ["sh", "${PLUGIN_DIR}/hooks/check.sh", "./hooks/x"], "timeoutS": 5 }
+  ]
+}
