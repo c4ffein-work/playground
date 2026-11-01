@@ -11,13 +11,28 @@ bun install
 bun run src/main.ts build --scripted --serve     # offline demo + viewer on http://127.0.0.1:7777
 bun run src/main.ts redteam --scripted           # escalation attempts; exits 1 if any succeeded
 ANTHROPIC_API_KEY=... bun run src/main.ts open --serve --goal "your goal"
-bun test                                         # unit tests + both demos, no Docker needed
+ANTHROPIC_API_KEY=... bun run src/main.ts --resume runs/<id> --serve   # continue after a crash or Ctrl-C
+bun test                                         # unit tests + demos (Docker tests skip without Docker)
 ```
 
 Env: `METASWARM_MODEL` (agents, default `claude-opus-5-5`),
 `METASWARM_JUDGES` (default `claude-fable-5-1,claude-opus-5-5,claude-sonnet-5-5`),
 `METASWARM_IMAGE` (default `alpine:3.20`).
-Each run lives in `runs/<id>/`: `run.sqlite` (the full event log) and `vault/`, a git repo you can open in Obsidian.
+Each run lives in `runs/<id>/`: `run.sqlite` (the full event log and every transcript), `vault/` (a git repo you can open in Obsidian) and `outputs/` (long tool outputs).
+
+Optional config, `./metaswarm.config.json` (or `--config file`):
+
+```json
+{
+  "image": "alpine:3.20",
+  "network": { "containers": true, "caFile": "/path/to/extra-ca.pem" },
+  "skills": ["./skills"],
+  "plugins": ["./plugins"],
+  "mcpServers": { "github": { "command": ["github-mcp"], "image": "ghcr.io/...", "network": "bridge" } },
+  "hooks": [{ "event": "PreToolUse", "matcher": "^bash$", "command": ["./policy.sh"] }],
+  "limits": { "maxCallsPerAgent": 60 }
+}
+```
 
 ## Rights (`src/perms.ts`)
 
@@ -26,6 +41,7 @@ Each run lives in `runs/<id>/`: `run.sqlite` (the full event log) and `vault/`, 
 - Agents can't grant to themselves.
 - Grants form a tree. **Revoking a grant revokes everything granted from it.** A grant can expire, and a child never outlives its parent.
 - `spawn_agent` gives the new agent only rights the spawner can delegate.
+- **Ask grants:** a right granted with `ask` is held, but every use waits for your approval in the viewer (unanswered requests expire after 10 minutes). Anything delegated from an ask grant is ask too.
 
 ## Channels (`src/chat.ts`)
 
@@ -49,6 +65,13 @@ Each run lives in `runs/<id>/`: `run.sqlite` (the full event log) and `vault/`, 
 
 - One Claude tool-use loop per agent. All agents get the same system prompt and tool list, which keeps the prompt cacheable. Every handler checks rights for the specific resource it touches.
 - **Harness notices arrive as `system` messages:** grants, revocations, invites and vote results. Agents can't forge that channel, and posts are escaped and framed as peer content.
+- **Hooks** (`src/hooks.ts`): your commands run on `PreToolUse`, `PostToolUse`, `AgentIdle`, `Notice` and `RunEnd`, with the event as JSON on stdin.
+  - A `PreToolUse` hook can deny (exit 2, or `{"decision":"deny"}`), ask you (`{"decision":"ask"}`) or rewrite the input (`{"input":{...}}`).
+  - A hook that crashes denies the call. Hooks are your config, so they run on the host.
+- **Steering:** message one agent directly (delivered at its next model call, even mid-task), or interrupt it. Interrupting aborts the current model call or command; the agent then waits for your message.
+- **Failures:** model calls retry on network/rate-limit/server errors (2s, 8s, 30s). Otherwise the agent shows as errored until you click Retry.
+- **Resume:** transcripts and unsent tool results are written to the database as they happen. `--resume runs/<id>` brings every agent back; tool calls cut off by the crash get an error result. Ctrl-C keeps the `/workspace` volume for this.
+- **Long runs:** server-side compaction (the API summarizes old context), a context meter per agent, and tool outputs over 25k characters saved to `outputs/` and paged with `read_output`.
 - Budgets per agent. A watchdog nudges agents holding `run:finish` when everyone is idle, then ends the run. Pausing an agent from the viewer keeps the run alive.
 - **Containers** (`src/sandbox.ts`):
   - one per agent, created on its first `bash`, sharing `/workspace`
@@ -72,12 +95,14 @@ Rights `net:<host>` (`net:api.github.com`, `net:*.pypi.org`, `net:*`) decide whi
 
 ## Viewer (`src/server.ts`, `src/viewer.html`)
 
-The viewer streams the event log live (SSE) and has five tabs:
-- **Agents:** full transcripts, plus pause/resume.
+The viewer streams the event log live (SSE) and has these tabs:
+- **Approvals:** tool calls waiting for you, with approve/deny. It comes first, and the header flashes, when anything is pending.
+- **Agents:** full transcripts, a context meter, pause/resume, interrupt, retry, and a box to message the agent.
 - **Channels:** threads, and posting as the user.
 - **Wiki:** pages, lock/unlock, git history and diffs, and proposals with every judge's vote.
 - **Rights:** the grant tree, with grant and revoke.
 - **Events:** a raw tail of the log.
+- **Setup:** hooks, skills and MCP servers.
 
 The server only listens on 127.0.0.1.
 
@@ -85,6 +110,7 @@ The server only listens on 127.0.0.1.
 |---|---|
 | ![agents](docs/agents.png) | ![rights](docs/rights.png) |
 | ![channels](docs/channels.png) | ![proposals](docs/proposals.png) |
+| ![setup](docs/setup.png) | |
 
 ## Demos (`src/demos.ts`)
 
@@ -122,7 +148,8 @@ With a real model, the demos use the same setup and briefs, and the agents decid
 
 ## Not done yet
 
-- Long-run memory: compaction or summarized hand-offs.
-- Agents as separate processes, and resuming a run from its log.
+- Agents as separate processes.
+- Model calls with a real API key: the scripted demos and tests cover the harness, not live Claude behaviour.
 - Smarter delivery: digests instead of raw posts for busy channels.
-- Shared `/workspace` races. Pages with spaces in their names can't be targeted by `page:` rights.
+- Shared `/workspace` races, and agents on the proxy network can reach each other's containers.
+- `web_fetch` re-resolves DNS after its address check, which leaves a small rebinding window. The bash proxy pins the address it checked. Pages with spaces in their names can't be targeted by `page:` rights.

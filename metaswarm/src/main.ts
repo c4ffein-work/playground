@@ -12,13 +12,13 @@ import { DEMOS, type Demo } from "./demos.ts";
 import type { HookConfig } from "./hooks.ts";
 import { mcpProvider, type McpServerConfig } from "./mcp.ts";
 import { ClaudeModel, ScriptedModel, type Model } from "./model.ts";
-import { fsTools } from "./fstools.ts";
+import { Egress } from "./egress.ts";
 import { loadPlugins } from "./plugins.ts";
+import { standardProviders } from "./providers.ts";
 import { resumeRun, runDemo, type RunOptions } from "./run.ts";
 import { DockerSandboxes } from "./sandbox.ts";
 import { serve } from "./server.ts";
 import type { Swarm } from "./swarm.ts";
-import { skillsProvider } from "./skills.ts";
 import type { ToolProvider } from "./tools.ts";
 import { ClaudeJudge, scriptedJudges } from "./vote.ts";
 
@@ -29,6 +29,13 @@ export interface Config {
   /** Plugin folders (skills/, mcp.json, hooks.json). */
   plugins?: string[];
   mcpServers?: Record<string, McpServerConfig>;
+  /** Web access, per agent, through net:<host> rights. */
+  network?: {
+    /** Give containers an egress proxy (bash can reach allowed hosts). Default false: no network at all. */
+    containers?: boolean;
+    /** Extra CA bundle the proxy trusts (e.g. a corporate TLS proxy's). */
+    caFile?: string;
+  };
   limits?: RunOptions["limits"];
   image?: string;
 }
@@ -80,22 +87,26 @@ const judges = useClaude ? judgeModels.map((m) => new ClaudeJudge(m.trim())) : s
 
 const dir = resumeDir ?? join("runs", new Date().toISOString().replace(/[:.]/g, "-"));
 const runId = basename(dir);
-const sandboxes = new DockerSandboxes({ image: process.env.METASWARM_IMAGE ?? config.image ?? "alpine:3.20", runId });
+let swarm: Swarm | undefined;
+const netLog = (agent: string, host: string, allowed: boolean) => swarm?.store.log("harness", "net", { agent, host, allowed });
+const egress = config.network?.containers
+  ? new Egress({ runId, can: (a, r) => swarm?.perms.can(a, r) ?? false, onDecision: netLog, caFile: config.network.caFile })
+  : undefined;
+const sandboxes = new DockerSandboxes({ image: process.env.METASWARM_IMAGE ?? config.image ?? "alpine:3.20", runId, egress });
 const plugins = await loadPlugins(config.plugins ?? []);
 const mcpServers = { ...plugins.mcpServers };
 for (const [name, cfg] of Object.entries(config.mcpServers ?? {})) {
   if (mcpServers[name]) console.error(`mcp: config server "${name}" overrides the plugin server with the same name`);
   mcpServers[name] = cfg;
 }
-const providers: ToolProvider[] = [fsTools, skillsProvider({ dirs: [...(config.skills ?? []), ...plugins.skillDirs] })];
+const providers: ToolProvider[] = standardProviders({ skillDirs: [...(config.skills ?? []), ...plugins.skillDirs], onNet: netLog, bashProxy: !!egress });
 if (Object.keys(mcpServers).length) providers.push(mcpProvider(mcpServers, { runId }));
 if (plugins.names.length) console.log(`plugins: ${plugins.names.join(", ")}`);
 
-let swarm: Swarm | undefined;
 process.on("SIGINT", async () => {
-  console.log(`\ninterrupted, removing containers… resume later with: bun run src/main.ts --resume ${dir}`);
+  console.log(`\ninterrupted, removing containers (keeping /workspace)… resume later with: bun run src/main.ts --resume ${dir}`);
   await swarm?.registry.shutdown();
-  await sandboxes.shutdown();
+  await sandboxes.shutdown({ keepVolume: true });
   process.exit(130);
 });
 

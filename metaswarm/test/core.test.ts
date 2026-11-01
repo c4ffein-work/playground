@@ -6,6 +6,7 @@ import { Chat } from "../src/chat.ts";
 import { DEMOS } from "../src/demos.ts";
 import { ScriptedModel } from "../src/model.ts";
 import { covers, Denied, Perms, USER } from "../src/perms.ts";
+import { standardProviders } from "../src/providers.ts";
 import { runDemo } from "../src/run.ts";
 import type { Sandbox, SandboxFactory } from "../src/sandbox.ts";
 import { Store } from "../src/store.ts";
@@ -136,7 +137,7 @@ const fakeSandboxes: SandboxFactory = {
 for (const name of ["build", "redteam"]) {
   test(`demo: ${name}`, async () => {
     const demo = DEMOS[name]!;
-    const { failures } = await runDemo(demo, { dir: tmp(), model: new ScriptedModel(demo.script, 5), judges: scriptedJudges(), sandboxes: fakeSandboxes });
+    const { failures } = await runDemo(demo, { dir: tmp(), model: new ScriptedModel(demo.script, 5), judges: scriptedJudges(), sandboxes: fakeSandboxes, providers: standardProviders() });
     expect(failures).toEqual([]);
   }, 30_000);
 }

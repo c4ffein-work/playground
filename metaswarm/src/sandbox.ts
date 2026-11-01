@@ -22,8 +22,8 @@ export interface Sandbox {
 
 export interface SandboxFactory {
   create(agent: string): Promise<Sandbox>;
-  /** Tear down anything shared (volumes). */
-  shutdown(): Promise<void>;
+  /** Tear down containers and anything shared. keepVolume keeps /workspace for a later --resume. */
+  shutdown(opts?: { keepVolume?: boolean }): Promise<void>;
 }
 
 const MAX_OUTPUT = 8_000;
@@ -126,11 +126,11 @@ export class DockerSandboxes implements SandboxFactory {
     return sb;
   }
 
-  async shutdown() {
+  async shutdown(opts: { keepVolume?: boolean } = {}) {
     await Promise.all([...this.live].map((s) => s.destroy()));
     // Proxy and network go after the containers attached to them.
     await this.opts.egress?.stop();
-    if (this.ready) await run(["volume", "rm", "-f", this.volume]);
+    if (this.ready && !opts.keepVolume) await run(["volume", "rm", "-f", this.volume]);
   }
 }
 
