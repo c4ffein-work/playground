@@ -12,6 +12,7 @@ import { DEMOS, type Demo } from "./demos.ts";
 import type { HookConfig } from "./hooks.ts";
 import { mcpProvider, type McpServerConfig } from "./mcp.ts";
 import { ClaudeModel, ScriptedModel, type Model } from "./model.ts";
+import { fsTools } from "./fstools.ts";
 import { loadPlugins } from "./plugins.ts";
 import { resumeRun, runDemo, type RunOptions } from "./run.ts";
 import { DockerSandboxes } from "./sandbox.ts";
@@ -59,7 +60,7 @@ if (!resumeDir) {
       ...DEMOS.build!,
       name: "open",
       description: "Your goal, one lead with broad rights.",
-      agents: [{ id: "lead", brief: `Goal from the user:\n\n${goal}`, rights: [r("spawn"), r("channel:create"), r("channel:join"), r("wiki:read"), r("wiki:propose"), r("bash"), r("run:finish", false)] }],
+      agents: [{ id: "lead", brief: `Goal from the user:\n\n${goal}`, rights: [r("spawn"), r("channel:create"), r("channel:join"), r("wiki:read"), r("wiki:propose"), r("bash"), r("fs:read:*"), r("fs:write:*"), r("run:finish", false)] }],
       script: {},
       verify: undefined,
     };
@@ -86,7 +87,7 @@ for (const [name, cfg] of Object.entries(config.mcpServers ?? {})) {
   if (mcpServers[name]) console.error(`mcp: config server "${name}" overrides the plugin server with the same name`);
   mcpServers[name] = cfg;
 }
-const providers: ToolProvider[] = [skillsProvider({ dirs: [...(config.skills ?? []), ...plugins.skillDirs] })];
+const providers: ToolProvider[] = [fsTools, skillsProvider({ dirs: [...(config.skills ?? []), ...plugins.skillDirs] })];
 if (Object.keys(mcpServers).length) providers.push(mcpProvider(mcpServers, { runId }));
 if (plugins.names.length) console.log(`plugins: ${plugins.names.join(", ")}`);
 
