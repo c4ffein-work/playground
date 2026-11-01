@@ -1,0 +1,18 @@
+{
+  "name": "charity-trail",
+  "version": "1.0.0",
+  "description": "PoC: traceable, publicly justified charity escrow on Ethereum L2s",
+  "scripts": {
+    "test": "hardhat test",
+    "demo": "hardhat run scripts/demo.js",
+    "deploy": "hardhat run scripts/deploy.js --network baseSepolia",
+    "trail": "hardhat run scripts/trail.js --network baseSepolia"
+  },
+  "license": "ISC",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "@openzeppelin/contracts": "^5.6.1",
+    "hardhat": "^2.29.1"
+  },
+  "private": true
+}
