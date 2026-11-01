@@ -57,6 +57,19 @@ Each run lives in `runs/<id>/`: `run.sqlite` (the full event log) and `vault/`, 
   - removed when the agent loses `bash`
 - **File tools** (`src/fstools.ts`, provider `fsTools`): `read_file`, `write_file`, `edit_file` (exact replace, only after a read of the unchanged file), `glob`, `grep`, all run in the agent's container and gated by `fs:read:<abs path>` / `fs:write:<abs path>` (`glob`/`grep` take `fs:read:<dir>/`), with paths normalized and symlinks resolved before the check. Tests need Docker; they skip without it.
 
+## Web access (`src/net.ts`, `src/egress.ts`, `src/egress-proxy.ts`)
+
+Rights `net:<host>` (`net:api.github.com`, `net:*.pypi.org`, `net:*`) decide which hosts an agent reaches. Private, loopback and link-local addresses are always refused, even with `net:*`.
+
+- **`web_fetch`** (`webProvider()`): the harness fetches the URL. It checks the right before any request and again on every redirect hop (at most 5), then the resolved addresses. It caps time (20s) and size (2 MB), and turns HTML into text with links kept as `text (url)`. If the harness can't resolve DNS but has a proxy, it falls back to name checks (`localhost`, `*.internal`, `*.local`, private IP literals).
+- **Egress for `bash`** (`new DockerSandboxes({ ..., egress: new Egress({ runId, can, onDecision }) })`):
+  - Agent containers join an internal network (`--internal`, no route out) with `HTTP(S)_PROXY=http://<agent>:<token>@proxy:3128`.
+  - The proxy container (node, `mirror.gcr.io/library/node:22-alpine`) sits on that network and the default bridge. It handles CONNECT and absolute-URI requests, including `https://` from busybox wget, where the proxy does the TLS itself.
+  - For each request the proxy asks the harness `may <token> reach <host>?` over a unix socket bind-mounted from a private temp dir. The harness maps the token to the agent and checks the right at that moment, so grants and revokes apply to the next request. Open tunnels are re-checked every 5s and cut on revoke.
+  - Every decision goes to `onDecision(agent, host, allowed)`.
+  - The unix socket needs the docker daemon on the same machine as the harness.
+  - Without `egress`, containers keep `--network none`.
+
 ## Viewer (`src/server.ts`, `src/viewer.html`)
 
 The viewer streams the event log live (SSE) and has five tabs:

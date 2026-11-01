@@ -1,5 +1,6 @@
 // Sandboxes: the only place tool calls run. The harness itself never touches the host.
 // Docker is the first backend; anything implementing Sandbox can replace it.
+import type { Egress } from "./egress.ts";
 
 export interface ExecResult {
   code: number;
@@ -57,7 +58,13 @@ function clip(s: string): string {
 export interface DockerOptions {
   image: string;
   runId: string;
-  network?: "none" | "bridge"; // default none
+  network?: "none" | "bridge"; // default none; ignored when egress is set
+  /**
+   * Web access through a rights-checking proxy (src/egress.ts). Containers
+   * then sit on an internal network whose only exit is the proxy, which lets
+   * each agent reach the hosts it holds `net:<host>` for.
+   */
+  egress?: Egress;
   memory?: string; // default 256m
   cpus?: string; // default 0.5
 }
@@ -82,6 +89,7 @@ export class DockerSandboxes implements SandboxFactory {
       if (r.code !== 0) throw new Error(`docker volume create failed: ${r.stderr}`);
       const c = await run(["run", "--rm", "--network", "none", "-v", `${this.volume}:/w`, this.opts.image, "chown", "1000:1000", "/w"]);
       if (c.code !== 0) throw new Error(`volume init failed: ${c.stderr}`);
+      await this.opts.egress?.start();
     })();
     return this.ready;
   }
@@ -89,9 +97,13 @@ export class DockerSandboxes implements SandboxFactory {
   async create(agent: string): Promise<Sandbox> {
     await this.init();
     const name = `metaswarm-${this.opts.runId}-${agent}`.replace(/[^a-zA-Z0-9_.-]/g, "_");
+    const egress = this.opts.egress;
+    const net = egress
+      ? ["--network", egress.network, ...Object.entries(egress.register(agent)).flatMap(([k, v]) => ["-e", `${k}=${v}`])]
+      : ["--network", this.opts.network ?? "none"];
     const r = await run([
       "run", "-d", "--name", name,
-      "--network", this.opts.network ?? "none",
+      ...net,
       "--read-only", "--tmpfs", "/tmp:rw,size=64m",
       "--user", "1000:1000",
       "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -102,14 +114,22 @@ export class DockerSandboxes implements SandboxFactory {
       "--label", `metaswarm.run=${this.opts.runId}`,
       this.opts.image, "sleep", "infinity",
     ]);
-    if (r.code !== 0) throw new Error(`docker run failed: ${r.stderr}`);
-    const sb = new DockerSandbox(name, () => this.live.delete(sb));
+    if (r.code !== 0) {
+      egress?.unregister(agent);
+      throw new Error(`docker run failed: ${r.stderr}`);
+    }
+    const sb = new DockerSandbox(name, () => {
+      this.live.delete(sb);
+      egress?.unregister(agent);
+    });
     this.live.add(sb);
     return sb;
   }
 
   async shutdown() {
     await Promise.all([...this.live].map((s) => s.destroy()));
+    // Proxy and network go after the containers attached to them.
+    await this.opts.egress?.stop();
     if (this.ready) await run(["volume", "rm", "-f", this.volume]);
   }
 }
