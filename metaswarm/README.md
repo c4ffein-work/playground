@@ -55,6 +55,7 @@ Each run lives in `runs/<id>/`: `run.sqlite` (the full event log) and `vault/`, 
   - no network, read-only root filesystem, uid 1000, all capabilities dropped
   - memory/CPU/process limits and a 30s limit per command
   - removed when the agent loses `bash`
+- **File tools** (`src/fstools.ts`, provider `fsTools`): `read_file`, `write_file`, `edit_file` (exact replace, only after a read of the unchanged file), `glob`, `grep`, all run in the agent's container and gated by `fs:read:<abs path>` / `fs:write:<abs path>` (`glob`/`grep` take `fs:read:<dir>/`), with paths normalized and symlinks resolved before the check. Tests need Docker; they skip without it.
 
 ## Viewer (`src/server.ts`, `src/viewer.html`)
 
