@@ -26,11 +26,11 @@ nav button.on{color:var(--fg);background:var(--bg3);box-shadow:inset 3px 0 var(-
 #detail{flex:1;overflow:auto;padding:10px 14px;min-width:0}
 #full{flex:1;overflow:auto;padding:10px 14px;display:none}
 .item{padding:6px 10px;border-bottom:1px solid var(--bd);cursor:pointer}.item:hover{background:var(--bg2)}.item.sel{background:var(--bg3);box-shadow:inset 3px 0 var(--acc)}
-.item .r{display:flex;gap:6px;align-items:center;justify-content:space-between}
+.r{display:flex;gap:6px;align-items:center;justify-content:space-between}
 .mono{font-family:var(--mono);font-size:12px}.dim{color:var(--dim)}.small{font-size:11px}
 .badge{display:inline-block;padding:0 6px;border-radius:9px;font-size:11px;border:1px solid var(--bd);color:var(--dim)}
 .b-running,.b-approved,.b-open{color:var(--ok);border-color:#2e5e41}.b-idle,.b-voting{color:var(--warn);border-color:#6a5328}
-.b-stopped,.b-rejected{color:var(--err);border-color:#6a3330}.b-paused{color:#111;background:var(--warn);border-color:var(--warn)}.b-invite{color:var(--sys);border-color:#523d6e}
+.b-stopped,.b-rejected,.b-errored,.b-denied,.b-error{color:var(--err);border-color:#6a3330}.b-pending,.b-ask{color:var(--warn);border-color:#6a5328}.b-expired{opacity:.7}.b-paused{color:#111;background:var(--warn);border-color:var(--warn)}.b-invite{color:var(--sys);border-color:#523d6e}
 h2{font-size:15px;margin:4px 0 10px}h3{font-size:13px;margin:16px 0 6px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
 .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
 .msg{border-left:3px solid var(--bd);padding:4px 10px;margin:8px 0;background:var(--bg2);border-radius:0 4px 4px 0}
@@ -62,6 +62,19 @@ pre{margin:0;padding:6px 8px;font:12px/1.4 var(--mono);white-space:pre-wrap;word
 #toasts{position:fixed;right:12px;bottom:12px;display:flex;flex-direction:column;gap:6px;z-index:9}
 .toast{background:#3a1d1b;border:1px solid var(--err);color:#fff;padding:6px 10px;border-radius:4px;max-width:360px}.toast.ok{background:#173322;border-color:var(--ok)}
 .empty{color:var(--dim);padding:20px;text-align:center}
+#appr{display:none;background:var(--warn);color:#111;border-color:var(--warn);font-weight:600;animation:pulse 1.6s ease-in-out infinite}#appr.on{display:inline-block}
+@keyframes pulse{50%{box-shadow:0 0 0 4px #f0b35a44}}
+nav .cnt{margin-left:6px;padding:0 6px;border-radius:9px;background:var(--warn);color:#111;font-weight:600;font-size:11px}
+.appr{border:1px solid var(--bd);border-radius:4px;padding:6px 10px;margin:8px 0;background:var(--bg2)}.appr.live{border-color:var(--warn);box-shadow:inset 3px 0 var(--warn)}.appr.past{opacity:.55}
+.appr pre{background:var(--bg);margin:6px 0;max-height:260px}.appr .bar{margin:0}button.ok{border-color:#2e5e41;color:var(--ok)}button.ok:hover{background:#173322}
+.meter{display:inline-block;width:46px;height:5px;background:var(--bg3);border-radius:3px;overflow:hidden;vertical-align:middle}.meter.w{width:90px;height:7px}
+.meter i{display:block;height:100%;background:var(--acc)}.meter i.mid{background:var(--warn)}.meter i.hi{background:var(--err)}
+.ahead{position:sticky;top:-10px;z-index:2;background:var(--bg);margin:-10px 0 6px;padding:10px 0 6px;border-bottom:1px solid var(--bd)}.ahead .bar{margin-bottom:6px}
+.amsg{display:flex;gap:6px}.amsg textarea{flex:1;height:34px;min-height:34px}.aerr{color:var(--err);white-space:pre-wrap;margin-bottom:6px}
+.txt.direct{background:#16263d;border-left:3px solid var(--acc);padding:3px 8px;border-radius:3px;margin:2px 0}
+.card.compact>summary{color:var(--sys)}
+.chip{display:inline-block;font:11px var(--mono);background:var(--bg3);border-radius:3px;padding:0 5px;margin:2px 3px 0 0}
+.setup{padding:5px 8px;border-bottom:1px solid var(--bd)}
 @media (max-width:760px){
  #app{flex-direction:column;height:auto}
  nav{width:auto;flex-direction:row;overflow-x:auto;padding:0;border-right:0;border-bottom:1px solid var(--bd)}
@@ -74,7 +87,7 @@ pre{margin:0;padding:6px 8px;font:12px/1.4 var(--mono);white-space:pre-wrap;word
 <body>
 <header>
  <span class="t">metaswarm</span><span class="m" id="runid">…</span><span class="badge" id="mode"></span><span class="badge" id="done"></span>
- <span id="summary"></span><span id="live">offline</span><button class="danger" id="finish">Finish run</button>
+ <span id="summary"></span><button id="appr" title="Tool calls waiting for your approval"></button><span id="live">offline</span><button class="danger" id="finish">Finish run</button>
 </header>
 <div id="app">
  <nav id="nav"></nav>
@@ -86,14 +99,20 @@ pre{margin:0;padding:6px 8px;font:12px/1.4 var(--mono);white-space:pre-wrap;word
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
-const TABS = ["Agents", "Channels", "Wiki", "Rights", "Events"];
-let S = { run: {}, agents: [], grants: [], channels: [], pages: [], proposals: [] };
+const BASE = ["Agents", "Channels", "Wiki", "Rights", "Events", "Setup"], TABS = ["Approvals", ...BASE];
+const FULL = new Set(["Rights", "Events", "Approvals", "Setup"]); // tabs without a list pane
+const EMPTY = () => ({ run: {}, agents: [], grants: [], channels: [], pages: [], proposals: [], approvals: [] });
+let S = EMPTY(), v2 = false; // v2: server has approvals / direct messages / interrupt
 let tab = (location.hash.slice(1).split("/")[0]) || "Agents";
 if (!TABS.includes(tab)) tab = "Agents";
+const pendingN = () => (S.approvals || []).filter(a => a.status === "pending").length;
+// Approvals goes first while anything is pending; otherwise it sits after Rights once there is history.
+function tabs() { return pendingN() ? TABS : (S.approvals || []).length || tab === "Approvals" ? [...BASE.slice(0, 4), "Approvals", ...BASE.slice(4)] : BASE; }
 const sel = { Agents: null, Channels: null, Wiki: null, commit: null };
 const openKeys = new Set(); // remembers expanded <details> across re-renders
 const events = [];
 let evFilter = "", rightsFilter = "", replyTo = null;
+const notes = {}, drafts = {}, gform = { agent: "", right: "", delegable: false, ask: false }; // survive re-renders
 
 // ---------- helpers ----------
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
@@ -148,7 +167,7 @@ function details(key, cls, summary, body) {
   d.addEventListener("toggle", () => d.open ? openKeys.add(key) : openKeys.delete(key));
   return d;
 }
-function setHash() { const id = tab === "Events" || tab === "Rights" ? "" : (sel[tab] || ""); history.replaceState(null, "", "#" + tab + (id ? "/" + encodeURIComponent(id) : "")); }
+function setHash() { const id = FULL.has(tab) ? "" : (sel[tab] || ""); history.replaceState(null, "", "#" + tab + (id ? "/" + encodeURIComponent(id) : "")); }
 function readHash() {
   const p = location.hash.slice(1).split("/");
   if (TABS.includes(p[0])) tab = p[0];
@@ -160,13 +179,18 @@ window.addEventListener("hashchange", () => { readHash(); renderAll(); refreshDe
 
 // ---------- layout ----------
 function renderNav() {
-  put($("#nav"), ...TABS.map(t => h("button", { class: t === tab ? "on" : "", onclick: () => { tab = t; setHash(); renderAll(); refreshDetail(); } }, t)));
-  const split = tab !== "Rights" && tab !== "Events";
+  const n = pendingN();
+  put($("#nav"), ...tabs().map(t => h("button", { class: t === tab ? "on" : "", onclick: () => goTab(t) }, t, t === "Approvals" && n ? h("span", { class: "cnt" }, n) : null)));
+  const split = !FULL.has(tab);
   $("#list").style.display = split ? "" : "none";
   $("#detail").style.display = split ? "" : "none";
   $("#full").style.display = split ? "none" : "block";
 }
+function goTab(t) { tab = t; setHash(); renderAll(); refreshDetail(); }
 function renderHeader() {
+  const n = pendingN(), ap = $("#appr");
+  ap.className = n ? "on" : ""; ap.textContent = "⚠ " + n + " pending approval" + (n === 1 ? "" : "s");
+  document.title = n ? "(" + n + ") metaswarm" : "metaswarm viewer";
   const r = S.run || {};
   $("#runid").textContent = r.id ? "run " + short(r.id) : "…";
   $("#runid").title = r.id || "";
@@ -175,7 +199,8 @@ function renderHeader() {
   $("#summary").textContent = r.summary || ""; $("#summary").title = r.summary || "";
   $("#finish").disabled = !!r.done;
 }
-function renderAll() { renderNav(); renderHeader(); renderList(); if (tab === "Rights") renderRights(); if (tab === "Events") renderEvents(); }
+const FULLR = { Rights: () => renderRights(), Events: () => renderEvents(), Approvals: () => renderApprovals(), Setup: () => renderSetup() };
+function renderAll() { renderNav(); renderHeader(); renderList(); if (FULLR[tab]) FULLR[tab](); }
 
 function listOf(items, key, row, empty) {
   const el = $("#list");
@@ -184,8 +209,8 @@ function listOf(items, key, row, empty) {
 }
 function renderList() {
   if (tab === "Agents") listOf(S.agents, "id", a => [
-    h("div", { class: "r" }, h("b", { class: "mono" }, a.id), h("span", {}, a.paused ? badge("paused") : null, " ", badge(a.status))),
-    h("div", { class: "r small dim" }, h("span", {}, "calls " + a.calls + "/" + a.maxCalls), h("span", {}, "by " + (a.spawnedBy || "?")))], "No agents yet");
+    h("div", { class: "r" }, h("b", { class: "mono" }, a.id), h("span", {}, a.queued ? h("span", { class: "small", title: "queued user messages" }, "✉" + a.queued + " ") : null, a.paused ? badge("paused") : null, " ", badge(a.status))),
+    h("div", { class: "r small dim" }, h("span", {}, "calls " + a.calls + "/" + a.maxCalls, " ", meter(a.context)), h("span", {}, "by " + (a.spawnedBy || "?")))], "No agents yet");
   else if (tab === "Channels") listOf(S.channels, "id", c => [
     h("div", { class: "r" }, h("span", { class: "mono", title: c.id }, "#" + short(c.id)), badge(c.visibility)),
     h("div", {}, c.topic || h("i", { class: "dim" }, "(no topic)")),
@@ -203,8 +228,7 @@ function renderList() {
 let detailSeq = 0;
 async function refreshDetail(reset) {
   const seq = ++detailSeq, el = $("#detail");
-  if (tab === "Rights") return renderRights();
-  if (tab === "Events") return renderEvents();
+  if (FULLR[tab]) return FULLR[tab]();
   const id = sel[tab];
   if (!id) { put(el, h("div", { class: "empty" }, "Select an item")); return; }
   if (reset) { put(el, h("div", { class: "empty" }, "Loading…")); }
@@ -223,10 +247,17 @@ async function refreshDetail(reset) {
   } catch (e) { if (seq === detailSeq) put(el, h("div", { class: "empty" }, String(e.message || e))); }
 }
 function jsonStr(v) { try { return typeof v === "string" ? v : JSON.stringify(v, null, 2); } catch { return String(v); } }
+const DIRECT = "[user → you]";
+const textEl = t => h("div", { class: "txt" + (String(t || "").startsWith(DIRECT) ? " direct" : "") }, t);
+const textOf = c => typeof c === "string" ? c : Array.isArray(c) ? c.map(x => typeof x === "string" ? x : x.text || "").join("\n") : "";
 function blockEl(b, key) {
-  if (typeof b === "string") return h("div", { class: "txt" }, b);
+  if (typeof b === "string") return textEl(b);
   switch (b.type) {
-    case "text": return h("div", { class: "txt" }, b.text);
+    case "text": return textEl(b.text);
+    case "compaction": {
+      const t = textOf(b.content) || b.summary || b.text || "";
+      return details(key, "compact", "⟲ context compacted" + (t ? "" : " (no summary)"), t ? h("pre", { class: "dim" }, t) : null);
+    }
     case "thinking": return details(key, "", "thinking" + (b.thinking ? "" : " (redacted)"), b.thinking ? h("pre", { class: "dim" }, b.thinking) : null);
     case "tool_use": return h("div", { class: "card tool" }, h("div", { class: "hd" }, "▸ " + b.name + "  ", h("span", { class: "dim" }, short(b.id))), h("pre", {}, jsonStr(b.input)));
     case "tool_result": {
@@ -237,14 +268,46 @@ function blockEl(b, key) {
     default: return h("div", { class: "card" }, h("div", { class: "hd" }, "[" + b.type + "]"));
   }
 }
+const fmtK = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(n || 0);
+function meter(c, wide) {
+  if (!c || !c.limit) return null;
+  const pct = Math.min(100, 100 * (c.tokens || 0) / c.limit);
+  const m = h("span", { class: "meter" + (wide ? " w" : ""), title: "context ≈ " + fmtK(c.tokens) + " / " + fmtK(c.limit) + " tokens" + (c.compactions ? " · " + c.compactions + " compactions" : "") },
+    h("i", { class: pct > 85 ? "hi" : pct > 65 ? "mid" : "", style: "width:" + pct.toFixed(1) + "%" }));
+  return wide ? h("span", { class: "small dim" }, m, " " + fmtK(c.tokens) + " / " + fmtK(c.limit) + " · " + (c.compactions || 0) + " compaction" + (c.compactions === 1 ? "" : "s")) : m;
+}
+function msgBox(id) {
+  const ta = h("textarea", { placeholder: "Message " + id + "… (Ctrl+Enter to send)", oninput: e => { drafts[id] = e.target.value; } });
+  ta.value = drafts[id] || "";
+  const send = async () => {
+    const body = ta.value.trim(); if (!body) return;
+    if (await post("/api/user/message", { agent: id, body })) { ta.value = ""; delete drafts[id]; toast("sent to " + id, true); }
+  };
+  ta.addEventListener("keydown", e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); } });
+  return h("div", { class: "amsg" }, ta, h("button", { onclick: send }, "Send"));
+}
 function renderAgent(id, tr, reset) {
   const a = S.agents.find(x => x.id === id) || { id };
   const el = $("#detail");
-  const build = () => put(el, 
+  let body = el.querySelector("#atr");
+  if (reset || !body || el.dataset.agent !== id) { // the message box is built once per agent so typing survives refreshes
+    body = h("div", { id: "atr" });
+    put(el, h("div", { class: "ahead" }, h("div", { id: "abar" }), v2 ? msgBox(id) : null), body);
+    el.dataset.agent = id;
+  }
+  const waiting = (S.approvals || []).filter(x => x.status === "pending" && x.agent === id).length;
+  put(el.querySelector("#abar"),
     h("div", { class: "bar" }, h("h2", { class: "mono", style: "margin:0" }, a.id), a.status ? badge(a.status) : null, a.paused ? badge("paused") : null,
       h("span", { class: "dim" }, a.calls != null ? "calls " + a.calls + "/" + a.maxCalls + " · spawned by " + a.spawnedBy : ""),
+      meter(a.context, true),
+      a.queued ? badge(a.queued + " queued", "pending") : null,
+      waiting ? h("a", { onclick: () => goTab("Approvals") }, badge("⚠ " + waiting + " awaiting approval", "pending")) : null,
       h("button", { onclick: () => post("/api/user/pause", { agent: id, paused: !a.paused }) }, a.paused ? "Resume" : "Pause"),
+      a.status === "running" && v2 ? h("button", { class: "danger", title: "Abort the current model call / command; the agent then waits for your message", onclick: () => post("/api/user/interrupt", { agent: id }) }, "Interrupt") : null,
+      a.status === "errored" ? h("button", { class: "ok", onclick: () => post("/api/user/retry", { agent: id }) }, "Retry") : null,
       h("button", { onclick: () => { tab = "Rights"; rightsFilter = id; setHash(); renderAll(); } }, "Rights")),
+    a.error && a.status === "errored" ? h("div", { class: "aerr mono" }, a.error) : null);
+  const build = () => put(body,
     ...(tr.length ? tr.map((m, i) => {
       const role = m.role || "user";
       const blocks = typeof m.content === "string" ? [m.content] : (m.content || []);
@@ -380,7 +443,7 @@ function renderRights() {
     return h("div", { class: "grant" + (g.revoked ? " rev" : "") },
       h("div", { class: "g", style: match(g) ? "" : "opacity:.5" },
         h("span", { class: "mono dim" }, "#" + g.id), h("span", { class: "rt" }, g.right), "→", h("b", { class: "mono" }, g.subject),
-        g.delegable ? badge("delegable", "open") : null, g.revoked ? badge("revoked", "stopped") : null,
+        g.delegable ? badge("delegable", "open") : null, g.ask ? h("span", { class: "badge b-ask", title: "every use needs your approval" }, "ask") : null, g.revoked ? badge("revoked", "stopped") : null,
         g.expiresAt ? h("span", { class: "small dim" }, "exp " + fmtDate(g.expiresAt)) : null,
         h("span", { class: "small dim" }, "by " + g.grantedBy + " · " + fmtTs(g.ts)),
         g.revoked ? null : h("button", { class: "danger", onclick: () => { if (confirm("Revoke grant #" + g.id + " (" + g.right + " → " + g.subject + ") and all its descendants?")) post("/api/user/revoke", { grant: g.id }); } }, "Revoke")),
@@ -388,17 +451,76 @@ function renderRights() {
   };
   const names = [...new Set(["user", ...S.agents.map(a => a.id), ...S.grants.map(g => g.subject)])];
   const fsel = h("select", { onchange: e => { rightsFilter = e.target.value; renderRights(); } }, h("option", { value: "" }, "all agents"), names.map(n => h("option", { value: n, selected: n === f }, n)));
-  const ga = h("select", {}, S.agents.map(a => h("option", { value: a.id }, a.id)));
-  if (f && S.agents.some(a => a.id === f)) ga.value = f;
-  const gr = h("input", { placeholder: "right, e.g. channel:<uuid>:post", style: "min-width:240px" });
-  const gd = h("input", { type: "checkbox" });
+  const ga = h("select", { onchange: e => { gform.agent = e.target.value; } }, S.agents.map(a => h("option", { value: a.id }, a.id)));
+  if (S.agents.some(a => a.id === gform.agent)) ga.value = gform.agent; else if (f && S.agents.some(a => a.id === f)) ga.value = f;
+  const gr = h("input", { placeholder: "right, e.g. channel:<uuid>:post", style: "min-width:240px", "data-f": "right", oninput: e => { gform.right = e.target.value; } });
+  const gd = h("input", { type: "checkbox", onchange: e => { gform.delegable = e.target.checked; } });
+  const gk = h("input", { type: "checkbox", onchange: e => { gform.ask = e.target.checked; } });
+  gr.value = gform.right; gd.checked = gform.delegable; gk.checked = gform.ask;
+  const refocus = document.activeElement && document.activeElement.dataset && document.activeElement.dataset.f === "right";
   const tree = roots.map(node).filter(Boolean);
   put(el, 
     h("h2", {}, "Rights"),
-    h("div", { class: "bar card", style: "padding:8px" }, h("b", {}, "Grant"), ga, gr, h("label", {}, gd, " delegable"),
-      h("button", { onclick: async () => { if (!ga.value || !gr.value.trim()) return toast("agent and right required"); if (await post("/api/user/grant", { agent: ga.value, right: gr.value.trim(), delegable: gd.checked })) { gr.value = ""; toast("granted", true); } } }, "Grant")),
+    h("div", { class: "bar card", style: "padding:8px" }, h("b", {}, "Grant"), ga, gr, h("label", {}, gd, " delegable"), v2 ? h("label", { title: "every use of this right waits for your approval" }, gk, " ask") : null,
+      h("button", { onclick: async () => { if (!ga.value || !gr.value.trim()) return toast("agent and right required"); if (await post("/api/user/grant", { agent: ga.value, right: gr.value.trim(), delegable: gd.checked, ...(v2 ? { ask: gk.checked } : {}) })) { gr.value = gform.right = ""; toast("granted", true); } } }, "Grant")),
     h("div", { class: "bar" }, "Filter:", fsel, h("span", { class: "small dim" }, S.grants.filter(g => !g.revoked).length + " active / " + S.grants.length + " total")),
     ...(tree.length ? tree : [h("div", { class: "empty" }, "No grants")]));
+  if (refocus) gr.focus();
+  scroller(el).scrollTop = top;
+}
+
+// ---------- approvals ----------
+let apprSig = "";
+function renderApprovals() {
+  const el = $("#full"), ap = S.approvals || [];
+  const sig = JSON.stringify(ap.map(a => [a.id, a.status]));
+  if (sig === apprSig && el.querySelector("#apprs")) return; // unchanged: don't disturb a note being typed
+  apprSig = sig;
+  const top = scroller(el).scrollTop, act = document.activeElement, focusId = act && act.dataset ? act.dataset.ap : null;
+  const pend = ap.filter(a => a.status === "pending").sort((a, b) => a.id - b.id);
+  const past = ap.filter(a => a.status !== "pending").sort((a, b) => b.id - a.id).slice(0, 40);
+  const card = (a, live) => {
+    const note = live ? h("input", { placeholder: "note to the agent (optional)", style: "flex:1;min-width:180px", "data-ap": a.id, oninput: e => { notes[a.id] = e.target.value; } }) : null;
+    if (note) note.value = notes[a.id] || "";
+    const btns = [];
+    const decide = approve => async () => {
+      btns.forEach(b => b.disabled = true);
+      const body = { id: a.id, approve }, n = note.value.trim(); if (n) body.note = n;
+      if (await post("/api/user/approve", body)) { delete notes[a.id]; toast((approve ? "approved #" : "denied #") + a.id, true); } else btns.forEach(b => b.disabled = false);
+    };
+    if (live) btns.push(h("button", { class: "ok", onclick: decide(true) }, "Approve"), h("button", { class: "danger", onclick: decide(false) }, "Deny"));
+    return h("div", { class: "appr " + (live ? "live" : "past") },
+      h("div", { class: "r" }, h("span", {}, h("span", { class: "mono dim" }, "#" + a.id + " "), h("a", { class: "mono", onclick: () => { sel.Agents = a.agent; goTab("Agents"); } }, a.agent), " → ", h("b", { class: "mono" }, a.tool)), badge(a.status || "?", a.status)),
+      h("div", { class: "small dim" }, "needs ", h("span", { class: "rt" }, a.right || "?"), " · " + fmtDate(a.ts)),
+      a.reason ? h("div", { class: "txt", style: "margin-top:3px" }, a.reason) : null,
+      live ? h("pre", {}, jsonStr(a.input)) : details("ap:" + a.id, "", "input", h("pre", {}, jsonStr(a.input))),
+      live ? h("div", { class: "bar" }, note, btns) : null);
+  };
+  put(el, h("div", { id: "apprs" },
+    h("h2", {}, "Approvals ", h("span", { class: "small dim" }, pend.length + " pending")),
+    pend.length ? pend.map(a => card(a, true)) : h("div", { class: "empty" }, "Nothing waiting for you"),
+    past.length ? [h("h3", {}, "Recently decided"), past.map(a => card(a, false))] : null));
+  if (focusId) { const f = el.querySelector('[data-ap="' + CSS.escape(focusId) + '"]'); if (f) { f.focus(); f.selectionStart = f.value.length; } }
+  scroller(el).scrollTop = top;
+}
+
+// ---------- setup ----------
+const argv = c => (Array.isArray(c) ? c : [c]).map(x => /^[\w@%+=:,./-]+$/.test(String(x)) ? String(x) : JSON.stringify(String(x))).join(" ");
+function renderSetup() {
+  const el = $("#full"), top = scroller(el).scrollTop;
+  const sec = (title, xs, row) => Array.isArray(xs) ? [h("h3", {}, title + " (" + xs.length + ")"), xs.length ? xs.map(row) : h("div", { class: "dim" }, "none")] : null;
+  const parts = [
+    sec("Hooks", S.hooks, k => h("div", { class: "setup" },
+      h("div", { class: "r" }, h("span", {}, badge(k.event, "x"), " ", k.matcher ? h("span", { class: "rt" }, k.matcher) : h("span", { class: "dim small" }, "(any tool)")), h("span", { class: "small dim" }, k.source)),
+      h("pre", { style: "padding:2px 0" }, argv(k.command || [])))),
+    sec("Skills", S.skills, k => h("div", { class: "setup" },
+      h("div", { class: "r" }, h("b", { class: "mono" }, k.name), badge(k.source || "?", k.source === "vault" ? "invite" : "x")),
+      k.description ? h("div", { class: "small dim" }, k.description) : null)),
+    sec("MCP servers", S.mcp, m => h("div", { class: "setup" },
+      h("div", { class: "r" }, h("b", { class: "mono" }, m.server), m.ok ? badge("ok", "approved") : badge("error")),
+      m.error ? h("div", { class: "aerr mono small" }, m.error) : null,
+      h("div", {}, (m.tools || []).length ? m.tools.map(t => h("span", { class: "chip" }, t)) : h("span", { class: "small dim" }, "no tools"))))].filter(Boolean);
+  put(el, h("h2", {}, "Setup"), parts.length ? parts : h("div", { class: "empty" }, "This server reports no hooks, skills or MCP servers."));
   scroller(el).scrollTop = top;
 }
 
@@ -423,13 +545,13 @@ function renderEvents() {
 
 // ---------- data / live ----------
 async function loadState() {
-  try { S = Object.assign({ run: {}, agents: [], grants: [], channels: [], pages: [], proposals: [] }, await api("/api/state")); renderAll(); }
+  try { const st = await api("/api/state"); v2 = "approvals" in st; S = Object.assign(EMPTY(), st); renderAll(); }
   catch (e) { toast("state: " + (e.message || e)); }
 }
 let refreshTimer = null;
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(async () => { await loadState(); if (tab !== "Rights" && tab !== "Events") refreshDetail(false); }, 300);
+  refreshTimer = setTimeout(async () => { await loadState(); if (!FULL.has(tab)) refreshDetail(false); }, 300);
 }
 let es = null, retry = 1000;
 function connect() {
@@ -448,6 +570,7 @@ function connect() {
     es.close(); es = null; setTimeout(connect, retry); retry = Math.min(retry * 2, 15000);
   };
 }
+$("#appr").onclick = () => goTab("Approvals");
 $("#finish").onclick = () => { if (confirm("Finish the run? Agents will be stopped.")) post("/api/user/finish", {}); };
 renderAll();
 loadState().then(() => refreshDetail(true));
