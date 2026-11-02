@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/pyscotch",
+  "remote": "https://github.com/c4ffein/pyscotch.git",
+  "base_branch": "main",
+  "base_sha": "87909180fb57a45d7bd086f0532a49096c9137e1",
+  "created": "2026-11-02",
+  "patches": 1,
+  "title": "Scotch 7.0.18: catalog entry, skipped, determinism patch carried over"
+}

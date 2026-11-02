@@ -1,0 +1,219 @@
+From 5c013d59d3e734d2497f9c33479006fbfeaa3258 Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Mon, 2 Nov 2026 08:07:30 +0000
+Subject: [PATCH] Scotch 7.0.18: catalog entry, skipped, determinism patch
+ carried over
+
+Pin the 7.0.18 GitLab archive (sha256 2cbdcf6d...). It compiles pristine
+but fails the reproducibility gate: bgraph_bipart_gg.c is unchanged since
+7.0.17, so the threaded greedy bipartitioner still seeds its worker PRNGs
+from the shared generator mid-draw and ignores SCOTCH_DETERMINISTIC
+(`make bump SCOTCH=7.0.18`: 5 distinct partitions over 12 fresh processes
+with the `h` strategy at 4 threads; 3 of 5 gate tests fail).
+
+Record it in _SKIPPED_VERSIONS (the shipped pin stays on 7.0.15) and offer
+the 7.0.17 behavioral patch, which applies unchanged, as
+scotch-7.0.18-bgraph-bipart-gg-determinism.patch. With it the gate passes
+3 x 30 fresh runs. No public C function added or removed since 7.0.15
+(library.h); test_api_completeness passes on the 7.0.18 build.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvpJnQWCnRoSKg7huQA
+---
+ CHANGELOG.md                                  | 13 +++
+ ...-7.0.18-bgraph-bipart-gg-determinism.patch | 85 +++++++++++++++++++
+ pyscotch/scotch_build.py                      | 22 ++++-
+ upstream/QUESTIONS_FOR_SCOTCH_TEAM.md         |  9 ++
+ 4 files changed, 128 insertions(+), 1 deletion(-)
+ create mode 100644 pyscotch/_scotch_patches/scotch-7.0.18-bgraph-bipart-gg-determinism.patch
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e3bc0db..e42dcdd 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ ## [Unreleased]
+ 
++### Added
++- **Scotch 7.0.18 catalogued but SKIPPED, with the behavioral patch carried
++  over.** 7.0.18 compiles pristine (sha256 pinned) but fails the
++  reproducibility gate like 7.0.16 and 7.0.17: `bgraph_bipart_gg.c` did not
++  change, so the worker-PRNG seeding race and the missing
++  `SCOTCH_DETERMINISTIC` guard are still there (5 distinct partitions over
++  12 fresh processes with the `h` strategy at 4 threads). It is recorded in
++  `_SKIPPED_VERSIONS`, the shipped pin stays on 7.0.15, and
++  `scotch-7.0.18-bgraph-bipart-gg-determinism.patch` (identical to the 7.0.17
++  one) is offered as a confirmed-only behavioral patch when building 7.0.18
++  explicitly; with it the gate passes (3 x 30 runs). No public C function
++  was added or removed since 7.0.15.
++
+ ## [7.0.7] - 2026-10-14
+ 
+ ### Added
+diff --git a/pyscotch/_scotch_patches/scotch-7.0.18-bgraph-bipart-gg-determinism.patch b/pyscotch/_scotch_patches/scotch-7.0.18-bgraph-bipart-gg-determinism.patch
+new file mode 100644
+index 0000000..9858bc1
+--- /dev/null
++++ b/pyscotch/_scotch_patches/scotch-7.0.18-bgraph-bipart-gg-determinism.patch
+@@ -0,0 +1,85 @@
++--- a/src/libscotch/bgraph_bipart_gg.h
+++++ b/src/libscotch/bgraph_bipart_gg.h
++@@ -97,6 +97,7 @@
++   Gnum                      cmloval;              /*+ Communication load value +*/
++   Gnum                      cpl0dlt;              /*+ Computation imbalance    +*/
++   GraphPart *               parttab;              /*+ Local part array         +*/
+++  IntRandContext            randdat;              /*+ Private random generator, seeded before launch +*/
++ } BgraphBipartGgThread;
++ 
++ /*+ The loop routine parameter
++--- a/src/libscotch/bgraph_bipart_gg.c
+++++ b/src/libscotch/bgraph_bipart_gg.c
++@@ -72,6 +72,7 @@
++ 
++ #include "module.h"
++ #include "common.h"
+++#include "context.h"
++ #include "gain.h"
++ #include "fibo.h"
++ #include "graph.h"
++@@ -124,7 +125,6 @@
++ {
++   Context                 contdat;                /* Local context, only used for its random section */
++   Context *               contptr;                /* Pointer to active local context                 */
++-  IntRandContext          randdat;                /* Local random context                            */
++   BgraphBipartGgTabl      tabldat;                /* Gain table                                      */
++   BgraphBipartGgVertex *  vexxtax;                /* Extended vertex array [norestrict]              */
++   BgraphBipartGgVertex *  vexxptr;                /* Pointer to current vertex to swap [norestrict]  */
++@@ -135,7 +135,7 @@
++   INT                     passnum;
++ 
++ #ifndef BGRAPHBIPARTGGNOTHREAD
++-  const int                     thrdnum = threadNum (descptr);
+++  const int                     thrdnum = (descptr != NULL) ? threadNum (descptr) : 0; /* NULL descriptor: single-threaded call */
++ #else /* BGRAPHBIPARTGGNOTHREAD */
++   const int                     thrdnum = 0;
++ #endif /* BGRAPHBIPARTGGNOTHREAD */
++@@ -173,9 +173,8 @@
++     contptr = grafptr->contptr;                   /* Use provided context */
++   }
++   else {
++-    parttax = thrdptr->parttab - grafptr->s.baseval; /* Use local array                       */
++-    intRandSpawn (grafptr->contptr->randptr, thrdnum, &randdat); /* Create fake local context */
++-    contdat.randptr = &randdat;
+++    parttax = thrdptr->parttab - grafptr->s.baseval; /* Use local array                                  */
+++    contdat.randptr = &thrdptr->randdat;          /* Use private generator, seeded by the caller before launch */
++     contptr = &contdat;
++   }
++ 
++@@ -305,7 +304,8 @@
++   int                   o;
++ 
++ #ifndef BGRAPHBIPARTGGNOTHREAD
++-  const int                   thrdnbr = contextThreadNbr (grafptr->contptr);
+++  INT                         deteval;            /* Flag set if deterministic behavior wanted */
+++  int                         thrdnbr;
++ #else /* BGRAPHBIPARTGGNOTHREAD */
++   const int                   thrdnbr = 1;
++ #endif /* BGRAPHBIPARTGGNOTHREAD */
++@@ -317,6 +317,11 @@
++   const Gnum * restrict const veextax = grafptr->veextax;
++   const Gnum                  dodival = grafptr->domndist;
++ 
+++#ifndef BGRAPHBIPARTGGNOTHREAD
+++  contextValuesGetInt (grafptr->contptr, CONTEXTOPTIONNUMDETERMINISTIC, &deteval);
+++  thrdnbr = (deteval != 0) ? 1 : contextThreadNbr (grafptr->contptr); /* Deterministic behavior wanted: run on one thread, like graphMatchInit() */
+++#endif /* BGRAPHBIPARTGGNOTHREAD */
+++
++   if (memAllocGroup ((void **) (void *)           /* Allocate shared data */
++                      &passdat.thrdtab, (size_t) (thrdnbr            * sizeof (BgraphBipartGgThread)),
++                      &passdat.cmg0tax, (size_t) (grafptr->s.vertnbr * sizeof (Gnum)), NULL) == NULL) {
++@@ -356,7 +361,12 @@
++   }
++ 
++ #ifndef BGRAPHBIPARTGGNOTHREAD
++-  contextThreadLaunch (grafptr->contptr, (ThreadFunc) bgraphBipartGg2, (void *) &passdat);
+++  for (thrdnum = 1; thrdnum < thrdnbr; thrdnum ++) /* Seed worker generators from the shared one BEFORE any thread draws from it */
+++    intRandSpawn (grafptr->contptr->randptr, thrdnum, &passdat.thrdtab[thrdnum].randdat);
+++  if (thrdnbr > 1)
+++    contextThreadLaunch (grafptr->contptr, (ThreadFunc) bgraphBipartGg2, (void *) &passdat);
+++  else
+++    bgraphBipartGg2 (NULL, &passdat);
++ #else /* BGRAPHBIPARTGGNOTHREAD */
++   bgraphBipartGg2 (NULL, &passdat);
++ #endif /* BGRAPHBIPARTGGNOTHREAD */
+diff --git a/pyscotch/scotch_build.py b/pyscotch/scotch_build.py
+index a2bd83e..ad57105 100644
+--- a/pyscotch/scotch_build.py
++++ b/pyscotch/scotch_build.py
+@@ -34,12 +34,13 @@ from . import _store
+ 
+ # ---------------------------------------------------------------------------
+ # Known upstream releases (GitLab archive tarballs). Checksums recorded
+-# 2026-07-15 (7.0.13: 2026-08-08; 7.0.14-7.0.16: 2026-10-08; 7.0.17: 2026-10-12); override with
++# 2026-07-15 (7.0.13: 2026-08-08; 7.0.14-7.0.16: 2026-10-08; 7.0.17: 2026-10-12; 7.0.18: 2026-11-02); override with
+ # --sha256 for other versions/patches or if GitLab regenerates an archive.
+ # --url overrides the source entirely.
+ # ---------------------------------------------------------------------------
+ _GITLAB = "https://gitlab.inria.fr/scotch/scotch/-/archive/v{v}/scotch-v{v}.tar.gz"
+ _KNOWN_VERSIONS = {
++    "7.0.18": "2cbdcf6da5a08ca31437d7c967b243b3c96d621409ecb710768de2aa2e09802d",
+     "7.0.17": "d8bc97540e83520f5218ebc6ed44ee370e0faa1e9c68d5e3c4cd8db0c683d48b",
+     "7.0.16": "76557a986c2bbcc08a122e21113f77266e08b584bc2d2d3a0dede39572d1af78",
+     "7.0.15": "5f8b558caa30eb5455fd896b763ad911822281c402e76b4afcd17c64eebc2898",
+@@ -73,6 +74,13 @@ def _version_key(version: str):
+ # stays green while a skipped release is upstream's newest tag. Retire an
+ # entry when the next upstream release passes `make test-reproducibility`.
+ _SKIPPED_VERSIONS = {
++    "7.0.18": (
++        "multi-threaded bgraphBipartGg() is still nondeterministic under "
++        "SCOTCH_DETERMINISTIC=1 (bgraph_bipart_gg.c is unchanged since "
++        "7.0.17: same seeding race, same missing deterministic guard); fails "
++        "`make test-reproducibility` on the pristine build "
++        "(QUESTIONS_FOR_SCOTCH_TEAM.md 2026-10-08, 7.0.18 status)"
++    ),
+     "7.0.17": (
+         "multi-threaded bgraphBipartGg() is still nondeterministic under "
+         "SCOTCH_DETERMINISTIC=1 (the 7.0.16 seeding race and the missing "
+@@ -171,6 +179,18 @@ _PATCH_VERIFY = {
+ # retired the day upstream ships the fix. Wheels and the repo's own default
+ # builds stay pristine upstream behavior.
+ _BEHAVIORAL_PATCHES = {
++    "7.0.18": [
++        (
++            "scotch-7.0.18-bgraph-bipart-gg-determinism.patch",
++            "restore reproducibility in the multi-threaded bgraphBipartGg() "
++            "(7.0.16 regression, upstream commit 7a934a8, still present in "
++            "7.0.18: worker PRNGs seeded from the shared generator mid-draw; "
++            "SCOTCH_DETERMINISTIC ignored). Same patch as for 7.0.17: "
++            "bgraph_bipart_gg.c is unchanged. See QUESTIONS_FOR_SCOTCH_TEAM.md "
++            "2026-10-08.",
++            True,
++        ),
++    ],
+     "7.0.17": [
+         (
+             "scotch-7.0.17-bgraph-bipart-gg-determinism.patch",
+diff --git a/upstream/QUESTIONS_FOR_SCOTCH_TEAM.md b/upstream/QUESTIONS_FOR_SCOTCH_TEAM.md
+index 2e7aae0..5fb2f25 100644
+--- a/upstream/QUESTIONS_FOR_SCOTCH_TEAM.md
++++ b/upstream/QUESTIONS_FOR_SCOTCH_TEAM.md
+@@ -734,6 +734,15 @@ to run). The same patch minus the already-merged change 3
+ against the v7.0.17 tarball) restores a single partition: 3 x 30 fresh
+ processes, 2 and 4 threads, plus the `h` strategy and the PT-Scotch legs.
+ 
++**Status (7.0.18, 2026-11-02):** unchanged. `bgraph_bipart_gg.c`,
++`bgraph_bipart_gg.h` and `gain.c` are identical in v7.0.17 and v7.0.18, so
++changes 1 and 2 are still missing. The pristine 7.0.18 fails
++`test_reproducibility.py` (`make bump SCOTCH=7.0.18`, 12 fresh processes):
++the `h` strategy at 4 threads gave 5 distinct partitions, and 3 of the 5
++gate tests failed. The 7.0.17 patch applies to 7.0.18 unchanged
++(`pyscotch/_scotch_patches/scotch-7.0.18-bgraph-bipart-gg-determinism.patch`);
++with it, the gate passes 3 times at 30 fresh processes per configuration.
++
+ ThreadSanitizer cross-check on v7.0.17 (`-O1 -g -fsanitize=thread`, `gpart 4
+ m16x16_b100000_v.grf`, 4 threads, 5 runs each): the unpatched build reports the
+ seeding race every time (`intRandVal3`, `common_integer.c`, 8 report lines per
+-- 
+2.43.0
+
