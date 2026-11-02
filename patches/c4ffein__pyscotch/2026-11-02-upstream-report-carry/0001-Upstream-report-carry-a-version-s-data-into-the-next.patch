@@ -1,0 +1,217 @@
+From b4e1a037e08dfc6c2fb14b8884f3fa90487cf5f2 Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Mon, 2 Nov 2026 08:10:02 +0000
+Subject: [PATCH] Upstream report: carry a version's data into the next one
+
+Add `gen_upstream_report.py carry --version X --from <prev DATA_DIR>`, which
+starts a new version's findings.json from the previous merged one so each
+finding keeps its history and merge-audit adds the new column.
+
+merge-audit now reads the newest `location_<version>` key of an audit
+entry (and of extra.json defects), keeps the audit's
+`upstream_fix_review` (our verdict on upstream's own fix), and updates
+the reproducer kits in upstream/repro/<group>/ in place instead of
+replacing the group folder, which would have dropped every kit the next
+round did not touch. The tracker shows the upstream fix review on each
+finding page. One test covers a two-version round.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvpJnQWCnRoSKg7huQA
+---
+ docs/site/gen_analysis.py                   |  7 +++
+ scripts/gen_upstream_report.py              | 52 +++++++++++++++++++--
+ tests/pyscotch_base/test_upstream_report.py | 44 +++++++++++++++++
+ 3 files changed, 100 insertions(+), 3 deletions(-)
+
+diff --git a/docs/site/gen_analysis.py b/docs/site/gen_analysis.py
+index 20c94a9..6cda91a 100644
+--- a/docs/site/gen_analysis.py
++++ b/docs/site/gen_analysis.py
+@@ -199,6 +199,13 @@ def finding_page(f, versions, out, series_by_file):
+     )
+     if f.get("upstream_change"):
+         parts.append(f"<dt>Upstream change</dt><dd>{esc(f['upstream_change'])}</dd>")
++    ufr = f.get("upstream_fix_review") or {}
++    if ufr.get("verdict"):
++        parts.append(
++            f"<dt>Upstream fix review</dt><dd><strong>{esc(ufr['verdict'])}</strong>"
++            f"{' (' + esc(ufr['commit']) + ')' if ufr.get('commit') else ''}: {esc(ufr.get('details', ''))}"
++            f"{'<br><span class=muted>Compared with ours: ' + esc(ufr['compared_with_ours']) + '</span>' if ufr.get('compared_with_ours') else ''}</dd>"
++        )
+     if f.get("related_review_ids"):
+         parts.append(
+             "<dt>Related</dt><dd>"
+diff --git a/scripts/gen_upstream_report.py b/scripts/gen_upstream_report.py
+index c15efca..05344e2 100644
+--- a/scripts/gen_upstream_report.py
++++ b/scripts/gen_upstream_report.py
+@@ -2,6 +2,7 @@
+ """Per-Scotch-version status report for the Scotch maintainers (HTML + PDF + email draft).
+ 
+     gen_upstream_report.py ingest      --version 7.0.17 --from DIR --to DATA_DIR
++    gen_upstream_report.py carry       --version 7.0.18 --from upstream/reports/7.0.17 --to DATA_DIR
+     gen_upstream_report.py merge-audit --from WORKROOT --to DATA_DIR [--check-apply SCOTCH_GIT] [--order FILE]
+                                        [--repro-root upstream/repro]
+     gen_upstream_report.py build       --data DATA_DIR [--pdf] [--internal]
+@@ -180,6 +181,31 @@ def ingest(version, src, dest):
+ RAN_METHODS = ("ran", "partly-run", "reproduced", "both")  # old (first pass) and new (audit) vocabularies
+ 
+ 
++def carry(version, prev, dest):
++    """Start DATA_DIR for a new Scotch version from the previous version's merged data: every finding keeps its
++    history, and the next merge-audit adds this version's column. Per-version files (series, patches, groups) are
++    not carried: the new audit writes its own."""
++    prev, dest = Path(prev), Path(dest)
++    data = json.load(open(prev / "findings.json"))
++    old = data["scotch_version"]
++    if _version_order(version) <= _version_order(old):
++        raise SystemExit(f"carry: {version} is not newer than {old}")
++    dest.mkdir(parents=True, exist_ok=True)
++    out = {"scotch_version": version, "findings": data["findings"], "new": data["new"]}
++    for f in out["findings"] + out["new"]:
++        f.setdefault("history", {old: f.get("status", "")})
++    json.dump(out, open(dest / "findings.json", "w"), indent=1, ensure_ascii=False)
++    meta = json.load(open(prev / "meta.json")) if (prev / "meta.json").exists() else {}
++    meta["previous"] = {"version": old, "commit": ""}  # fill in: the commit the previous report was based on
++    meta["highlights"] = []
++    json.dump(meta, open(dest / "meta.json", "w"), indent=1, ensure_ascii=False)
++    print(f"{len(out['findings'])} findings, {len(out['new'])} further defects carried from {old} -> {dest}")
++
++
++def _version_order(v):
++    return tuple(int(p) for p in re.findall(r"\d+", v))
++
++
+ def is_run(method):
+     return method in RAN_METHODS
+ 
+@@ -209,6 +235,16 @@ def _patch_subject(path):
+     return ""
+ 
+ 
++def _location(entry, default=""):
++    """An audit's location key names its Scotch version (location_7_0_18, ...); take the newest one."""
++    keys = sorted((k for k in entry if k.startswith("location_") and entry[k]), key=_location_key)
++    return entry[keys[-1]] if keys else default
++
++
++def _location_key(key):
++    return tuple(int(p) if p.isdigit() else 0 for p in key[len("location_") :].split("_"))
++
++
+ def _audited(f, a, data_dir, group):
+     """Overlay one audit entry `a` onto the ingested finding `f` (in place)."""
+     if "first_pass" not in f:  # keep the first pass's own claims when merge-audit is re-run on overlaid data
+@@ -226,7 +262,8 @@ def _audited(f, a, data_dir, group):
+     f["ran"] = a.get("ran", "")
+     f["read_only"] = a.get("read_only", "")
+     f["why_not_run"] = a.get("why_not_run", "")
+-    f["location"] = a.get("location_7_0_17") or f.get("location", "")
++    f["location"] = _location(a, f.get("location", ""))
++    f["upstream_fix_review"] = a.get("upstream_fix_review") or {}
+     f["evidence"] = a.get("evidence", "")
+     f["upstream_change"] = a.get("upstream_change", "")
+     f["review_accuracy"] = a.get("review_accuracy", "")
+@@ -301,7 +338,8 @@ def _absorb(owner, other, group):
+ 
+ def export_group(src, dest, group, repro_root=None):
+     """Copy a group's summary and raw audit into DATA_DIR/groups/<group>/, and its source-level reproducer kit
+-    (sources, inputs, logs; no binaries or core dumps) into REPRO_ROOT/<group>/, which lives outside any version."""
++    (sources, inputs, logs; no binaries or core dumps) into REPRO_ROOT/<group>/, which lives outside any version
++    and is updated in place (files the work dir does not have are kept)."""
+     import shutil
+ 
+     gd = dest / "groups" / group
+@@ -313,7 +351,7 @@ def export_group(src, dest, group, repro_root=None):
+     if repro_root is None or not rep.is_dir():
+         return
+     out = Path(repro_root) / group
+-    shutil.rmtree(out, ignore_errors=True)
++    # Updated in place: a later version's audit adapts some kits, the others stay as the earlier audit left them.
+     for f in rep.rglob("*"):
+         if f.is_file() and REPRO_KEEP.search(f.name) and f.stat().st_size < 2_000_000:
+             t = out / f.relative_to(rep)
+@@ -360,6 +398,8 @@ def merge_audit(src, dest, check_apply=None, order_file=None, repro_root=None):
+                 n["group"] = group
+                 n["status"] = canon_status(n.get("status", "still-present"))
+                 n["related_review_ids"] = n.get("related_ids", n.get("related_review_ids", []))
++                n["location"] = _location(n, n.get("location", ""))
++                n.setdefault("history", {ver: n["status"]})
+                 opts = []
+                 for o in n.get("fix_options", []):
+                     o = dict(o)
+@@ -695,6 +735,10 @@ def main():
+     m.add_argument(
+         "--repro-root", metavar="DIR", help="where the version-independent reproducer kits go (upstream/repro)"
+     )
++    c = sub.add_parser("carry", help="start a new version's DATA_DIR from the previous version's merged data")
++    c.add_argument("--version", required=True)
++    c.add_argument("--from", dest="src", required=True, help="previous version's DATA_DIR")
++    c.add_argument("--to", dest="dest", required=True)
+     b = sub.add_parser("build")
+     b.add_argument("--data", required=True)
+     b.add_argument("--pdf", action="store_true")
+@@ -705,6 +749,8 @@ def main():
+     args = ap.parse_args()
+     if args.cmd == "ingest":
+         ingest(args.version, args.src, args.dest)
++    elif args.cmd == "carry":
++        carry(args.version, args.src, args.dest)
+     elif args.cmd == "merge-audit":
+         merge_audit(args.src, args.dest, args.check_apply, args.order, args.repro_root)
+     else:
+diff --git a/tests/pyscotch_base/test_upstream_report.py b/tests/pyscotch_base/test_upstream_report.py
+index b1d61eb..0d7536c 100644
+--- a/tests/pyscotch_base/test_upstream_report.py
++++ b/tests/pyscotch_base/test_upstream_report.py
+@@ -406,3 +406,47 @@ def test_merge_audit_keeps_one_finding_per_id_when_several_groups_record_it(tmp_
+     cor01 = next(f for f in data["findings"] if f["id"] == "COR-01")
+     assert cor01["group"] == "G01" and cor01["also"][0]["our_title"] == "G02's view of COR-01"
+     assert set(cor01["also"][0]["patch_files"]) <= set(cor01["patch_files"]), "patches of every view are kept"
++
++
++def test_carry_then_merge_adds_a_version_column_and_keeps_untouched_kits(tmp_path):
++    repo, work = _repo_with_patches(tmp_path)
++    (work / "G01" / "repro" / "COR-01").mkdir(parents=True)
++    (work / "G01" / "repro" / "COR-01" / "old.c").write_text("/* 7.0.17 kit */\n")
++    dest17 = _ingest_two(tmp_path)
++    repro_root = tmp_path / "repro"
++    gur.merge_audit(work, dest17, repro_root=repro_root)
++    (dest17 / "meta.json").write_text(json.dumps({"review": {"author": "R"}, "previous": {"version": "7.0.16"}}))
++    dest18 = tmp_path / "data18"
++    gur.carry("7.0.18", dest17, dest18)
++    with pytest.raises(SystemExit):
++        gur.carry("7.0.17", dest17, tmp_path / "older")
++    assert json.loads((dest18 / "meta.json").read_text())["previous"]["version"] == "7.0.17"
++    # the 7.0.18 round: G01 audits COR-01 again, with a 7.0.18 location and a review of upstream's fix
++    work18 = tmp_path / "work18"
++    for g in ("G01", "G02"):
++        (work18 / g).mkdir(parents=True)
++        audit = json.loads((work / g / "audit.json").read_text())
++        for a in audit:
++            a.pop("location_7_0_17", None)
++            a["location_7_0_18"] = "a.c:9"
++            a["status"] = "fixed" if a["id"] == "COR-01" else a["status"]
++            a["upstream_fix_review"] = {"commit": "abc", "verdict": "correct", "details": "d"}
++            a["patch_files"] = []
++        (work18 / g / "audit.json").write_text(json.dumps(audit))
++        extra = json.loads((work / g / "extra.json").read_text())
++        (work18 / g / "extra.json").write_text(json.dumps(extra if g == "G02" else []))
++    (work18 / "G01" / "repro" / "COR-01").mkdir(parents=True)
++    (work18 / "G01" / "repro" / "COR-01" / "new.c").write_text("/* 7.0.18 kit */\n")
++    (work18 / "G01" / "extra.json").write_text(
++        json.dumps([{"local_id": "PS3-G01-1", "our_title": "n", "status": "still-present", "location_7_0_18": "b.c:1"}])
++    )
++    gur.merge_audit(work18, dest18, repro_root=repro_root)
++    data = json.loads((dest18 / "findings.json").read_text())
++    cor01 = next(f for f in data["findings"] if f["id"] == "COR-01")
++    assert cor01["history"]["7.0.17"] == "still-present" and cor01["history"]["7.0.18"] == "fixed"
++    assert cor01["location"] == "a.c:9" and cor01["upstream_fix_review"]["verdict"] == "correct"
++    new = {n["local_id"]: n for n in data["new"]}
++    assert new["PS3-G01-1"]["location"] == "b.c:1" and new["PS3-G01-1"]["history"] == {"7.0.18": "still-present"}
++    assert "PS2-G01-1" in new, "a further defect from the previous version is carried even if no group re-records it"
++    assert (repro_root / "G01" / "COR-01" / "old.c").is_file(), "kits are updated in place, not replaced"
++    assert (repro_root / "G01" / "COR-01" / "new.c").is_file()
+-- 
+2.43.0
+

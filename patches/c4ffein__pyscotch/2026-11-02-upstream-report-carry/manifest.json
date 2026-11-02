@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/pyscotch",
+  "remote": "https://github.com/c4ffein/pyscotch.git",
+  "base_branch": "5c013d5",
+  "base_sha": "5c013d59d3e734d2497f9c33479006fbfeaa3258",
+  "created": "2026-11-02",
+  "patches": 1,
+  "title": "Upstream report: carry a version's data into the next one"
+}
