@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/pyscotch",
+  "remote": "https://github.com/c4ffein/pyscotch.git",
+  "base_branch": "b4e1a03",
+  "base_sha": "b4e1a037e08dfc6c2fb14b8884f3fa90487cf5f2",
+  "created": "2026-11-02",
+  "patches": 2,
+  "title": "Upstream report: keep cited patches in their group, name the reviewed version"
+}

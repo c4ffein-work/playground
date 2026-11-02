@@ -1,0 +1,102 @@
+From e58f2ff4d83d8aa6e92019744473b1ac66ee3e68 Mon Sep 17 00:00:00 2001
+From: c4ffein <c4ffein.work@gmail.com>
+Date: Mon, 2 Nov 2026 09:46:51 +0000
+Subject: [PATCH 1/2] Upstream report: keep cited patches in their group, name
+ the reviewed version
+
+merge-audit copied a patch cited by another group's audit entry into the
+citing group's folder, so patches/<group>/ could hold stray copies of
+other groups' commits. A patch that lives in WORKROOT/<G>/patches now stays
+in patches/<G>/. One test.
+
+The report and email named the review after `previous.version`, which is
+only right for the first round (7.0.17's report re-checked a review of
+7.0.16). meta.json's `review` may now carry its own `version` and
+`commit`; the templates fall back to `previous` when it does not.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvpJnQWCnRoSKg7huQA
+---
+ scripts/gen_upstream_report.py              |  2 ++
+ tests/pyscotch_base/test_upstream_report.py | 14 ++++++++++++++
+ upstream/report-templates/email.txt.j2      |  2 +-
+ upstream/report-templates/report.html.j2    |  6 +++---
+ 4 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/scripts/gen_upstream_report.py b/scripts/gen_upstream_report.py
+index 05344e2..833daaf 100644
+--- a/scripts/gen_upstream_report.py
++++ b/scripts/gen_upstream_report.py
+@@ -215,6 +215,8 @@ def _rel_copy(path, data_dir, sub, group):
+     src = Path(path)
+     if not src.is_file():
+         return None
++    if src.parent.name == sub and src.parent.parent.name.startswith("G"):  # another group's patch stays in its folder
++        group = src.parent.parent.name
+     dest = data_dir / sub / group / src.name
+     dest.parent.mkdir(parents=True, exist_ok=True)
+     dest.write_bytes(src.read_bytes())
+diff --git a/tests/pyscotch_base/test_upstream_report.py b/tests/pyscotch_base/test_upstream_report.py
+index 0d7536c..b74b099 100644
+--- a/tests/pyscotch_base/test_upstream_report.py
++++ b/tests/pyscotch_base/test_upstream_report.py
+@@ -450,3 +450,17 @@ def test_carry_then_merge_adds_a_version_column_and_keeps_untouched_kits(tmp_pat
+     assert "PS2-G01-1" in new, "a further defect from the previous version is carried even if no group re-records it"
+     assert (repro_root / "G01" / "COR-01" / "old.c").is_file(), "kits are updated in place, not replaced"
+     assert (repro_root / "G01" / "COR-01" / "new.c").is_file()
++
++
++def test_merge_audit_keeps_a_patch_cited_by_another_group_in_its_own_folder(tmp_path):
++    repo, work = _repo_with_patches(tmp_path)
++    audit = json.loads((work / "G02" / "audit.json").read_text())
++    g01_patch = sorted((work / "G01" / "patches").glob("*.patch"))[0]
++    audit[0]["patch_files"] = audit[0]["patch_files"] + [str(g01_patch)]
++    (work / "G02" / "audit.json").write_text(json.dumps(audit))
++    dest = _ingest_two(tmp_path)
++    gur.merge_audit(work, dest)
++    own = sorted(p.name for p in (work / "G02" / "patches").glob("*.patch"))
++    assert sorted(p.name for p in (dest / "patches" / "G02").glob("*.patch")) == own, "no stray copy in G02's folder"
++    f = next(f for f in json.loads((dest / "findings.json").read_text())["findings"] if f["id"] == audit[0]["id"])
++    assert f"patches/G01/{g01_patch.name}" in f["patch_files"]
+diff --git a/upstream/report-templates/email.txt.j2 b/upstream/report-templates/email.txt.j2
+index 17e7d56..ae300f7 100644
+--- a/upstream/report-templates/email.txt.j2
++++ b/upstream/report-templates/email.txt.j2
+@@ -4,7 +4,7 @@ Subject: Scotch {{ ver }}: status of the {{ prev.version }} findings ({{ counts.
+ 
+ Hello François,
+ 
+-Here is where things stand on Scotch {{ ver }}, using the same identifiers as {{ review.author }}'s review of {{ prev.version }} so you can follow them directly.
++Here is where things stand on Scotch {{ ver }}, using the same identifiers as {{ review.author }}'s review of {{ review.version or prev.version }} so you can follow them directly.
+ 
+ What changed in {{ ver }}
+ - {{ counts.fixed }} of the {{ counts.total }} findings are fixed ({{ counts.fixed_high }} of the high-severity ones).
+diff --git a/upstream/report-templates/report.html.j2 b/upstream/report-templates/report.html.j2
+index 2e292b3..c51a462 100644
+--- a/upstream/report-templates/report.html.j2
++++ b/upstream/report-templates/report.html.j2
+@@ -43,10 +43,10 @@
+ <section class="cover">
+   <div class="eyebrow">PyScotch · independent QA for Scotch</div>
+   <h1>Scotch {{ ver }} — where the {{ prev.version }} findings stand</h1>
+-  <p class="muted">Generated {{ generated }} · {{ total }} leads from an external review of {{ prev.version }} (commit <code>{{ prev.commit }}</code>), each re-checked against {{ ver }}{% if new|length %}, plus {{ new|length }} defects found while checking{% endif %}.</p>
++  <p class="muted">Generated {{ generated }} · {{ total }} leads from an external review of {{ review.version or prev.version }} (commit <code>{{ review.commit or prev.commit }}</code>), each re-checked against {{ ver }}{% if new|length %}, plus {{ new|length }} defects found while checking{% endif %}.</p>
+   <p class="small">Every finding below links from the index; patch sketches open with a click (the PDF prints them open).</p>
+   <div class="credit">
+-    <b>Credit.</b> The leads come from <b>{{ review.author }}</b>’s review of Scotch {{ prev.version }} ({{ review.date }}). We cite its identifiers
++    <b>Credit.</b> The leads come from <b>{{ review.author }}</b>’s review of Scotch {{ review.version or prev.version }} ({{ review.date }}). We cite its identifiers
+     (<code>COR-01</code> …) and re-state every defect in our own words; we do not reproduce the review. Everything below the identifier —
+     status in {{ ver }}, evidence, reproducers, fix options — is PyScotch’s own verification{% if verifier %} ({{ verifier }}){% endif %}.
+     Items marked <i>PS-…</i> were not in the review.
+@@ -142,7 +142,7 @@
+   <div class="f-head"><span class="f-id">{{ f.id }}</span>
+     <span class="f-title">{% if f.our_title %}{{ f.our_title }}{% else %}<span class="pending">title pending</span>{% endif %}</span>
+     {{ status(f.status) }}{{ method(f.method) }}</div>
+-  <div class="f-meta">review severity: {{ f.claimed_severity }}{% if f.severity %} · ours: <span class="sev-ours">{{ f.severity }}</span>{% if f.severity_note %} ({{ f.severity_note }}){% endif %}{% endif %} · history: reported in {{ prev.version }}, {{ labels.get(f.status, f.status) }} in {{ ver }} · <code>{{ f.location or '—' }}</code></div>
++  <div class="f-meta">review severity: {{ f.claimed_severity }}{% if f.severity %} · ours: <span class="sev-ours">{{ f.severity }}</span>{% if f.severity_note %} ({{ f.severity_note }}){% endif %}{% endif %} · history: reported in {{ review.version or prev.version }}, {{ labels.get(f.status, f.status) }} in {{ ver }} · <code>{{ f.location or '—' }}</code></div>
+   {% if f.needs %}<div class="f-meta"><b>Not run:</b> {{ needs_labels.get(f.needs, f.needs) }}{% if f.needs_note %} — {{ f.needs_note }}{% endif %}</div>{% endif %}
+   {% if f.upstream_change %}<h4>Upstream change</h4><p class="small">{{ f.upstream_change }}</p>{% endif %}
+   <h4>Evidence</h4><pre>{{ f.evidence }}</pre>
+-- 
+2.43.0
+
