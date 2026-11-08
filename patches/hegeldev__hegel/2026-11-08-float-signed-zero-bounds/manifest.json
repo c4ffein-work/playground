@@ -1,0 +1,9 @@
+{
+  "repo": "hegeldev/hegel",
+  "remote": "https://github.com/hegeldev/hegel",
+  "base_branch": "main",
+  "base_sha": "b2f2bb2e9014bda07c5ee60f5a42b7be409701e3",
+  "created": "2026-11-08",
+  "patches": 1,
+  "title": "Reject min_value=0.0, max_value=-0.0 in float draws"
+}
