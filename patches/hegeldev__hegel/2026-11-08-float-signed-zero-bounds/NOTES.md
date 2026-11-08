@@ -51,10 +51,10 @@ frontends).
 ## Issue text
 
 `ISSUE.md` is ready to paste into a hegeldev/hegel issue: summary up top,
-then collapsed sections (C++ repro, C ABI test, fix diff, affected
-frontends, how it was found). C++, TypeScript, Go and OCaml pass these
-bounds through unchanged; C++ was reproduced, the other three read from
-source.
+then collapsed sections (TypeScript repro, C ABI test, fix diff, affected
+frontends and idioms, how it was found). C++, TypeScript, Go and OCaml
+pass these bounds through unchanged; C++ and TypeScript were reproduced,
+Go and OCaml read from source.
 
 `js-repro/` holds the TypeScript-frontend reproducers: `interval.mjs`
 (sorts two drawn floats with `(a, b) => a - b`; about 1 run in 40, pinned
