@@ -13,38 +13,64 @@ Seen on `libhegel/0.50.0` and on `main` (b2f2bb2e9). The C++, TypeScript, Go and
 **Fix.** Compare the bounds with `sign_aware_lte`, as the Rust frontend does. I have a patch with a regression test and can open a PR.
 
 <details>
-<summary>Reproducer: C++ frontend</summary>
+<summary>Reproducer: C++ frontend, a realistic test</summary>
+
+A test that draws an interval, then a point inside it. Ordering the bounds with `if (hi < lo) std::swap(lo, hi)` leaves `lo = 0.0, hi = -0.0` unswapped. Without a fixed seed it fails about one run in 40 (51 of 2000 seeds, database off); seed 71 fails on every run.
 
 ```cpp
 #include <hegel/hegel.h>
-#include <cstdio>
-#include <exception>
+#include <stdexcept>
+#include <utility>
 
 namespace gs = hegel::generators;
 
-HEGEL_TEST(signed_zero_bounds)(hegel::TestCase& tc) {
-    tc.draw("x", gs::floats<double>({.min_value = 0.0, .max_value = -0.0}));
+struct Interval {
+    double lo, hi;
+    bool contains(double x) const { return lo <= x && x <= hi; }
+};
+
+HEGEL_TEST(point_drawn_in_interval_is_contained,
+           {.seed = 71, .database = hegel::Database::disabled()})(hegel::TestCase& tc) {
+    auto bound = gs::floats<double>({.min_value = -1e6, .max_value = 1e6});
+    double lo = tc.draw("lo", bound);
+    double hi = tc.draw("hi", bound);
+    if (hi < lo) std::swap(lo, hi);
+    Interval iv{lo, hi};
+
+    double x = tc.draw("x", gs::floats<double>({.min_value = iv.lo, .max_value = iv.hi}));
+    if (!iv.contains(x)) throw std::runtime_error("point outside its interval");
 }
 
-int main() {
-    try {
-        signed_zero_bounds();
-    } catch (const std::exception& e) {
-        std::printf("%s\n", e.what());
-    }
-}
+int main() { point_drawn_in_interval_is_contained(); }
 ```
 
 On `main`:
 
 ```
+Falsified after 9 test cases (0 discarded):
+
+  auto lo = 0.0;
+  auto hi = -0.0;
+
 Exception: std::runtime_error: hegel_generate_float failed (internal error): Internal error in hegel at libhegel/src/native/core/choices.rs:707:9: FloatChoice::simplest: no valid float for this choice. ...
+note: nondeterministic failure, confirmed: failed 19 of 20 replays at confirmation and 1 of 1 at report time
 ```
 
-With the fix:
+With the fix, the test still fails, since it asks for an empty range, but with an error that names the bounds (and without the spurious "nondeterministic" note):
 
 ```
+Falsified after 9 test cases (0 discarded):
+
+  auto lo = 0.0;
+  auto hi = -0.0;
+
 Exception: std::invalid_argument: min_value (0) must be <= max_value (-0) after exclusive-bound adjustment
+```
+
+The minimal form is a single draw, which fails on every seed:
+
+```cpp
+tc.draw("x", gs::floats<double>({.min_value = 0.0, .max_value = -0.0}));
 ```
 
 </details>

@@ -56,8 +56,13 @@ frontends, how it was found). C++, TypeScript, Go and OCaml pass these
 bounds through unchanged; C++ was reproduced, the other three read from
 source.
 
-`cpp-repro/` is the C++ reproducer. Build against an existing libhegel:
+`cpp-repro/` holds two C++ reproducers: `repro.cpp`, a single draw with
+`[0.0, -0.0]` (fails every run), and `interval.cpp`, a realistic test that
+draws an interval and a point in it (about 1 run in 40; pinned to seed 71
+with the database off, since a `.hegel` database replays a stored failure
+and makes every later seed look like a hit). Build against an existing
+libhegel:
 
     cmake -S cpp-repro -B build -DHEGEL_SRC=<hegel checkout> \
           -DHEGEL_LIBHEGEL_LIBRARY=<hegel checkout>/target/release/libhegel_c.so
-    cmake --build build && ./build/repro
+    cmake --build build && ./build/repro && ./build/interval
