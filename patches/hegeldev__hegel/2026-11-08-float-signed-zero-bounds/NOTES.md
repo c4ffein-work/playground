@@ -56,13 +56,15 @@ frontends, how it was found). C++, TypeScript, Go and OCaml pass these
 bounds through unchanged; C++ was reproduced, the other three read from
 source.
 
-`cpp-repro/` holds two C++ reproducers: `repro.cpp`, a single draw with
-`[0.0, -0.0]` (fails every run), and `interval.cpp`, a realistic test that
-draws an interval and a point in it (about 1 run in 40; pinned to seed 71
-with the database off, since a `.hegel` database replays a stored failure
-and makes every later seed look like a hit). Build against an existing
-libhegel:
+`js-repro/` holds the TypeScript-frontend reproducers: `interval.mjs`
+(sorts two drawn floats with `(a, b) => a - b`; about 1 run in 40, pinned
+to seed 71 with the database off, since a `.hegel` database replays a
+stored failure and makes every later seed look like a hit) and `zero.mjs`
+(a single draw with `[0, -0]`, fails every run). Run with the frontend
+built (`npm ci && npx tsc` in `frontends/typescript`) and resolvable as
+`@hegeldev/hegel`, e.g. by symlinking it into `node_modules/@hegeldev/hegel`:
 
-    cmake -S cpp-repro -B build -DHEGEL_SRC=<hegel checkout> \
-          -DHEGEL_LIBHEGEL_LIBRARY=<hegel checkout>/target/release/libhegel_c.so
-    cmake --build build && ./build/repro && ./build/interval
+    HEGEL_LIBHEGEL_PATH=<hegel>/target/release/libhegel_c.so node interval.mjs
+
+An earlier C++ version (`std::swap`, same seed 71) was dropped for the
+shorter JS one; it behaved the same.
