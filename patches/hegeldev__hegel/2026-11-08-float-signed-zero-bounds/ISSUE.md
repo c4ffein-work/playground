@@ -141,8 +141,9 @@ How each language's usual ways of ordering two floats `a, b` treat `0` and `-0`,
 | min / max | `std::min` / `std::max`: safe | `Math.min` / `Math.max`: safe | `min` / `max`, `math.Min` / `math.Max`: safe | `Float.min` / `Float.max`, `Stdlib.min` / `max`: safe |
 | sort the pair | `std::minmax`: **`[0, -0]`** | `.sort((x, y) => x - y)`: **`[0, -0]`** | `slices.Sort`: **`[0, -0]`** | `List.sort compare`: **`[0, -0]`** |
 | `if (hi < lo) swap` | **`[0, -0]`** | **`[0, -0]`** | **`[0, -0]`** | **`[0, -0]`** |
+| draw `hi` with `min = lo` | safe (the engine never draws `hi` below `lo`; run in C++) | safe | safe | safe |
 
-The min/max forms are likely why hegel-rust's `with_min_and_max` test, which uses `a.min(b)` / `a.max(b)`, never hit this.
+The ordered-pair pattern from the Python tutorial (`frontends/python/docs/tutorial/custom-generators.md`, `high` drawn with `min_value=low`) doesn't reach it; sorting the pair, e.g. with the README's `(a, b) => a - b`, does. The min/max forms are likely why hegel-rust's `with_min_and_max` test, which uses `a.min(b)` / `a.max(b)`, never hit this.
 
 </details>
 
