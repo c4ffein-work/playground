@@ -48,13 +48,16 @@ run. With it: `cargo test --release -p hegeltest-c` passes (2690 tests),
 `cargo fmt --check` and clippy are clean. Not run: `just check` (the other
 frontends).
 
-## Draft issue (if filing before the PR)
+## Issue text
 
-**Title:** libhegel: `hegel_generate_float` with `min_value=0.0, max_value=-0.0` returns an internal error
+`ISSUE.md` is ready to paste into a hegeldev/hegel issue: summary up top,
+then collapsed sections (C++ repro, C ABI test, fix diff, affected
+frontends, how it was found). C++, TypeScript, Go and OCaml pass these
+bounds through unchanged; C++ was reproduced, the other three read from
+source.
 
-`hegel_generate_float(ctx, tc, 64, 0.0, -0.0, false, false, false, false, 5e-324, &out)`
-returns `HEGEL_E_INTERNAL` with "FloatChoice::simplest: no valid float for
-this choice". Expected `HEGEL_E_INVALID_ARG`, as the Rust frontend gives
-for the same bounds. The bounds check in `generate_float` uses `>`, which
-doesn't order the two zeros; `FloatChoice` does. Hit by a C caller that
-orders two drawn floats with `a < b ? a : b`.
+`cpp-repro/` is the C++ reproducer. Build against an existing libhegel:
+
+    cmake -S cpp-repro -B build -DHEGEL_SRC=<hegel checkout> \
+          -DHEGEL_LIBHEGEL_LIBRARY=<hegel checkout>/target/release/libhegel_c.so
+    cmake --build build && ./build/repro
