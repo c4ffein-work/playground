@@ -202,14 +202,6 @@ three targeting cases and three of the five shrink-quality cases now pass,
 leaving widening (16), the six `large_factorial` discovery cases and two
 `lowering_together` cases.
 
-The cover failures are the classes of round three (observability 11,
-flakiness and stateful 13, seed and statistics wording 11, custom reprs
-and error notes 10, explain 6, discovery, engine internals, database) with
-one more sampled_from note test. The quality gain is libhegel 0.48's: the
-three targeting cases and three of the five shrink-quality cases now pass,
-leaving widening (16), the six `large_factorial` discovery cases and two
-`lowering_together` cases.
-
 **A correction, and the one patch worth sending first.** Re-measuring the
 lazy diffuse pool on its own, with one seed and 20000 wide draws through
 the C ABI (fingerprints identical before and after): 5.7 to 1.3 us per draw
