@@ -1,13 +1,16 @@
-From 0ee0b10a688dd6f76bf7f27c3b265ba9dace47cb Mon Sep 17 00:00:00 2001
+From 6d02df1a0beb9773ca3c0d279e80a701033bfc9d Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
-Date: Sun, 25 Oct 2026 18:04:39 +0000
+Date: Mon, 9 Nov 2026 21:02:40 +0000
 Subject: [PATCH] Add experimental libhegel backend and engine through
  hegeltest's binding
 
 Two experiments towards sharing one engine with libhegel, the native
 engine behind the Hegel libraries, reached through hegel._native, the
 pyo3 extension of Hegel's own Python frontend (the hegeltest package, an
-optional dependency: hypothesis[hegel]). No Rust is added to Hypothesis.
+optional dependency: hypothesis[hegel]). No Rust is added to Hypothesis,
+and nothing of the experiment is imported unless it is asked for: the
+binding loads on first use, with an error naming what is missing when
+hegeltest is absent or lacks the entry points used here.
 
 backend="hegel" is a PrimitiveProvider whose draw_* go to libhegel one to
 one (weighted and shrink_towards integers, NaN with finite bounds,
@@ -33,22 +36,22 @@ of strategy, a natively generated value is exactly what the Python
 engine draws when it replays libhegel's recorded choices through its own
 do_draw code. HYPOTHESIS_HEGEL_BATCH=0 keeps every draw interactive.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
  hypothesis/RELEASE.rst                        |  13 +
- hypothesis/pyproject.toml                     |   1 +
- hypothesis/src/hypothesis/core.py             |   9 +-
- .../hypothesis/internal/conjecture/data.py    |  65 +++
+ hypothesis/pyproject.toml                     |   3 +
+ hypothesis/src/hypothesis/core.py             |  12 +-
+ .../hypothesis/internal/conjecture/data.py    |  71 +++
  .../internal/conjecture/hegel_ir.py           | 249 +++++++++
- .../internal/conjecture/hegel_provider.py     | 517 ++++++++++++++++++
- .../internal/conjecture/hegel_runner.py       | 492 +++++++++++++++++
+ .../internal/conjecture/hegel_provider.py     | 529 ++++++++++++++++++
+ .../internal/conjecture/hegel_runner.py       | 492 ++++++++++++++++
  .../internal/conjecture/providers.py          |   2 +
- hypothesis/tests/conjecture/test_hegel_ir.py  | 161 ++++++
- .../tests/conjecture/test_hegel_provider.py   | 207 +++++++
- .../tests/conjecture/test_hegel_runner.py     | 149 +++++
+ hypothesis/tests/conjecture/test_hegel_ir.py  | 165 ++++++
+ .../tests/conjecture/test_hegel_provider.py   | 210 +++++++
+ .../tests/conjecture/test_hegel_runner.py     | 152 +++++
  .../tests/quality/test_discovery_ability.py   |   7 +-
- 12 files changed, 1870 insertions(+), 2 deletions(-)
+ 12 files changed, 1903 insertions(+), 2 deletions(-)
  create mode 100644 hypothesis/RELEASE.rst
  create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_ir.py
  create mode 100644 hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
@@ -77,37 +80,35 @@ index 00000000..e7ed794f
 +both may change or disappear in any release, and the engine flag ignores the
 +example database for now.
 diff --git a/hypothesis/pyproject.toml b/hypothesis/pyproject.toml
-index 5d68d48e..d6a165f4 100644
+index 117f38fe..95bf429f 100644
 --- a/hypothesis/pyproject.toml
 +++ b/hypothesis/pyproject.toml
-@@ -116,6 +116,7 @@ pytest = ["pytest>=4.6"]
+@@ -116,6 +116,9 @@ pytest = ["pytest>=4.6"]
  dpcontracts = ["dpcontracts>=0.4"]
  redis = ["redis>=3.0.0"]
- crosshair = ["hypothesis-crosshair>=0.0.31", "crosshair-tool>=0.0.111"]
-+hegel = ["hegeltest>=0.2.1"]
+ crosshair = ["hypothesis-crosshair>=0.0.31", "crosshair-tool>=0.0.112"]
++# EXPERIMENT: needs a hegeltest whose hegel._native carries the Hypothesis
++# bridge entry points, which no release has yet (0.4.2 is the latest).
++hegel = ["hegeltest>0.4.2"]
  # zoneinfo is an odd one: every dependency is platform-conditional.
  zoneinfo = ["tzdata>=2026.5; sys_platform == 'win32' or sys_platform == 'emscripten'"]
  # We only support Django versions with upstream support - see
 diff --git a/hypothesis/src/hypothesis/core.py b/hypothesis/src/hypothesis/core.py
-index ecc9c6ef..96b9035a 100644
+index eb467926..1e1f42bb 100644
 --- a/hypothesis/src/hypothesis/core.py
 +++ b/hypothesis/src/hypothesis/core.py
-@@ -85,6 +85,7 @@ from hypothesis.internal.conjecture.engine import (
-     ConjectureRunner,
-     ExitReason,
- )
-+from hypothesis.internal.conjecture.hegel_runner import hegel_engine_enabled
- from hypothesis.internal.conjecture.junkdrawer import (
-     ensure_free_stackframes,
-     gc_cumulative_time,
-@@ -1417,7 +1418,13 @@ class StateForActualGivenExecution:
+@@ -1448,7 +1448,17 @@ class StateForActualGivenExecution:
              else:
                  database_key = None
  
 -        runner = ConjectureRunner(
 +        runner_cls: Any = ConjectureRunner
-+        if hegel_engine_enabled() and self.settings.backend == "hypothesis":
-+            # EXPERIMENT: libhegel owns the run loop; see hegel_runner.py
++        if (
++            os.environ.get("HYPOTHESIS_ENGINE") == "hegel"
++            and self.settings.backend == "hypothesis"
++        ):
++            # EXPERIMENT: libhegel owns the run loop; see hegel_runner.py.
++            # Imported here so nothing of it loads without the flag.
 +            from hypothesis.internal.conjecture.hegel_runner import HegelRunner
 +
 +            runner_cls = HegelRunner
@@ -116,7 +117,7 @@ index ecc9c6ef..96b9035a 100644
              settings=self.settings,
              random=self.random,
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/data.py b/hypothesis/src/hypothesis/internal/conjecture/data.py
-index 29ace6ef..75e5e82c 100644
+index dbb6a218..e24597d1 100644
 --- a/hypothesis/src/hypothesis/internal/conjecture/data.py
 +++ b/hypothesis/src/hypothesis/internal/conjecture/data.py
 @@ -10,6 +10,7 @@
@@ -157,7 +158,7 @@ index 29ace6ef..75e5e82c 100644
  threadlocal = ThreadLocal(global_test_counter=int)
  
  
-@@ -903,6 +927,10 @@ class ConjectureData:
+@@ -912,6 +936,10 @@ class ConjectureData:
          elif forced is None:
              value = getattr(self.provider, f"draw_{choice_type}")(**constraints)
          else:
@@ -168,7 +169,7 @@ index 29ace6ef..75e5e82c 100644
              value = forced
  
          # nan values generated via int_to_float break list membership:
-@@ -1242,6 +1270,30 @@ class ConjectureData:
+@@ -1251,6 +1279,36 @@ class ConjectureData:
          self.index += 1
          return choice
  
@@ -186,20 +187,26 @@ index 29ace6ef..75e5e82c 100644
 +                    value=value,
 +                    constraints=_PERMISSIVE_CONSTRAINTS[choice_type],
 +                    was_forced=False,
-+                    index=len(self.nodes) + len(nodes),
++                    index=len(self._nodes) + len(nodes),
 +                )
 +            )
-+        self.nodes += tuple(nodes)
-+        self.length += choices_size([n.value for n in nodes])
++        self._nodes.extend(nodes)
++        self.length += sum(choice_size(n.value) for n in nodes)
 +        if self.length > self.max_length or (
-+            self.max_choices is not None and len(self.nodes) > self.max_choices
++            self.max_choices is not None and len(self._nodes) > self.max_choices
 +        ):
 +            self.mark_overrun()
++
++    def _hegel_replace_nodes(self, nodes: Sequence[ChoiceNode]) -> None:
++        """EXPERIMENT: take a native engine's own record of the case as this
++        data's nodes (it includes the draws Python never saw)."""
++        self._nodes = list(nodes)
++        self._nodes_tuple = tuple(nodes)
 +
      def as_result(self) -> ConjectureResult | _Overrun:
          """Convert the result of running this test into
          either an Overrun object or a ConjectureResult."""
-@@ -1314,6 +1366,19 @@ class ConjectureData:
+@@ -1323,6 +1381,19 @@ class ConjectureData:
              label = unwrapped.label
              assert isinstance(label, int)
  
@@ -476,10 +483,10 @@ index 00000000..f34a27af
 +    return compiled
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
 new file mode 100644
-index 00000000..2d62c51a
+index 00000000..43620684
 --- /dev/null
 +++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_provider.py
-@@ -0,0 +1,517 @@
+@@ -0,0 +1,529 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -532,11 +539,6 @@ index 00000000..2d62c51a
 +from hypothesis.internal.conjecture.utils import LABEL_MASK
 +from hypothesis.internal.intervalsets import IntervalSet
 +
-+try:
-+    from hegel import _native
-+except ImportError:  # pragma: no cover
-+    _native = None
-+
 +T = TypeVar("T")
 +
 +INT64_MIN = -(2**63)
@@ -564,12 +566,29 @@ index 00000000..2d62c51a
 +    return SURROGATES[0] <= lo and hi <= SURROGATES[1]
 +
 +
++_native: Any = None
++
++
 +def native() -> Any:
-+    """The ``hegel._native`` module, or an error naming the dependency."""
-+    if _native is None:  # pragma: no cover
-+        raise InvalidArgument(
-+            "The libhegel engine needs the hegeltest package (pip install hegeltest)"
-+        )
++    """The ``hegel._native`` module of the hegeltest package, imported on
++    first use so that Hypothesis without the experiment never loads it."""
++    global _native
++    if _native is None:
++        try:
++            from hegel import _native as module
++        except ImportError:  # pragma: no cover
++            raise InvalidArgument(
++                "The libhegel engine needs the hegeltest package "
++                "(pip install hypothesis[hegel])"
++            ) from None
++        if not hasattr(module, "CompiledStrategy"):  # pragma: no cover
++            raise InvalidArgument(
++                "The installed hegeltest does not have the entry points this "
++                "experiment uses (TestCase.generate, generate_integer_weighted, "
++                "choices_blob, from_blob, StringGenerator.text_ranges); it needs "
++                "a build carrying the Hypothesis bridge patches."
++            )
++        _native = module
 +    return _native
 +
 +
@@ -999,7 +1018,7 @@ index 00000000..2d62c51a
 +    return base64.b64encode(b"\x00" + bytes(buf)).decode("ascii")
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
 new file mode 100644
-index 00000000..e53f9ebf
+index 00000000..9019193f
 --- /dev/null
 +++ b/hypothesis/src/hypothesis/internal/conjecture/hegel_runner.py
 @@ -0,0 +1,492 @@
@@ -1452,7 +1471,7 @@ index 00000000..e53f9ebf
 +        blob = provider.choices_blob()
 +        choices = None if blob is None else decode_choices(blob)
 +        if choices is not None:
-+            data.nodes = _nodes_from_choices(choices)
++            data._hegel_replace_nodes(_nodes_from_choices(choices))
 +        data.freeze()
 +        self._stats.append(
 +            {
@@ -1496,7 +1515,7 @@ index 00000000..e53f9ebf
 +                self.interesting_test_cases[origin] = result
 +        tc.mark_complete(_status(data.status), origin_key)
 diff --git a/hypothesis/src/hypothesis/internal/conjecture/providers.py b/hypothesis/src/hypothesis/internal/conjecture/providers.py
-index fd1951b5..3e8ba02c 100644
+index 1c4a1860..7cf26b77 100644
 --- a/hypothesis/src/hypothesis/internal/conjecture/providers.py
 +++ b/hypothesis/src/hypothesis/internal/conjecture/providers.py
 @@ -130,6 +130,8 @@ INTEGERS_DISTRIBUTION = PiecewiseDistribution(
@@ -1510,10 +1529,10 @@ index fd1951b5..3e8ba02c 100644
  CacheKeyT: TypeAlias = tuple[ChoiceTypeT, tuple[Any, ...]]
 diff --git a/hypothesis/tests/conjecture/test_hegel_ir.py b/hypothesis/tests/conjecture/test_hegel_ir.py
 new file mode 100644
-index 00000000..bce4c7cb
+index 00000000..aa430242
 --- /dev/null
 +++ b/hypothesis/tests/conjecture/test_hegel_ir.py
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,165 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -1540,6 +1559,10 @@ index 00000000..bce4c7cb
 +from hypothesis.internal.conjecture.data import ConjectureData
 +from hypothesis.internal.conjecture.hegel_ir import NOT_BATCHABLE, compile_strategy
 +from hypothesis.internal.conjecture.hegel_runner import HegelCaseProvider, HegelRunner
++
++_native = pytest.importorskip("hegel._native")
++if not hasattr(_native, "CompiledStrategy"):
++    pytest.skip("hegeltest lacks the bridge entry points", allow_module_level=True)
 +
 +
 +@pytest.fixture(autouse=True)
@@ -1677,10 +1700,10 @@ index 00000000..bce4c7cb
 +    assert HegelCaseProvider.batched_draws == before
 diff --git a/hypothesis/tests/conjecture/test_hegel_provider.py b/hypothesis/tests/conjecture/test_hegel_provider.py
 new file mode 100644
-index 00000000..b8e0772f
+index 00000000..52492fcd
 --- /dev/null
 +++ b/hypothesis/tests/conjecture/test_hegel_provider.py
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,210 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -1711,7 +1734,6 @@ index 00000000..b8e0772f
 +    native,
 +)
 +from hypothesis.internal.intervalsets import IntervalSet
-+
 +from tests.common.debug import minimal
 +from tests.conjecture.common import (
 +    draw_value,
@@ -1720,6 +1742,10 @@ index 00000000..b8e0772f
 +    nodes,
 +    string_constr,
 +)
++
++_native = pytest.importorskip("hegel._native")
++if not hasattr(_native, "CompiledStrategy"):
++    pytest.skip("hegeltest lacks the bridge entry points", allow_module_level=True)
 +
 +HEGEL = settings(backend="hegel", database=None)
 +
@@ -1890,10 +1916,10 @@ index 00000000..b8e0772f
 +        )
 diff --git a/hypothesis/tests/conjecture/test_hegel_runner.py b/hypothesis/tests/conjecture/test_hegel_runner.py
 new file mode 100644
-index 00000000..ed18d1a8
+index 00000000..8d2a82c6
 --- /dev/null
 +++ b/hypothesis/tests/conjecture/test_hegel_runner.py
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,152 @@
 +# This file is part of Hypothesis, which may be found at
 +# https://github.com/HypothesisWorks/hypothesis/
 +#
@@ -1926,8 +1952,11 @@ index 00000000..ed18d1a8
 +    HegelRunner,
 +    hegel_engine_enabled,
 +)
-+
 +from tests.common.debug import minimal
++
++_native = pytest.importorskip("hegel._native")
++if not hasattr(_native, "CompiledStrategy"):
++    pytest.skip("hegeltest lacks the bridge entry points", allow_module_level=True)
 +
 +
 +@pytest.fixture(autouse=True)

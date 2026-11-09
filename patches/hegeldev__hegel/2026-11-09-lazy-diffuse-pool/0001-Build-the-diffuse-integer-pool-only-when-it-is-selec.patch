@@ -1,18 +1,19 @@
-From dfd6462082d5a2db5611e471f173aaecd69020b0 Mon Sep 17 00:00:00 2001
+From bbd4af21feb4622784c204e83f3f81cf1033a9d8 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
-Date: Sun, 25 Oct 2026 19:24:14 +0000
+Date: Mon, 9 Nov 2026 20:50:24 +0000
 Subject: [PATCH] Build the diffuse integer pool only when it is selected
 
 biguint_sample_in_range built its diffuse pool (up to 256 bignum powers
 of two, sorted and deduplicated) on every draw over a range wider than
 i128, although that category is picked a small fraction of the time; the
 interesting pool was already built lazily. Doing the same for the diffuse
-one takes a seeded wide draw from 5.7 to 1.3 microseconds at the dev
-profile (3.0 to 1.2 at release), with the same RNG consumption and so
-the same values: 20000 draws from one seed fingerprint identically
-before and after.
+one takes a seeded wide draw from 3.5 to 0.9 microseconds in a release
+build (3.5 to 1.3 at the dev profile; best of seven runs of 20000 draws),
+with the same RNG consumption and so the same values: the draws from one
+seed fingerprint identically before and after. The existing embedded
+tests of the wide sampler take the moved branch.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
  libhegel/RELEASE.md               |  3 +++
@@ -22,18 +23,18 @@ Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 
 diff --git a/libhegel/RELEASE.md b/libhegel/RELEASE.md
 new file mode 100644
-index 00000000..0c333a55
+index 00000000..9c7bbb22
 --- /dev/null
 +++ b/libhegel/RELEASE.md
 @@ -0,0 +1,3 @@
 +RELEASE_TYPE: patch
 +
-+This patch improves the performance of integer draws over ranges wider than `i128`, such as a frontend's unbounded `integers()` clamped to `[-2**128, 2**128]`. The sampler built its "diffuse" pool of candidates (up to 256 big-integer powers of two, sorted and deduplicated) on every draw, although that category is selected only a small fraction of the time; it is now built only when selected, as the "interesting" pool already was. Such a draw takes about a quarter of the time it did, and generates exactly the same values from the same seed.
++This patch improves the performance of integer draws over ranges wider than `i128`, such as a frontend's unbounded `integers()` clamped to `[-2**128, 2**128]`. The sampler built its "diffuse" pool of candidates (up to 256 big-integer powers of two, sorted and deduplicated) on every draw, although that category is selected only a small fraction of the time; it is now built only when selected, as the "interesting" pool already was. In a release build such a draw goes from about 3.5 microseconds to about 0.9, and generates exactly the same values from the same seed.
 diff --git a/libhegel/src/native/core/state.rs b/libhegel/src/native/core/state.rs
-index e7496efa..ab83a9fc 100644
+index 7f38cfd9..7ec3969d 100644
 --- a/libhegel/src/native/core/state.rs
 +++ b/libhegel/src/native/core/state.rs
-@@ -1084,23 +1084,6 @@ fn biguint_sample_in_range(
+@@ -1082,23 +1082,6 @@ fn biguint_sample_in_range(
          }
      }
  
@@ -57,7 +58,7 @@ index e7496efa..ab83a9fc 100644
      // One shared draw selects the category by cumulative weight; an empty
      // category is skipped so its mass flows to the next (finally the middle). A
      // range beyond `i128` always has non-empty endpoints.
-@@ -1125,8 +1108,27 @@ fn biguint_sample_in_range(
+@@ -1123,8 +1106,27 @@ fn biguint_sample_in_range(
          }
      }
      acc += params.diffuse_probability;

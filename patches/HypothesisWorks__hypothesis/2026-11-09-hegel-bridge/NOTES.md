@@ -1,10 +1,12 @@
 # Hypothesis on libhegel: from a draw-level backend to a runner-level engine
 
 Session notes for the Hypothesis-on-libhegel experiment. The current
-series are this one against Hypothesis master (5057a16c, v6.170.9) and
-`patches/hegeldev__hegel/2026-10-25-hypothesis-bridge` against the Hegel
-monorepo (36f65de4, libhegel 0.48.0, hegeltest for Python 0.2.1); round four
-below describes them. Rounds one to three were cut against Hypothesis
+series are this one against Hypothesis master (9ab0be61, v6.170.15) and
+`patches/hegeldev__hegel/2026-11-09-hypothesis-bridge` against the Hegel
+monorepo (d278c5ca, libhegel 0.51.0, hegeltest for Python 0.4.2), plus the
+independent `patches/hegeldev__hegel/2026-11-09-lazy-diffuse-pool`. Round
+four below describes the design; "Re-cut and review" right after this
+introduction says what changed since and which earlier claims were wrong. Rounds one to three were cut against Hypothesis
 6.168.3 and the now-archived hegel-rust repository (libhegel 0.44.1); their
 series are superseded and removed, the notes stand.
 The question was whether Hypothesis's Python-to-Rust engine migration
@@ -28,6 +30,107 @@ native engine, and how to check equivalence. Three rounds:
    moved into the Hegel monorepo (libhegel plus `hegel._native`, the pyo3
    extension of Hegel's Python frontend), Hypothesis's half became Python
    only over `hegeltest` as an optional dependency. See "Round four".
+
+## Re-cut and review (2026-11-09)
+
+Two weeks after round four the work was reviewed with fresh eyes and all
+three series were rebased onto today's upstreams and rebuilt. Read this
+section before trusting any number further down.
+
+**Claims that were wrong, now corrected or marked:**
+
+- **Every libhegel time measured before round three's final table came
+  from an unoptimized build of the extension.** The first `--release`
+  build happened in the middle of round three; the per-case engine cost
+  dropped tenfold at that moment and was misread as machine load and as
+  the lazy-pool fix. So round two's "Speed" section (generation 1.1-1.5x
+  slower than the Python engine, "the cover suite takes 15 minutes against
+  3.5") says nothing about the engine and is marked as such below. Its
+  call counts stand; its times and its explanation do not.
+- **The lazy diffuse pool is worth 2.5-4x per wide draw, not 50x** (already
+  corrected in round four). Re-measured today as the best of seven runs of
+  20000 seeded draws: 3.5 to 0.9 us in a release build, 3.5 to 1.3 at the
+  dev profile, identical fingerprints. The existing embedded tests of the
+  wide sampler take the moved branch 81 times, so the coverage gate is not
+  at risk.
+- **"libhegel finds the bugs in 2 to 35 calls against 17 to 1414" is thin
+  evidence**: four hand-picked bugs, three seeds each, all of them
+  boundary- or duplicate-shaped, which is exactly where libhegel's bias
+  toward simplest values pays. Finding "two records with the same id" on
+  the second test case mostly shows that bias. It supports "libhegel is
+  much better at this shape of bug", not "libhegel finds bugs faster".
+- **The optional dependency pin could not work**: `hegeltest>=0.2.1`, when
+  no released hegeltest has the entry points. The extra now says so, and
+  the binding is checked at first use with an error naming what is
+  missing.
+- **`import hypothesis` loaded `hegel` for everyone who had it installed**
+  (core.py imported the runner module, which imported the provider, which
+  imported the binding). The binding now loads on first use and core.py
+  imports the runner only under the flag. The three test files skip
+  without a suitable hegeltest instead of failing.
+
+**What the rebase took** (libhegel 0.48.0 to 0.51.0, hegeltest 0.2.1 to
+0.4.2, Hypothesis 6.170.9 to 6.170.15):
+
+- libhegel: one line (generation parameters are read per stream now).
+  The lazy pool was taken out of the bridge's libhegel commit, so the two
+  series are independent and either can land first.
+- Python frontend: the module list in `lib.rs` (a grammar module arrived);
+  `TestCase::tc` was already `pub(crate)` upstream.
+- Hypothesis: `git apply --check` passed and the code was broken anyway.
+  `ConjectureData.nodes` became a property over a list and `choices_size`
+  left `data.py` (upstream's own speed work on the Python engine), so the
+  batched recording raised at run time. Fixed with `_nodes.extend`, the new
+  `choice_size`, and a `_hegel_replace_nodes` helper. A patch that applies
+  is not a patch that works; only the tests said so.
+
+**Checks actually run this time**, including the ones round four skipped:
+
+| check | result |
+|---|---|
+| libhegel `cargo test` with the shared library built (so `smoke` runs), three times | all pass |
+| libhegel clippy, fmt, header and FFI list regenerated | clean |
+| Python frontend: ruff format, ruff, mypy | clean |
+| Python frontend: its own suite under its 100% line and branch coverage gate | 608 passed, 100% |
+| Python frontend: Hypothesis's test suite ported to the Hegel API | 2101 passed, 1 skipped |
+| Hypothesis: the three hegel test files, with the equivalence test | 97 passed |
+| Hypothesis `tests/cover` under `HYPOTHESIS_ENGINE=hegel` | 3925 passed, 71 failed (round four: 3921 / 70) |
+| Hypothesis `tests/quality` under `HYPOTHESIS_ENGINE=hegel` | 248 passed, 24 failed (unchanged) |
+
+Not run: the other frontends' checks (they bind only the C functions they
+use, so new entry points should not affect them, but this is an inference),
+the monorepo's coverage ratchet for libhegel's Rust code, and any
+third-party Hypothesis suite. That last one remains the strongest missing
+evidence.
+
+The cover failures are the same classes as before. Two tests moved: they
+expect `Unsatisfiable` from a filter that rejects everything in a small
+finite set and now get libhegel's filter health check first. They passed
+against 0.48, so something in 0.49-0.51 changed which fires first, or the
+tests changed; its changelog does not say and this was not investigated.
+
+**The big-test benchmark again**, same script, today's versions, a
+different container from October's, single runs:
+
+| generation, per example | python 6.170.9 (Oct) | python 6.170.15 | libhegel 0.48 (Oct) | libhegel 0.51 |
+|---|---|---|---|---|
+| lists of 100-200 records | 76.3 ms | 43.1 ms | 5.7 ms | 6.1 ms |
+| the same, unique by id | 93.4 ms | 65.8 ms | 17.2 ms | 13.4 ms |
+| 30x30 matrix of integers | 30.3 ms | 21.7 ms | 4.1 ms | 5.8 ms |
+
+Hypothesis's own engine got a good deal faster in two weeks (upstream
+moved `ConjectureData`'s nodes to a list and stopped serializing choices
+to size them, the same changes that broke this patch). The headline ratio
+on large records is therefore 7x today, not 12.5x; 4.9x unique, 3.7x on
+the matrix. The machine differs too, though libhegel's numbers moving
+little suggests it is comparable. The hunts are unchanged in shape: the
+same found-at calls for the Python engine seed for seed, libhegel between
+2 and 744 calls against 17 to 1414, shrink call counts as before, every
+libhegel run at the expected minimum and the Python engine short of it on
+the same two seeds of the duplicate-id case. Whole hunt plus shrink is now
+faster under libhegel on three of the four cases and level on the fourth.
+The moving baseline is the point to keep: any ratio in these notes is a
+snapshot against a Python engine that is itself being optimized.
 
 ## Round four: the bridge on Hegel's binding (2026-10-25)
 
@@ -115,7 +218,7 @@ at the monorepo's dev profile, 3.0 to 1.2 at release, and the untouched
 three compared an unoptimized build with an optimized one. The fix is
 real and free, just 2.5-4x, not 50x. It is cut as its own single commit
 against the monorepo's main,
-`patches/hegeldev__hegel/2026-10-25-lazy-diffuse-pool` with a `PR.md`
+`patches/hegeldev__hegel/2026-11-09-lazy-diffuse-pool` with a `PR.md`
 beside it, because it needs no design conversation: same values, same
 seed, less work.
 
@@ -339,8 +442,10 @@ Reading it:
   `ChoiceNode`s on the way back; recording the choice sequence lazily
   (keep libhegel's blob, materialise nodes only when something reads
   them) is the next step and would take that case toward the records'.
-- **libhegel finds the bugs in a fraction of the examples**: 2 to 35 calls
-  against 17 to 1414. Its generation is far more biased to boundaries and
+- **libhegel finds these bugs in a fraction of the examples**: 2 to 35 calls
+  against 17 to 1414. This is four hand-picked boundary- and
+  duplicate-shaped bugs with three seeds each, so it shows what libhegel's
+  bias is good at, not a general rate. Its generation is far more biased to boundaries and
   duplicates (round two measured 6% zero integers against 0.1%), which is
   exactly what these bugs want; the quality suite's `large_factorial`
   cases are the price of the same bias.
@@ -499,6 +604,12 @@ engine generate, let `do_draw` decorate.
   Hypothesis's optimiser on the "threshold bug" cases.
 
 ## Speed
+
+**Do not read the libhegel column's times as an engine comparison.** They
+were measured with an unoptimized build of the extension (see "Re-cut and
+review"). The call counts are valid; the times, the "15 minutes against
+3.5" for the cover suite, and the explanation under the table are not.
+Round three's table is the first measured on an optimized build.
 
 Whole loop, seconds and test-function calls, Python engine versus libhegel
 runner (2000 examples; find + shrink with 500):

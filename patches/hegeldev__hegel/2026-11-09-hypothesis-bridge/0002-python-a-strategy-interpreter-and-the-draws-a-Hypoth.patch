@@ -1,6 +1,6 @@
-From 2647d9e87d5ae409982ef0ce5cbf086dba04f55c Mon Sep 17 00:00:00 2001
+From d3468b945c7054a406ba2f5c06b710536ebef159 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
-Date: Sun, 25 Oct 2026 18:04:03 +0000
+Date: Mon, 9 Nov 2026 20:59:18 +0000
 Subject: [PATCH 2/2] python: a strategy interpreter and the draws a Hypothesis
  frontend needs
 
@@ -14,12 +14,10 @@ small entry points a frontend built on another API needs: a weighted
 integer draw carrying shrink_towards, a forced integer draw, a text
 generator over explicit codepoint ranges, a live case's choices as a
 blob, and a test case replaying a blob outside a run. Nothing changes for
-hegel.generators. Ported from the Hypothesis-side extension of the
-experiment running Hypothesis on libhegel, and Hypothesis-agnostic: the
-frontend passes its draw, record and invalid callbacks and its retry
-exception.
+hegel.generators. Hypothesis-agnostic: the frontend passes its draw,
+record and invalid callbacks and its retry exception.
 
-Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
  frontends/python/RELEASE.md                  |   3 +
@@ -27,9 +25,9 @@ Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
  frontends/python/src/interpret.rs            | 737 +++++++++++++++++++
  frontends/python/src/lib.rs                  |   3 +
  frontends/python/src/strings.rs              |  21 +
- frontends/python/src/test_case.rs            | 115 ++-
+ frontends/python/src/test_case.rs            | 113 ++-
  frontends/python/tests/test_native_bridge.py | 171 +++++
- 7 files changed, 1081 insertions(+), 8 deletions(-)
+ 7 files changed, 1080 insertions(+), 7 deletions(-)
  create mode 100644 frontends/python/RELEASE.md
  create mode 100644 frontends/python/src/interpret.rs
  create mode 100644 frontends/python/tests/test_native_bridge.py
@@ -44,7 +42,7 @@ index 00000000..b496d360
 +
 +This patch adds to `hegel._native`, for a frontend that drives libhegel through this binding rather than through `hegel.generators`, the pieces an experiment putting Hypothesis on libhegel needed: `TestCase.generate_integer_weighted` and a `forced` argument to `TestCase.generate_integer`, `StringGenerator.text_ranges`, `TestCase.choices_blob`, `TestCase.from_blob`, and `TestCase.generate`, which walks a `CompiledStrategy` (a strategy compiled by its frontend into a small tree of draws, collections, alternatives, mapped and filtered values and opaque leaves) against the test case in one call, recording the choices it made. Nothing changes for `hegel.generators`.
 diff --git a/frontends/python/python/hegel/_native.pyi b/frontends/python/python/hegel/_native.pyi
-index 1ce40a6d..eb8055d6 100644
+index fc1282de..97e7c636 100644
 --- a/frontends/python/python/hegel/_native.pyi
 +++ b/frontends/python/python/hegel/_native.pyi
 @@ -1,7 +1,8 @@
@@ -57,7 +55,7 @@ index 1ce40a6d..eb8055d6 100644
  
  # -- exceptions ---------------------------------------------------------------
  
-@@ -106,6 +107,10 @@ class StringGenerator:
+@@ -110,6 +111,10 @@ class StringGenerator:
          exclude_characters: str | None,
      ) -> StringGenerator: ...
      @staticmethod
@@ -68,7 +66,7 @@ index 1ce40a6d..eb8055d6 100644
      def regex(
          pattern: str, fullmatch: bool, alphabet: StringGenerator | None
      ) -> StringGenerator: ...
-@@ -152,14 +157,44 @@ class RunResult:
+@@ -178,14 +183,44 @@ class RunResult:
      def failure_count(self) -> int: ...
      def failure(self, index: int) -> tuple[str, str | None, str | None]: ...
  
@@ -858,33 +856,34 @@ index 00000000..78416e22
 +    })
 +}
 diff --git a/frontends/python/src/lib.rs b/frontends/python/src/lib.rs
-index 03b84f38..e7b7a3fc 100644
+index ae6aaf48..ae6fe16d 100644
 --- a/frontends/python/src/lib.rs
 +++ b/frontends/python/src/lib.rs
-@@ -15,11 +15,13 @@ use pyo3::types::PyModule;
- use std::ffi::{c_char, c_void};
+@@ -16,12 +16,14 @@ use std::ffi::{c_char, c_void};
  use std::sync::{Arc, Mutex};
  
+ mod grammar;
 +mod interpret;
  mod printer;
  mod settings;
  mod strings;
  mod test_case;
  
+ pub(crate) use grammar::{Grammar, GrammarBuilder, GrammarDraw};
 +pub(crate) use interpret::CompiledStrategy;
  pub(crate) use printer::Printer;
  pub(crate) use settings::Settings;
  pub(crate) use strings::StringGenerator;
-@@ -285,6 +287,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+@@ -301,6 +303,7 @@ fn _native(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
      m.add_class::<Pool>()?;
      m.add_class::<StateMachine>()?;
      m.add_class::<StringGenerator>()?;
 +    m.add_class::<CompiledStrategy>()?;
      m.add_class::<Printer>()?;
-     m.add_function(wrap_pyfunction!(version, m)?)?;
-     m.add_function(wrap_pyfunction!(label_from_name, m)?)?;
+     m.add_class::<GrammarBuilder>()?;
+     m.add_class::<Grammar>()?;
 diff --git a/frontends/python/src/strings.rs b/frontends/python/src/strings.rs
-index e00e182e..b45a3a22 100644
+index 44a77078..ee4b755a 100644
 --- a/frontends/python/src/strings.rs
 +++ b/frontends/python/src/strings.rs
 @@ -65,6 +65,27 @@ impl StringGenerator {
@@ -916,7 +915,7 @@ index e00e182e..b45a3a22 100644
      #[pyo3(signature = (pattern, fullmatch, alphabet))]
      fn regex(pattern: &str, fullmatch: bool, alphabet: Option<&StringGenerator>) -> PyResult<Self> {
 diff --git a/frontends/python/src/test_case.rs b/frontends/python/src/test_case.rs
-index 663bb470..f4bc6cdb 100644
+index 92c768b7..0ed58423 100644
 --- a/frontends/python/src/test_case.rs
 +++ b/frontends/python/src/test_case.rs
 @@ -1,8 +1,9 @@
@@ -924,23 +923,14 @@ index 663bb470..f4bc6cdb 100644
  use crate::printer::{Printer, with_options};
  use crate::{
 -    InternalError, OutputBuffer, SendPtr, Settings, StringGenerator, big_from_le, big_to_le, check,
--    hstr, hstr_bytes, hstrs, opt_string_from, output_trampoline, output_user_data, string_from,
--    with_ctx,
+-    hstr, hstr_bytes, max_size_arg, opt_string_from, output_trampoline, output_user_data,
+-    string_from, with_ctx,
 +    InternalError, InvalidArgument, OutputBuffer, SendPtr, Settings, StringGenerator, big_from_le,
-+    big_to_le, check, hstr, hstr_bytes, hstrs, opt_string_from, output_trampoline,
++    big_to_le, check, hstr, hstr_bytes, max_size_arg, opt_string_from, output_trampoline,
 +    output_user_data, string_from, with_ctx,
  };
  use hegel_c as c;
  use hegel_c::hegel_result_t as Rc;
-@@ -215,7 +216,7 @@ impl Drop for TestCase {
- }
- 
- impl TestCase {
--    fn tc(&self) -> *mut c::HegelTestCase {
-+    pub(crate) fn tc(&self) -> *mut c::HegelTestCase {
-         self.raw.0
-     }
- }
 @@ -342,8 +343,52 @@ impl TestCase {
          Ok(out)
      }
