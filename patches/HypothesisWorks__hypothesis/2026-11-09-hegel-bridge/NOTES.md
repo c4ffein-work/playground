@@ -2,9 +2,10 @@
 
 Session notes for the Hypothesis-on-libhegel experiment. The current
 series are this one against Hypothesis master (9ab0be61, v6.170.15) and
-`patches/hegeldev__hegel/2026-11-09-hypothesis-bridge` against the Hegel
-monorepo (d278c5ca, libhegel 0.51.0, hegeltest for Python 0.4.2), plus the
-independent `patches/hegeldev__hegel/2026-11-09-lazy-diffuse-pool`. Round
+`patches/hegeldev__hegel/2026-11-11-hypothesis-bridge` against the Hegel
+monorepo (d74a7a73 on 2026-11-11, libhegel 0.51, hegeltest for Python
+0.4.3), plus the
+independent `patches/hegeldev__hegel/2026-11-11-lazy-diffuse-pool`. Round
 four below describes the design; "Re-cut and review" right after this
 introduction says what changed since and which earlier claims were wrong. Rounds one to three were cut against Hypothesis
 6.168.3 and the now-archived hegel-rust repository (libhegel 0.44.1); their
@@ -96,6 +97,13 @@ section before trusting any number further down.
 | Hypothesis: the three hegel test files, with the equivalence test | 97 passed |
 | Hypothesis `tests/cover` under `HYPOTHESIS_ENGINE=hegel` | 3925 passed, 71 failed (round four: 3921 / 70) |
 | Hypothesis `tests/quality` under `HYPOTHESIS_ENGINE=hegel` | 248 passed, 24 failed (unchanged) |
+
+A slip in this re-cut, fixed two days later: the monorepo had moved
+release notes from `<component>/RELEASE.md` to `<component>/RELEASE/<slug>.md`
+before 2026-11-09 and the series still used the old location, which its
+release check rejects. Both Hegel series were rebased onto main of
+2026-11-11 with the files in the right place; `release.py check`, the
+libhegel suite and the bridge tests pass there.
 
 Not run: the other frontends' checks (they bind only the C functions they
 use, so new entry points should not affect them, but this is an inference),
@@ -210,7 +218,7 @@ at the monorepo's dev profile, 3.0 to 1.2 at release, and the untouched
 three compared an unoptimized build with an optimized one. The fix is
 real and free, just 2.5-4x, not 50x. It is cut as its own single commit
 against the monorepo's main,
-`patches/hegeldev__hegel/2026-11-09-lazy-diffuse-pool` with a `PR.md`
+`patches/hegeldev__hegel/2026-11-11-lazy-diffuse-pool` with a `PR.md`
 beside it, because it needs no design conversation: same values, same
 seed, less work.
 

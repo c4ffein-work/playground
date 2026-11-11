@@ -1,4 +1,4 @@
-From d3468b945c7054a406ba2f5c06b710536ebef159 Mon Sep 17 00:00:00 2001
+From 4d846fc287ccebddfc6e11d0f480a00e8fca49fe Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 9 Nov 2026 20:59:18 +0000
 Subject: [PATCH 2/2] python: a strategy interpreter and the draws a Hypothesis
@@ -20,23 +20,23 @@ record and invalid callbacks and its retry exception.
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
- frontends/python/RELEASE.md                  |   3 +
- frontends/python/python/hegel/_native.pyi    |  39 +-
- frontends/python/src/interpret.rs            | 737 +++++++++++++++++++
- frontends/python/src/lib.rs                  |   3 +
- frontends/python/src/strings.rs              |  21 +
- frontends/python/src/test_case.rs            | 113 ++-
- frontends/python/tests/test_native_bridge.py | 171 +++++
+ .../python/RELEASE/strategy-interpreter.md    |   3 +
+ frontends/python/python/hegel/_native.pyi     |  39 +-
+ frontends/python/src/interpret.rs             | 737 ++++++++++++++++++
+ frontends/python/src/lib.rs                   |   3 +
+ frontends/python/src/strings.rs               |  21 +
+ frontends/python/src/test_case.rs             | 113 ++-
+ frontends/python/tests/test_native_bridge.py  | 171 ++++
  7 files changed, 1080 insertions(+), 7 deletions(-)
- create mode 100644 frontends/python/RELEASE.md
+ create mode 100644 frontends/python/RELEASE/strategy-interpreter.md
  create mode 100644 frontends/python/src/interpret.rs
  create mode 100644 frontends/python/tests/test_native_bridge.py
 
-diff --git a/frontends/python/RELEASE.md b/frontends/python/RELEASE.md
+diff --git a/frontends/python/RELEASE/strategy-interpreter.md b/frontends/python/RELEASE/strategy-interpreter.md
 new file mode 100644
 index 00000000..b496d360
 --- /dev/null
-+++ b/frontends/python/RELEASE.md
++++ b/frontends/python/RELEASE/strategy-interpreter.md
 @@ -0,0 +1,3 @@
 +RELEASE_TYPE: patch
 +

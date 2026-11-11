@@ -1,4 +1,4 @@
-From c97ace5f70350b2c0720eb084746183646cd9f65 Mon Sep 17 00:00:00 2001
+From b1eed90ef56156a595e6b037e7c0c482e6e4c621 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 9 Nov 2026 20:53:52 +0000
 Subject: [PATCH 1/2] libhegel: the draws a Hypothesis frontend needs
@@ -14,20 +14,20 @@ regenerated; C ABI tests.
 Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_016mTrLpQ8SJg9RC9F1GH9Ac
 ---
- frontends/rust/src/ffi/sys/fns.rs        |   4 +
- libhegel/RELEASE.md                      |   9 +
- libhegel/include/hegel.h                 | 104 ++++++-
- libhegel/src/backend.rs                  |  39 +++
- libhegel/src/lib.rs                      | 177 +++++++++++
- libhegel/src/native/blob.rs              |  11 +
- libhegel/src/native/core/state.rs        |  29 ++
- libhegel/src/native/data_source.rs       |  37 +++
- libhegel/src/native/draws/mod.rs         | 127 +++++++-
- libhegel/src/native/draws/text.rs        |  21 ++
- libhegel/tests/c_abi_generate.rs         |  32 +-
- libhegel/tests/c_abi_hypothesis_needs.rs | 366 +++++++++++++++++++++++
+ frontends/rust/src/ffi/sys/fns.rs             |   4 +
+ libhegel/RELEASE/hypothesis-frontend-draws.md |   9 +
+ libhegel/include/hegel.h                      | 104 ++++-
+ libhegel/src/backend.rs                       |  39 ++
+ libhegel/src/lib.rs                           | 177 +++++++++
+ libhegel/src/native/blob.rs                   |  11 +
+ libhegel/src/native/core/state.rs             |  29 ++
+ libhegel/src/native/data_source.rs            |  37 ++
+ libhegel/src/native/draws/mod.rs              | 127 +++++-
+ libhegel/src/native/draws/text.rs             |  21 +
+ libhegel/tests/c_abi_generate.rs              |  32 +-
+ libhegel/tests/c_abi_hypothesis_needs.rs      | 366 ++++++++++++++++++
  12 files changed, 921 insertions(+), 35 deletions(-)
- create mode 100644 libhegel/RELEASE.md
+ create mode 100644 libhegel/RELEASE/hypothesis-frontend-draws.md
  create mode 100644 libhegel/tests/c_abi_hypothesis_needs.rs
 
 diff --git a/frontends/rust/src/ffi/sys/fns.rs b/frontends/rust/src/ffi/sys/fns.rs
@@ -55,11 +55,11 @@ index d331335e..3ad807d1 100644
              fn hegel_test_case_clone(ctx: *mut HegelContext, tc: *const HegelTestCase, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
              fn hegel_test_case_free(ctx: *mut HegelContext, tc: *mut HegelTestCase) -> hegel_result_t;
              fn hegel_test_case_from_blob(ctx: *mut HegelContext, s: *const HegelSettings, blob: hegel_string_t, callback: hegel_output_callback_t, user_data: *mut c_void, out_test_case: *mut *mut HegelTestCase) -> hegel_result_t;
-diff --git a/libhegel/RELEASE.md b/libhegel/RELEASE.md
+diff --git a/libhegel/RELEASE/hypothesis-frontend-draws.md b/libhegel/RELEASE/hypothesis-frontend-draws.md
 new file mode 100644
 index 00000000..15b5f432
 --- /dev/null
-+++ b/libhegel/RELEASE.md
++++ b/libhegel/RELEASE/hypothesis-frontend-draws.md
 @@ -0,0 +1,9 @@
 +RELEASE_TYPE: patch
 +
@@ -474,10 +474,10 @@ index f24c0187..8997428a 100644
      let raw = serialize_choices(choices)?;
      let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&raw, ZLIB_LEVEL);
 diff --git a/libhegel/src/native/core/state.rs b/libhegel/src/native/core/state.rs
-index 7f38cfd9..77baf7de 100644
+index 86e669da..f18fc9a7 100644
 --- a/libhegel/src/native/core/state.rs
 +++ b/libhegel/src/native/core/state.rs
-@@ -2702,6 +2702,35 @@ impl NativeTestCase {
+@@ -2751,6 +2751,35 @@ impl NativeTestCase {
          ))
      }
  

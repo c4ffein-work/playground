@@ -1,7 +1,7 @@
 # PR: Build the diffuse integer pool only when it is selected
 
-Target: hegeldev/hegel `main` (d278c5ca, libhegel 0.51.0). One commit,
-`libhegel/` only, with `libhegel/RELEASE.md` (patch).
+Target: hegeldev/hegel `main` (d74a7a73, 2026-11-11). One commit,
+`libhegel/` only, with `libhegel/RELEASE/lazy-diffuse-pool.md` (patch).
 
 ## Title
 
@@ -40,11 +40,12 @@ takes this path on every draw.
 - `cargo fmt --check`, `cargo clippy --all-targets` for `hegeltest-c`.
 - `cargo build -p hegeltest-c && cargo test -p hegeltest-c` (the `smoke`
   binary included): all pass.
+- `.github/scripts/release.py check main`: passes.
 
 Not run here: `just libhegel::check-coverage` and the other frontends.
 
 ## To open it
 
-`git am patches/hegeldev__hegel/2026-11-09-lazy-diffuse-pool/0001-*.patch`
+`git am patches/hegeldev__hegel/2026-11-11-lazy-diffuse-pool/0001-*.patch`
 on a fresh checkout of `main`, push to a fork, open the PR with the title
 and body above.
