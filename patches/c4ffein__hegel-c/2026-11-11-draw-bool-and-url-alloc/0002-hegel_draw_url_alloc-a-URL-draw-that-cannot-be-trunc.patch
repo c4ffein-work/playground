@@ -1,0 +1,165 @@
+From 64c1f0b1b7792403ef5bdd05d12ab34ab753bd4b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 19:38:17 +0000
+Subject: [PATCH 2/2] hegel_draw_url_alloc: a URL draw that cannot be truncated
+
+hegel_draw_url writes into the caller's buffer and cuts the URL at
+capacity - 1 bytes.  URLs have no length bound (631 characters seen in
+2000 draws, TODO.md), and a cut URL is not a valid one, so a harness with
+a short buffer tests malformed input without knowing.
+
+hegel_draw_url_alloc (tc) makes the same engine draw (HEGEL_OP_DRAW_URL,
+same choices) and returns the whole string in a hegel_alloc block: owned
+by the case, freed on every exit path, like hegel_draw_grammar's result.
+hegel_draw_url is unchanged.
+
+test_value_draws_net draws one and checks its shape; CLAUDE.md, the C
+skill reference and TODO.md name it.
+
+Not built or run: written in a sandbox that could not compile the
+repository.  Run make selftest-test before keeping it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvrCDpVjyeVdC5cqgPz
+---
+ .claude/skills/hegel/references/c/reference.md |  6 +++---
+ CLAUDE.md                                      |  2 +-
+ TODO.md                                        |  9 ++++++---
+ core/hegel_runtime.c                           | 13 +++++++++++++
+ hegel_c.h                                      |  9 ++++++++-
+ tests/selftest/test_value_draws_net.c          | 10 +++++++++-
+ 6 files changed, 40 insertions(+), 9 deletions(-)
+
+diff --git a/.claude/skills/hegel/references/c/reference.md b/.claude/skills/hegel/references/c/reference.md
+index c584026..ffbe0c5 100644
+--- a/.claude/skills/hegel/references/c/reference.md
++++ b/.claude/skills/hegel/references/c/reference.md
+@@ -381,13 +381,13 @@ hegel_datetime dt = hegel_draw_datetime(tc, &(hegel_datetime){ from, {0} }, NULL
+ hegel_time t = hegel_draw_time(tc, NULL, NULL);
+ hegel_uuid u = hegel_draw_uuid(tc, 4);        /* 0 = any version */
+ hegel_ipv4 a = hegel_draw_ipv4(tc);           /* a.bytes[0..3], network order */
+-char email[256], url[4096], host[256];
++char email[256], host[256];
+ hegel_draw_email(tc, email, sizeof email);
+-hegel_draw_url(tc, url, sizeof url);
++char *url = hegel_draw_url_alloc(tc);         /* whole URL, owned by the case */
+ hegel_draw_domain(tc, 63, host, sizeof host);
+ ```
+ 
+-Prefer these to assembling dates or addresses from integer draws: they are always valid and shrink as values (a date toward 2000-01-01, a time toward its lower bound). NULL bounds are the engine's defaults; impossible bounds are health failures, not test failures. Size string buffers generously: a truncated email or URL is no longer valid.
++Prefer these to assembling dates or addresses from integer draws: they are always valid and shrink as values (a date toward 2000-01-01, a time toward its lower bound). NULL bounds are the engine's defaults; impossible bounds are health failures, not test failures. Size string buffers generously: a truncated email or domain is no longer valid. URLs have no length bound, so draw them with `hegel_draw_url_alloc` (`hegel_draw_url(tc, buf, capacity)` truncates into a buffer).
+ 
+ ### Grammar strings
+ 
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 41cd30b..c49a780 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -82,7 +82,7 @@ For standalone compilation: `gcc -O2 -I. -o test test.c -Lbuild -lhegel_c -lpthr
+ 
+ **Primitive draws:** `hegel_draw_int`, `_i64`, `_u64`, `_usize`, `_float`, `_double`, `_bool`, `_text`, `_bytes`, `_regex` (full match)
+ 
+-**Value draws:** `hegel_draw_date(tc, &min, &max)` / `_time` / `_datetime` return `hegel_date` / `hegel_time` / `hegel_datetime` structs (NULL bounds = 0001-01-01..9999-12-31 and the whole day; a date shrinks toward 2000-01-01 by distance, a time toward its minimum); `hegel_draw_uuid(tc, version)` (0 = any but nil, 1..15 forces the version nibble and the RFC 4122 variant); `hegel_draw_ipv4` / `_ipv6` (byte structs, network order); `hegel_draw_email` / `_url` / `_domain(tc, max_length /*0 = 255*/, ...)` with `hegel_draw_text`'s buffer contract (ASCII, never NUL; URLs have no length bound, so use a 4 KB buffer). Bounds that aren't real dates or times, min > max, a uuid version > 15 or a domain length outside 4..255 are health failures. See `tests/selftest/test_value_draws_*.c`.
++**Value draws:** `hegel_draw_date(tc, &min, &max)` / `_time` / `_datetime` return `hegel_date` / `hegel_time` / `hegel_datetime` structs (NULL bounds = 0001-01-01..9999-12-31 and the whole day; a date shrinks toward 2000-01-01 by distance, a time toward its minimum); `hegel_draw_uuid(tc, version)` (0 = any but nil, 1..15 forces the version nibble and the RFC 4122 variant); `hegel_draw_ipv4` / `_ipv6` (byte structs, network order); `hegel_draw_email` / `_url` / `_domain(tc, max_length /*0 = 255*/, ...)` with `hegel_draw_text`'s buffer contract (ASCII, never NUL; URLs have no length bound, so use a 4 KB buffer, or `hegel_draw_url_alloc(tc)`, which returns the whole URL as a case-owned string). Bounds that aren't real dates or times, min > max, a uuid version > 15 or a domain length outside 4..255 are health failures. See `tests/selftest/test_value_draws_*.c`.
+ 
+ **Grammars:** `hegel_draw_grammar(tc, lark_text, start)` returns a string the Lark grammar accepts (`start` NULL = rule `start`), owned by the case (`hegel_alloc`), NUL-free, never truncated; it shrinks through its derivation. `hegel_draw_grammar_with(tc, text, &opts)` takes `hegel_grammar_options`: `start`, `max_size` (characters, 0 = 8192), `max_depth` (0 = 200), `import_dir` (`%import a.b.X` reads `<dir>/a/b.lark`; Lark's bundled grammars otherwise), and explicit terminals (`explicit_names` / `n_explicit` + `fill(tc, i, ctx)`, which draws the value with ordinary draws and returns it; required for `%declare`d terminals, and it can override a defined one). A rejected grammar is a health failure with the engine's message. See `tests/selftest/test_grammar_*.c`.
+ 
+diff --git a/TODO.md b/TODO.md
+index 6a26495..f5a79f8 100644
+--- a/TODO.md
++++ b/TODO.md
+@@ -45,9 +45,12 @@
+   - A passing repeat loop runs until the choice budget overruns (often
+     ~400k iterations), which trips TooSlow in fork mode. A built-in cap would
+     depart from the engine and hegel-rust; decide whether to offer one.
+-  - URLs from `hegel_draw_url` have no length bound (631 characters seen in
+-    2000 draws), and the caller-buffer contract truncates silently: an
+-    allocating variant (case-owned, like `hegel_draw_grammar`) would be safer.
++  - ~~URLs from `hegel_draw_url` have no length bound (631 characters seen
++    in 2000 draws), and the caller-buffer contract truncates silently~~:
++    `hegel_draw_url_alloc` returns the whole URL, case-owned like
++    `hegel_draw_grammar`. Left: the same for text, regex, email and domain
++    if a harness needs it (their lengths are bounded, so a buffer can be
++    sized).
+ - **Imperative helpers (2026-10-30).** Main is plain generators now (the
+   schema layer moved to `experiments/`, see its README). What the
+   harnesses read while deciding would have used:
+diff --git a/core/hegel_runtime.c b/core/hegel_runtime.c
+index 514f08c..8af522b 100644
+--- a/core/hegel_runtime.c
++++ b/core/hegel_runtime.c
+@@ -594,6 +594,19 @@ int hegel_draw_url (hegel_testcase * tc, char * buf, int capacity)
+   return draw_value_string (tc, HEGEL_OP_DRAW_URL, NULL, 0, buf, capacity);
+ }
+ 
++char * hegel_draw_url_alloc (hegel_testcase * tc)
++{
++  if (!tc->silent) tc->draw_count++;
++  hegel_buf r;
++  hegel__buf_init (&r);
++  hegel__call (tc, HEGEL_OP_DRAW_URL, NULL, 0, &r, 0);
++  char * s = hegel_alloc (tc, r.len + 1);   /* zeroed: the NUL is there */
++  if (r.len) memcpy (s, r.data, r.len);
++  hegel__buf_free (&r);
++  trace (tc, "\"%s\"", s);
++  return s;
++}
++
+ int hegel_draw_domain (hegel_testcase * tc, int max_length, char * buf, int capacity)
+ {
+   /* 0 = the engine default, 255; out-of-range lengths go to the server
+diff --git a/hegel_c.h b/hegel_c.h
+index da5f72f..09ead8f 100644
+--- a/hegel_c.h
++++ b/hegel_c.h
+@@ -420,11 +420,18 @@ hegel_ipv6 hegel_draw_ipv6 (hegel_testcase * tc);
+ ** is at most 254 characters, a domain max_length; a URL has no bound
+ ** (its path has as many components as the engine draws, each up to ~300
+ ** characters percent-encoded) — 4096 bytes covers what it generates in
+-** practice, and a return of capacity - 1 means the URL may be cut. */
++** practice, and a return of capacity - 1 means the URL may be cut.
++** hegel_draw_url_alloc (below) has no buffer to size. */
+ int hegel_draw_email  (hegel_testcase * tc, char * buf, int capacity);
+ int hegel_draw_url    (hegel_testcase * tc, char * buf, int capacity);
+ int hegel_draw_domain (hegel_testcase * tc, int max_length, char * buf, int capacity);
+ 
++/* The same URL draw as hegel_draw_url (same choices, so it shrinks the
++** same), returned whole: a NUL-terminated string owned by the test case
++** (hegel_alloc: freed when the case ends, or earlier with hegel_free),
++** never truncated, never NULL. */
++char * hegel_draw_url_alloc (hegel_testcase * tc);
++
+ /* ---- Test suite ---- */
+ 
+ /* A test suite runs multiple tests in one binary; each test is its own
+diff --git a/tests/selftest/test_value_draws_net.c b/tests/selftest/test_value_draws_net.c
+index 85ba6f1..4b12ab6 100644
+--- a/tests/selftest/test_value_draws_net.c
++++ b/tests/selftest/test_value_draws_net.c
+@@ -14,7 +14,8 @@
+ **      version and the RFC 4122 variant, an unversioned one is never nil,
+ **      both round-trip through text; IPv4 / IPv6 addresses round-trip
+ **      through inet_ntop / inet_pton; emails, URLs and domains have the
+-**      shape their RFC says, no NUL, and respect max_length
++**      shape their RFC says, no NUL, and respect max_length; a URL
++**      drawn with hegel_draw_url_alloc has that shape too
+ **   3. Makefile runner      — TESTS_PASS; each property runs in fork
+ **      mode AND in nofork mode, must exit 0 */
+ 
+@@ -187,6 +188,13 @@ static void prop_strings (hegel_testcase * tc)
+                 "url has an embedded NUL or was truncated (%d bytes)", n);
+   HEGEL_ASSERT (url_ok (buf), "malformed url \"%s\"", buf);
+ 
++  /* The case-owned form: whole whatever its length, and writable. */
++  char * url = hegel_draw_url_alloc (tc);
++  size_t url_len = strlen (url);
++  HEGEL_ASSERT (url_ok (url), "malformed url \"%s\"", url);
++  url[url_len] = 'x';   /* the NUL's byte belongs to the block */
++  url[url_len] = '\0';
++
+   n = hegel_draw_domain (tc, 0, buf, sizeof buf);
+   HEGEL_ASSERT (n <= 255 && domain_ok (buf, (size_t) n), "malformed domain \"%s\"", buf);
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,38 @@
+From 9ccb41bbde40354da96c70ca3b7b1b23837158c3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 19:37:12 +0000
+Subject: [PATCH 2/3] ci: drop HEGEL_ENGINE_VERSION, which nothing reads
+
+The workflow set HEGEL_ENGINE_VERSION to v0.17.4 and described it as the
+engine pin.  No step, Makefile or script reads it: the engine job builds
+the deps/hegel submodule, and the pin is LIBHEGEL_VERSION in the Makefile
+(0.50.0).  A comment says where the version comes from instead.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvrCDpVjyeVdC5cqgPz
+---
+ .github/workflows/ci.yml | 8 +++-----
+ 1 file changed, 3 insertions(+), 5 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 7ede5b6..33ab41c 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -9,11 +9,9 @@ on:
+   pull_request:
+     branches: [main]
+ 
+-# Engine (libhegel.so) source version.  Pinned to the tag local dev
+-# builds from and the runtime is verified against (see CLAUDE.md).
+-# Bump deliberately — CI then builds and tests the exact engine dev uses.
+-env:
+-  HEGEL_ENGINE_VERSION: v0.17.4
++# The engine (libhegel.so) version is not set here: the `engine` job builds
++# whatever deps/hegel is checked out at, which the release watch keeps on
++# the Makefile's LIBHEGEL_VERSION tag (see CLAUDE.md, "libhegel").
+ 
+ jobs:
+   # Build the engine cdylib (libhegel.so) from source once and share it.
+-- 
+2.43.0
+

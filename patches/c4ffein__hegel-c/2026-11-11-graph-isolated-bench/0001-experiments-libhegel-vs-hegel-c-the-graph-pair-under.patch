@@ -1,0 +1,148 @@
+From 2c7efe226a94c683b0e7d34106dc69c68a2d2e5e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 19:41:43 +0000
+Subject: [PATCH] experiments/libhegel-vs-hegel-c: the graph pair under nofork
+ + HEGEL_ISOLATED
+
+The comparison measures nofork + HEGEL_ISOLATED on the crash pair only,
+one draw per case (19 ms against fork mode's 31).  The graph pair, where
+fork mode pays a pipe round trip for each of many draws per case (1850 ms
+against nofork's 76), has no isolated row, so what crash isolation costs
+for a draw-heavy generator is not in the table.
+
+hc_graph_iso.c is hc_graph.c with the nofork runner and adj_build + its
+assert inside a HEGEL_ISOLATED block; run.sh prints it as
+"3 graph / hegel-c nofork+ISOLATED" and counts its lines.
+
+The row is not measured yet: the Results block in README.md and the
+figures in docs/libhegel-vs-hegel-c.md are as they were.  After
+make -C experiments/libhegel-vs-hegel-c run, paste the new output and say
+in the "Fork mode time" paragraph what the row shows (expected from the
+crash pair's ~0.25 ms per fork: a few hundred ms).
+
+Not built or run: written in a sandbox that could not build the
+repository (gcc -fsyntax-only -Wall -Wextra is clean).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvrCDpVjyeVdC5cqgPz
+---
+ experiments/libhegel-vs-hegel-c/Makefile      |  2 +-
+ experiments/libhegel-vs-hegel-c/README.md     |  3 +-
+ .../libhegel-vs-hegel-c/hc_graph_iso.c        | 56 +++++++++++++++++++
+ experiments/libhegel-vs-hegel-c/run.sh        |  3 +-
+ 4 files changed, 61 insertions(+), 3 deletions(-)
+ create mode 100644 experiments/libhegel-vs-hegel-c/hc_graph_iso.c
+
+diff --git a/experiments/libhegel-vs-hegel-c/Makefile b/experiments/libhegel-vs-hegel-c/Makefile
+index 29d990e..7c0c89b 100644
+--- a/experiments/libhegel-vs-hegel-c/Makefile
++++ b/experiments/libhegel-vs-hegel-c/Makefile
+@@ -39,7 +39,7 @@ RAW     = $(addprefix raw_,$(PAIRS)) raw_crash_fork raw_replay
+ # lite_*: the shortest correct libhegel version of each pair (no shared
+ # helpers, no return-code checks beyond what correctness needs, no frees)
+ LITE    = $(addprefix lite_,$(PAIRS)) lite_replay
+-HC      = $(addprefix hc_,$(PAIRS)) hc_crash_iso
++HC      = $(addprefix hc_,$(PAIRS)) hc_crash_iso hc_graph_iso
+ # hcn_*: the same hc_*.c under the nofork runner (no source change: the
+ # fork runner's name is redefined on the command line)
+ HCN     = $(addprefix hcn_,$(PAIRS))
+diff --git a/experiments/libhegel-vs-hegel-c/README.md b/experiments/libhegel-vs-hegel-c/README.md
+index 6367ca5..717209d 100644
+--- a/experiments/libhegel-vs-hegel-c/README.md
++++ b/experiments/libhegel-vs-hegel-c/README.md
+@@ -95,7 +95,8 @@ examples; the ~54-line `main` is the same in all of them (see "Lines").
+ 
+ Variants: `raw_crash_fork.c` (raw with hand-rolled isolation: draw in the
+ engine's process, fork for the code under test, signal = INTERESTING),
+-`hc_crash_iso.c` (nofork + `HEGEL_ISOLATED`), `hcn_*` (the hc_*.c
++`hc_crash_iso.c` and `hc_graph_iso.c` (nofork + `HEGEL_ISOLATED`: one
++draw per case, and a draw-heavy generator), `hcn_*` (the hc_*.c
+ sources built with `-Dhegel_run_test_n=hegel_run_test_nofork_n`, i.e.
+ hegel-c without per-case fork), `raw_replay.c` (raw_minimal + a `REPRO`
+ env var for `hegel_run_start_blob`).
+diff --git a/experiments/libhegel-vs-hegel-c/hc_graph_iso.c b/experiments/libhegel-vs-hegel-c/hc_graph_iso.c
+new file mode 100644
+index 0000000..5663bf6
+--- /dev/null
++++ b/experiments/libhegel-vs-hegel-c/hc_graph_iso.c
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: MIT
++** Copyright (c) 2026 c4ffein
++** Part of hegel-c — see hegel/LICENSE for terms. */
++/*
++** Pair 3, hegel-c nofork mode + HEGEL_ISOLATED: hc_graph.c's generator,
++** unchanged, run in the runner's process (draws are plain calls into the
++** engine), and only adj_build with its check forked.  What it measures:
++** crash isolation for a draw-heavy generator at one fork per case and no
++** pipe round trip per draw — the row between "hegel-c fork" and "hegel-c
++** nofork".
++*/
++#include "hegel_c.h"
++#include "common.h"
++#include "sut.h"
++
++static void gen_graph (hegel_testcase * tc, graph * g)
++{
++  hegel_start_span (tc, hegel_label ("lvh.graph"));
++  g->nvert = hegel_draw_int (tc, 1, MAX_VERT);
++  hegel_collection c = hegel_collection_new (tc, 0, MAX_EDGE);
++  while (hegel_collection_more (tc, c)) {
++    hegel_start_span (tc, hegel_label ("lvh.edge"));
++    int u = hegel_draw_int (tc, 0, g->nvert - 1);
++    int v = hegel_draw_int (tc, 0, g->nvert - 1);
++    hegel_stop_span (tc, 0);
++    g->edges = hegel_realloc (tc, g->edges, (size_t) (g->nedge + 1) * sizeof *g->edges);
++    g->edges[g->nedge++] = (edge) { u, v };
++  }
++  hegel_collection_free (tc, c);
++  hegel_stop_span (tc, 0);
++}
++
++static void prop (hegel_testcase * tc)
++{
++  count_exec ();
++  graph g = { 0 };
++  adjacency a;
++  gen_graph (tc, &g);
++  char shape[1024];
++  FILE * m = fmemopen (shape, sizeof shape, "w");
++  graph_print (m, &g);
++  fclose (m);
++  hegel_note (tc, shape);
++  HEGEL_ISOLATED (tc) {
++    int stored = adj_build (&g, &a);
++    HEGEL_ASSERT (stored == 2 * g.nedge, "stored %d of %d adjacency entries", stored, 2 * g.nedge);
++  }
++}
++
++/* B{ */
++int main (void)
++{
++  hegel_run_test_nofork_n (prop, 100);
++  return 0;
++}
++/* }B */
+diff --git a/experiments/libhegel-vs-hegel-c/run.sh b/experiments/libhegel-vs-hegel-c/run.sh
+index d44df6b..cfa3c70 100644
+--- a/experiments/libhegel-vs-hegel-c/run.sh
++++ b/experiments/libhegel-vs-hegel-c/run.sh
+@@ -35,6 +35,7 @@ ROWS='
+ 3 graph|raw_graph|libhegel||^graph:
+ 3 graph|hc_graph|hegel-c fork||^graph:
+ 3 graph|hcn_graph|hegel-c nofork||^graph:
++3 graph|hc_graph_iso|hegel-c nofork+ISOLATED||^graph:
+ 4 tree|lite_tree|libhegel lite||^FAILED:\|^run error:
+ 4 tree|raw_tree|libhegel||^expr =
+ 4 tree|hc_tree|hegel-c fork||^expr =
+@@ -103,7 +104,7 @@ echo
+ echo "Lines of test code (comments and blank lines excluded; shared sut.h / common.h not counted)"
+ printf '  %-18s %6s %12s %10s %7s\n' file lines boilerplate "property" chars
+ sh ./loc.sh lite_minimal.c raw_minimal.c hc_minimal.c lite_crash.c raw_crash.c raw_crash_fork.c \
+-   hc_crash.c hc_crash_iso.c lite_graph.c raw_graph.c hc_graph.c lite_tree.c raw_tree.c hc_tree.c \
++   hc_crash.c hc_crash_iso.c lite_graph.c raw_graph.c hc_graph.c hc_graph_iso.c lite_tree.c raw_tree.c hc_tree.c \
+    lite_twobugs.c raw_twobugs.c hc_twobugs.c lite_misuse.c raw_misuse.c hc_misuse.c \
+    lite_replay.c raw_replay.c raw_check.h |
+   awk '{ printf "  %-18s %6d %12d %10d %7d\n", $1, $2, $3, $2 - $3, $4 }'
+-- 
+2.43.0
+

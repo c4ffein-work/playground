@@ -1,0 +1,647 @@
+From 6b4d55b20affb3744492738498fe4cdd92fc83c8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 19:41:09 +0000
+Subject: [PATCH] A per-case timeout: a forked body that hangs is killed, and
+ the hang shrinks
+
+An infinite loop or a deadlock in the code under test hung the run: the
+fork parent blocked in read() on the child's request pipe, and a
+HEGEL_ISOLATED block's parent on its verdict pipe, both for ever.  Hangs
+are a bug class the kernel harnesses can reach, and a hung run reports
+nothing.
+
+A forked body now has a deadline.  The parent reads its pipe through
+hegel__read_deadline (poll with the time left on the monotonic clock);
+when the deadline passes first it SIGKILLs the child and the case ends
+INTERESTING, like a crash:
+
+  fork mode       origin "timeout",
+                  "test case timed out after N ms (killed)"
+  HEGEL_ISOLATED  the block's origin (one block = one bug, so a bug that
+                  hangs on some inputs and crashes on others shrinks as
+                  one), "HEGEL_ISOLATED block at <site> timed out ..."
+
+hegel_run_options gets timeout_ms: 0 is HEGEL_DEFAULT_TIMEOUT_MS (10 s),
+HEGEL_OFF is no deadline.  HEGEL_C_TIMEOUT_MS in the environment
+overrides it (0 = none): like HEGEL_C_FORK the environment wins, so a
+slow machine, an ASan build or a debugger needs no rebuild.
+
+On by default, so behaviour changes: a case that honestly takes more
+than 10 s of wall time under a fork runner (engine time serving its draws
+included) is now a failure.  Candidates to check: MPI spawn tests, ASan
+kernel harnesses, fork-clean mode, and fork-mode repeat loops that run to
+the choice budget (TODO.md says those already trip TooSlow).
+
+Known limits, documented in hegel_c.h: every hanging execution costs the
+whole timeout, so shrinking a hang at the default is slow (the selftest
+uses 300 ms); a case near the deadline replays nondeterministically; only
+the forked body is killed, not processes it started; nofork code outside
+a block has no deadline.
+
+tests/selftest/test_timeout_hang.c (TESTS_SHRINK): a ring walk that never
+ends when its step is a multiple of 8, under fork and under nofork +
+HEGEL_ISOLATED; both must shrink to step 8.
+
+Not built or run: written in a sandbox that could not build the
+repository (gcc -fsyntax-only -Wall -Wextra is clean on the changed
+files).  Run make test, then the Scotch, MPI and Linux pins, before
+keeping it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvrCDpVjyeVdC5cqgPz
+---
+ .../skills/hegel/references/c/reference.md    |   2 +
+ CLAUDE.md                                     |   9 +-
+ core/hegel_internal.h                         |  16 +++
+ core/hegel_runner.c                           |  62 ++++++++-
+ core/hegel_runtime.c                          |  75 +++++++++-
+ hegel_c.h                                     |  44 +++++-
+ tests/selftest/Makefile                       |   3 +-
+ tests/selftest/test_timeout_hang.c            | 128 ++++++++++++++++++
+ 8 files changed, 319 insertions(+), 20 deletions(-)
+ create mode 100644 tests/selftest/test_timeout_hang.c
+
+diff --git a/.claude/skills/hegel/references/c/reference.md b/.claude/skills/hegel/references/c/reference.md
+index c584026..519f089 100644
+--- a/.claude/skills/hegel/references/c/reference.md
++++ b/.claude/skills/hegel/references/c/reference.md
+@@ -547,6 +547,8 @@ int main(void) { hegel_run_test_nofork(test_build); return 0; }
+ 
+ Rules: no draws, spans or collection calls inside the block (a health failure says so), no nesting, and don't leave it with `break` / `return` / `goto`. Every failure inside one block — crash, abort, `HEGEL_ASSERT` — counts as one bug, so code whose bug sometimes crashes and sometimes returns garbage shrinks as a single failure.
+ 
++Hangs: a forked body (a fork-mode case, or a block's child under nofork) still running after the run's timeout is killed and the case fails, so an infinite loop shrinks like a crash. The timeout is `hegel_run_options.timeout_ms` (default 10 s, `HEGEL_OFF` for none; `HEGEL_C_TIMEOUT_MS` in the environment overrides it). Each hanging execution costs the whole timeout, so when a test is expected to find hangs set it to a few times the slowest honest case (`.timeout_ms = 300`). Nofork code outside a block has no deadline.
++
+ Fork-mode notes:
+ 
+ - **Global state changes in the child are not visible to the next case** — the child exits after each case. Use `hegel_set_case_setup` for per-case initialization.
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 41cd30b..5b0d23b 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -22,7 +22,7 @@ Until 2026-10-30 there was a second layer, `hegel_gen.h`: a declarative schema s
+   - `hegel_runner.c` — run drivers (fork + nofork), the fork parent's serve loop, capture-by-origin failure reporting, suite API.
+   - `hegel_stateful.c` — stateful driver on the engine's state machine (`hegel_new_state_machine`), shaped like hegel-rust's `run_sequential`; preconditions map onto `rule_rejected`. Works in fork and nofork mode.
+   - `hegel_alloc.c` — generator helpers that live in the body's process, never on the wire: `hegel_alloc` / `_realloc` / `_free` (per-case blocks linked into the test case with serial numbers; the case drivers release them after the cleanup hook) and `hegel_draw_recursive` / `hegel_recursive_child` (the recursion protocol around a node function; an over-budget attempt longjmps back and its blocks are released by serial).
+-- `tests/selftest/` — 58 self-tests (PASS/FAIL/CRASH/HEALTH-CHECK/SHRINK): draws, value draws, grammars, spans, shrinking, stateful, isolation, engine protocols (collections, recursion, repeat loops), events, settings and profiles, generator helpers
++- `tests/selftest/` — 59 self-tests (PASS/FAIL/CRASH/HEALTH-CHECK/SHRINK): draws, value draws, grammars, spans, shrinking, stateful, isolation, timeouts, engine protocols (collections, recursion, repeat loops), events, settings and profiles, generator helpers
+ - `tests/from-hegel-rust/` — 11 tests ported from hegel-rust (5 PASS, 6 SHRINK)
+ - `tests/mpi/` — 3 MPI tests (mpiexec + MPI_Comm_spawn patterns)
+ - `tests/irl/scotch/` — 3 Scotch integration tests (sequential, the `hgraphOrderCp` reducer demo, PT-Scotch MPI), a 29-test property suite (`props/`: 24 green on current master via `make test-props` / pin `current`, 5 witnesses of open bugs run by their pins) + bug pins (`pins/`; `PIN_ASAN=1` in a pin forces an ASan Scotch)
+@@ -56,7 +56,7 @@ make check-libhegel             # engine pin: submodule tag, installed version,
+ make check-libhegel-upstream    # only: is there a libhegel release newer than LIBHEGEL_VERSION? (CI release watch)
+ make check-libhegel-coverage    # every libhegel function bound or classified (tools/libhegel-coverage.toml)
+ 
+-make selftest-test              # 58 tests (PASS/FAIL/CRASH/HEALTH-CHECK/SHRINK)
++make selftest-test              # 59 tests (PASS/FAIL/CRASH/HEALTH-CHECK/SHRINK)
+ make from-hegel-rust-test       # 11 tests (5 PASS, 6 SHRINK)
+ make mpi-test                   # 3 tests (needs mpicc)
+ make scotch-test                # Scotch tests (needs Scotch — clone via make inspiration)
+@@ -77,6 +77,7 @@ For standalone compilation: `gcc -O2 -I. -o test test.c -Lbuild -lhegel_c -lpthr
+ - `hegel_suite_new/add/run/free` — multi-test runner (one binary, several tests; each test is its own engine run)
+ - `hegel_run_test_with(fn, &opts)` / `hegel_run_test_nofork_with` — `hegel_run_options`: `test_cases`, `has_seed`+`seed`, `suppress_health` (`HEGEL_SUPPRESS_*` bits), `skip_phases` (`HEGEL_SKIP_*` bits), `report_multiple` (report every distinct failure, each with its own reproduce line; `HEGEL_REPORT_MULTIPLE_FAILURES=1` does the same, see `tests/selftest/test_report_multiple.c`); zero fields keep the engine default. Returns 0/1. See `tests/selftest/test_run_options.c`.
+ - Engine settings, as more `hegel_run_options` fields (zero keeps what the profile and environment resolved): tri-state `HEGEL_ON` / `HEGEL_OFF` for `derandomize`, `stop_on_first_failure` (OFF spends the whole budget), `show_statistics` (the engine's statistics block on stderr; also `HEGEL_STATISTICS=1`), `print_blob` (OFF drops the reproduce line) and `unbounded_choices`; `backend` (`HEGEL_BACKEND_*`), `nondeterminism` (`HEGEL_NONDETERMINISM_QUIET/WARN/ERROR`); `settings` (a `"key=value ..."` string in hegel.toml's vocabulary); `profile` (`base`, `development`, `ci`, `workload`, a hegel.toml section or a registered one); `test_file` / `test_line` / `test_function` (`HEGEL_TEST_LOCATION(fn)`; the engine uses them only inside Antithesis, where every run is now reported). `hegel_register_profile(name, &opts)` snapshots a profile, `hegel_set_default_profile(name)` picks the default (NULL clears). Precedence, lowest first: profile < `HEGEL_*` environment < `settings` string < typed fields < what the runner owns (verbosity, database, report_multiple, test location). See `tests/selftest/test_settings.c`, `test_profiles.c`.
++- Timeouts: a forked body (a fork-mode case, a `HEGEL_ISOLATED` block's child under nofork) still running after `timeout_ms` (a `hegel_run_options` field; 0 = `HEGEL_DEFAULT_TIMEOUT_MS`, 10 s; `HEGEL_OFF` = none) is killed and the case fails like a crash, so a hang shrinks. `HEGEL_C_TIMEOUT_MS` in the environment overrides the option (0 = none; like `HEGEL_C_FORK`, the environment wins). Origin `timeout` in fork mode, the block's origin inside a block. Every hanging execution costs the whole timeout, so a test that hunts hangs sets a few hundred ms; nofork code outside a block has no deadline. See `tests/selftest/test_timeout_hang.c`.
+ - Replay: every failure report ends with `reproduce: HEGEL_C_REPRODUCE='N:<blob>'` — N is the run's number within the binary (1-based, in call order). Rerunning the binary with that variable replays exactly that failure through `hegel_run_start_blob` (other runs are skipped); with the bug fixed it prints "did not reproduce" and passes. See `tests/selftest/test_reproduce_blob.c`.
+ - Example database: off unless `HEGEL_DATABASE=<dir>` is set; then failures are stored per `<binary basename>#<run number>` and replayed first by the next invocation.
+ 
+@@ -100,7 +101,7 @@ For standalone compilation: `gcc -O2 -I. -o test test.c -Lbuild -lhegel_c -lpthr
+ - `hegel_alloc(tc, size)` (zeroed, max-aligned) / `hegel_realloc(tc, p, size)` (growth zeroed) / `hegel_free(tc, p)` — memory owned by the test case, freed when it ends however it ends (return, assert, assume, overrun, health failure; fork and nofork; a stateful rule's blocks last until the case ends, after teardown). Under nofork, a `HEGEL_ISOLATED` block's own blocks vanish with its child; don't `hegel_free` an earlier block inside one. See `tests/selftest/test_alloc_lifetime.c`.
+ - `hegel_draw_recursive(tc, max_depth, max_leaves, node_fn, ctx)` + `hegel_recursive_child(tc)` — the recursion protocol run for you. `void *node_fn(tc, bool leaf, ctx)` builds ONE node with `hegel_alloc`; when `leaf` is false it calls `hegel_recursive_child` once per child slot. An over-budget attempt longjmps back to the top, its `hegel_alloc` blocks are freed and the engine closes its spans; each sub-value gets its own span. Rules: nodes from `hegel_alloc` only, hold nothing else across a child call, no child call from a leaf or outside a node function (health failures). Defaults `HEGEL_RECURSIVE_MAX_DEPTH` (50) / `_MAX_LEAVES` (100): ~80 nodes on average for a binary tree, same distribution as the raw protocol. See `tests/selftest/test_recursive_tree.c`, `test_recursive_shrinks.c`.
+ 
+-**Crash isolation for a block:** `HEGEL_ISOLATED(tc) { ... }` — no draws inside (health failure), no nesting, no break/return out of it. Every failure inside a block (crash, `HEGEL_ASSERT`, `hegel_fail`) shares one origin, `HEGEL_ISOLATED at <file:line>`, so a bug that sometimes asserts and sometimes segfaults shrinks as one bug. If a plain test shrinks poorly, wrapping the code under test in a block is the fix. `HEGEL_C_MERGE_ORIGINS=1` merges every failure in a run into one origin.
++**Crash isolation for a block:** `HEGEL_ISOLATED(tc) { ... }` — no draws inside (health failure), no nesting, no break/return out of it. Every failure inside a block (crash, timeout, `HEGEL_ASSERT`, `hegel_fail`) shares one origin, `HEGEL_ISOLATED at <file:line>`, so a bug that sometimes asserts and sometimes segfaults shrinks as one bug. If a plain test shrinks poorly, wrapping the code under test in a block is the fix. `HEGEL_C_MERGE_ORIGINS=1` merges every failure in a run into one origin.
+ 
+ **Other:** `hegel_note(tc, msg)` (captured for the counterexample report), `hegel_event(tc, label)` / `hegel_event_value(tc, label, value)` (observations for the engine's end-of-run statistics, like Hypothesis's `event()`: printed on stderr with `show_statistics` or `HEGEL_STATISTICS=1`; `event` gives the share of cases with the label, `event_value` count/min/median/mean/p90/max of the values, which must be finite; only generation-phase cases that completed count; they never steer generation or shrinking; see `tests/selftest/test_event_stats.c`), `hegel_label_combine(labels, n)` (pure C, bit for bit libhegel's), `hegel_target(tc, score, label)` (the TARGET phase hill-climbs toward higher scores; needs a budget well above the default 100 cases — see `tests/selftest/test_target.c`), `hegel_assume(tc, cond)`, `hegel_fail(msg)` (code-under-test broken), `hegel_health_fail(msg)` (test-setup broken — emits "Health check failure:" prefix), `HEGEL_ASSERT(cond, fmt, ...)`
+ 
+@@ -173,7 +174,7 @@ In fork mode, the **parent** process owns the engine (in-process, via libhegel).
+ 1. Parent calls `hegel_next_test_case`, creates request/response pipes, then `fork()`s
+ 2. Child runs the C test function; every engine call (`hegel_draw_*`, spans, collections, ...) writes a framed request to the pipe
+ 3. Parent serves each request with `hegel__serve_op` — the same function nofork mode calls directly — and writes the response back
+-4. Child ends with a terminal message (DONE / STOPPED / ASSUME / FAIL / HEALTH); if it crashes instead (SIGSEGV, SIGABRT), parent catches it via `waitpid()` and marks the case INTERESTING so the engine shrinks it
++4. Child ends with a terminal message (DONE / STOPPED / ASSUME / FAIL / HEALTH); if it crashes instead (SIGSEGV, SIGABRT), parent catches it via `waitpid()` and marks the case INTERESTING so the engine shrinks it; if it is still running at the case's deadline (`hegel__read_deadline` polls the request pipe), parent kills it and marks the case INTERESTING too
+ 
+ The child never touches the engine — the parent proxies all draws. The message protocol (in `core/hegel_internal.h`) is deliberately transport-shaped: the same message set is meant to later run over a serial/TCP link to a remote target (embedded board), with the board taking the child's role and watchdog-reset taking fork's role as crash isolation.
+ 
+diff --git a/core/hegel_internal.h b/core/hegel_internal.h
+index a2bb0dd..353415d 100644
+--- a/core/hegel_internal.h
++++ b/core/hegel_internal.h
+@@ -39,6 +39,7 @@
+ 
+ #include <setjmp.h>
+ #include <stdint.h>
++#include <time.h>
+ 
+ /* ---- Escape codes (longjmp values / terminal outcomes) ---- */
+ 
+@@ -309,6 +310,21 @@ void hegel__send (hegel_testcase * tc, uint8_t op, const void * payload, uint32_
+ int hegel__read_full  (int fd, void * buf, size_t n);
+ int hegel__write_full (int fd, const void * buf, size_t n);
+ 
++/* ---- Per-case deadline for forked bodies ----
++**
++** How long a forked body (a fork-mode case, a HEGEL_ISOLATED block's
++** child) may run before its parent kills it, in milliseconds; 0 = no
++** deadline.  Set by the run driver when a run starts (hegel_run_options
++** .timeout_ms / HEGEL_C_TIMEOUT_MS), read by whichever process forks. */
++extern int64_t hegel__case_timeout_ms;
++
++/* `d` = now + ms, on the monotonic clock. */
++void hegel__deadline_in (struct timespec * d, int64_t ms);
++
++/* hegel__read_full that gives up at `deadline` (NULL = never).  Returns
++** 0 on success, -1 on EOF/error, -2 when the deadline passed first. */
++int hegel__read_deadline (int fd, void * buf, size_t n, const struct timespec * deadline);
++
+ /* Run drivers (hegel_runner.c) with a custom body (stateful). */
+ int hegel__run_property (void (*test_fn)(hegel_testcase *), uint64_t n_cases, int use_fork);
+ 
+diff --git a/core/hegel_runner.c b/core/hegel_runner.c
+index 5a01c01..b854a16 100644
+--- a/core/hegel_runner.c
++++ b/core/hegel_runner.c
+@@ -25,6 +25,7 @@
+ 
+ #include "hegel_internal.h"
+ 
++#include <errno.h>
+ #include <setjmp.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -89,22 +90,30 @@ static void capture_clear (void)
+ 
+ /* ---- Fork-mode parent: serve one child's requests ---- */
+ 
+-static void serve_child (hegel_case_srv * srv, int req_fd, int resp_fd, hegel_outcome * out)
++/* Returns 1 when the child was still running at `deadline` (NULL = no
++** deadline) — the caller kills it — and 0 otherwise. */
++static int serve_child (hegel_case_srv * srv, int req_fd, int resp_fd, hegel_outcome * out,
++                        const struct timespec * deadline)
+ {
+   hegel_buf payload, resp;
++  int timed_out = 0;
+   hegel__buf_init (&payload);
+   hegel__buf_init (&resp);
+ 
+   for (;;) {
+     hegel_msg_header h;
+-    if (hegel__read_full (req_fd, &h, sizeof h) != 0) break;  /* EOF: crash */
++    int rd = hegel__read_deadline (req_fd, &h, sizeof h, deadline);
++    if (rd == -2) timed_out = 1;
++    if (rd != 0) break;                       /* EOF: crash */
+     payload.len = 0;
+     uint8_t chunk[4096];
+     uint32_t left = h.len;
+     int eof = 0;
+     while (left) {
+       uint32_t n = left < sizeof chunk ? left : (uint32_t) sizeof chunk;
+-      if (hegel__read_full (req_fd, chunk, n) != 0) { eof = 1; break; }
++      rd = hegel__read_deadline (req_fd, chunk, n, deadline);
++      if (rd == -2) timed_out = 1;
++      if (rd != 0) { eof = 1; break; }
+       hegel__buf_put (&payload, chunk, n);
+       left -= n;
+     }
+@@ -122,9 +131,13 @@ static void serve_child (hegel_case_srv * srv, int req_fd, int resp_fd, hegel_ou
+   }
+   hegel__buf_free (&payload);
+   hegel__buf_free (&resp);
++  return timed_out;
+ }
+ 
+-static void crash_outcome (hegel_case_srv * srv, int wstatus, hegel_outcome * out)
++/* `timed_out_ms`: nonzero when the runner killed the child at its
++** deadline (wstatus is then our own SIGKILL, and says nothing). */
++static void crash_outcome (hegel_case_srv * srv, int wstatus, int64_t timed_out_ms,
++                           hegel_outcome * out)
+ {
+   const char * site = hegel__srv_iso_site (srv);
+   char where[300] = "";
+@@ -132,7 +145,12 @@ static void crash_outcome (hegel_case_srv * srv, int wstatus, hegel_outcome * ou
+   out->status = HG_STATUS_INTERESTING;
+   if (site)   /* the block is the origin, whatever the crash (see hegel_fail_with_origin) */
+     snprintf (out->origin, sizeof out->origin, "HEGEL_ISOLATED at %s", site);
+-  if (WIFSIGNALED (wstatus)) {
++  if (timed_out_ms) {
++    if (!site)
++      snprintf (out->origin, sizeof out->origin, "timeout");
++    snprintf (out->msg, sizeof out->msg, "test case timed out after %lld ms (killed)%s",
++              (long long) timed_out_ms, where);
++  } else if (WIFSIGNALED (wstatus)) {
+     int sig = WTERMSIG (wstatus);
+     if (!site)
+       snprintf (out->origin, sizeof out->origin, "crash: signal %d (%s)", sig, strsignal (sig));
+@@ -337,14 +355,20 @@ static void run_case_forked (hegel_case_srv * srv, void (*test_fn)(hegel_testcas
+   /* Parent */
+   close (req[1]);
+   close (resp[0]);
+-  serve_child (srv, req[0], resp[1], out);
++  int64_t timeout_ms = hegel__case_timeout_ms;
++  struct timespec deadline;
++  if (timeout_ms) hegel__deadline_in (&deadline, timeout_ms);
++  int timed_out = serve_child (srv, req[0], resp[1], out, timeout_ms ? &deadline : NULL);
+   close (req[0]);
+   close (resp[1]);
+ 
++  /* Still running at the deadline (an infinite loop, a deadlock): kill it.
++  ** Only the child itself: processes it started are not ours to find. */
++  if (timed_out) kill (pid, SIGKILL);
+   int wstatus = 0;
+   while (waitpid (pid, &wstatus, 0) < 0) { /* EINTR */ }
+ 
+-  if (out->status == -1) crash_outcome (srv, wstatus, out);
++  if (out->status == -1) crash_outcome (srv, wstatus, timed_out ? timeout_ms : 0, out);
+ }
+ 
+ /* Run one test case in-process; fill `out`. */
+@@ -502,6 +526,28 @@ static int reproduce_target (uint64_t * run, const char ** blob, size_t * len)
+   return 1;
+ }
+ 
++/* The per-case deadline of a run, in ms (0 = none): HEGEL_C_TIMEOUT_MS if
++** set (as with HEGEL_C_FORK, the environment wins, so a slow machine or a
++** debugger session needs no rebuild), else the run option, else the
++** default. */
++static int64_t case_timeout_ms (const hegel_run_options * o)
++{
++  const char * e = getenv ("HEGEL_C_TIMEOUT_MS");
++  if (e && *e) {
++    char * end = NULL;
++    errno = 0;
++    long long v = strtoll (e, &end, 10);
++    if (errno || *end || v < 0) {
++      fprintf (stderr, "hegel-c: HEGEL_C_TIMEOUT_MS must be a number of milliseconds "
++                       "(0 = no timeout), got '%s'\n", e);
++      exit (1);
++    }
++    return v;
++  }
++  if (o->timeout_ms < 0) return 0;            /* HEGEL_OFF */
++  return o->timeout_ms ? o->timeout_ms : HEGEL_DEFAULT_TIMEOUT_MS;
++}
++
+ /* Every run goes through here: numbered, and its result recorded so a
+ ** fork-clean child can replay main() exactly (see clean_child_run). */
+ static int run_property (void (*test_fn)(hegel_testcase *), const hegel_run_options * o,
+@@ -753,6 +799,8 @@ static int run_property_inner (void (*test_fn)(hegel_testcase *),
+     return 1;
+   }
+ 
++  hegel__case_timeout_ms = case_timeout_ms (o);
++
+   int rc = 0;
+   int health_failed = 0;
+   for (;;) {
+diff --git a/core/hegel_runtime.c b/core/hegel_runtime.c
+index 514f08c..be46d87 100644
+--- a/core/hegel_runtime.c
++++ b/core/hegel_runtime.c
+@@ -20,6 +20,10 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <limits.h>
++#include <poll.h>
++#include <signal.h>
++#include <time.h>
+ #include <sys/wait.h>
+ 
+ /* ---- Globals (single active test case per process by design) ---- */
+@@ -29,6 +33,7 @@ char hegel__fail_msg[1024];
+ char hegel__fail_origin[512];
+ void (*hegel__case_setup)(void) = NULL;
+ void (*hegel__draws_abandoned)(void) = NULL;
++int64_t hegel__case_timeout_ms = 0;
+ 
+ void hegel_set_case_setup (void (*setup_fn)(void))
+ {
+@@ -53,6 +58,46 @@ int hegel__read_full (int fd, void * buf, size_t n)
+   return 0;
+ }
+ 
++void hegel__deadline_in (struct timespec * d, int64_t ms)
++{
++  clock_gettime (CLOCK_MONOTONIC, d);
++  d->tv_sec += (time_t) (ms / 1000);
++  d->tv_nsec += (long) (ms % 1000) * 1000000L;
++  if (d->tv_nsec >= 1000000000L) {
++    d->tv_sec ++;
++    d->tv_nsec -= 1000000000L;
++  }
++}
++
++int hegel__read_deadline (int fd, void * buf, size_t n, const struct timespec * deadline)
++{
++  if (!deadline) return hegel__read_full (fd, buf, n);
++  uint8_t * p = buf;
++  while (n > 0) {
++    struct timespec now;
++    clock_gettime (CLOCK_MONOTONIC, &now);
++    int64_t left = (int64_t) (deadline->tv_sec - now.tv_sec) * 1000
++                 + (int64_t) (deadline->tv_nsec - now.tv_nsec) / 1000000;
++    if (left < 0) left = 0;                   /* poll (0): take what is already there */
++    struct pollfd pfd = { fd, POLLIN, 0 };
++    int ready = poll (&pfd, 1, left > INT_MAX ? INT_MAX : (int) left);
++    if (ready < 0) {
++      if (errno == EINTR) continue;
++      return -1;
++    }
++    if (ready == 0) return -2;
++    ssize_t r = read (fd, p, n);
++    if (r < 0) {
++      if (errno == EINTR) continue;
++      return -1;
++    }
++    if (r == 0) return -1;  /* EOF */
++    p += r;
++    n -= (size_t)r;
++  }
++  return 0;
++}
++
+ int hegel__write_full (int fd, const void * buf, size_t n)
+ {
+   const uint8_t * p = buf;
+@@ -1074,9 +1119,17 @@ void hegel_event_value (hegel_testcase * tc, const char * label, double value)
+ ** (health failure): the parent can't see draws made in a process that
+ ** may not survive. */
+ 
+-static void report_iso_crash (hegel_testcase * tc, const char * site, int wstatus)
++static void report_iso_crash (hegel_testcase * tc, const char * site, int wstatus,
++                              int64_t timed_out_ms)
+ {
+-  if (WIFSIGNALED (wstatus)) {
++  if (timed_out_ms) {
++    /* The block is the origin, as for a crash: a bug that hangs on some
++    ** inputs and crashes on others shrinks as one. */
++    snprintf (hegel__fail_origin, sizeof hegel__fail_origin, "HEGEL_ISOLATED at %s", site);
++    snprintf (hegel__fail_msg, sizeof hegel__fail_msg,
++              "HEGEL_ISOLATED block at %s timed out after %lld ms (killed)",
++              site, (long long) timed_out_ms);
++  } else if (WIFSIGNALED (wstatus)) {
+     int sig = WTERMSIG (wstatus);
+     snprintf (hegel__fail_origin, sizeof hegel__fail_origin, "HEGEL_ISOLATED at %s", site);
+     snprintf (hegel__fail_msg, sizeof hegel__fail_msg,
+@@ -1135,17 +1188,26 @@ int hegel__isolate_enter (hegel_testcase * tc, const char * site)
+     return 1;
+   }
+ 
+-  /* Parent: relay notes, collect the verdict. */
++  /* Parent: relay notes, collect the verdict — or kill a child that is
++  ** still running at the deadline. */
+   close (fds[1]);
++  int64_t timeout_ms = hegel__case_timeout_ms, timed_out_ms = 0;
++  struct timespec deadline;
++  if (timeout_ms) hegel__deadline_in (&deadline, timeout_ms);
++  const struct timespec * dl = timeout_ms ? &deadline : NULL;
+   hegel_outcome out;
+   memset (&out, 0, sizeof out);
+   out.status = -1;
+   for (;;) {
+     hegel_msg_header h;
+-    if (hegel__read_full (fds[0], &h, sizeof h) != 0) break;
++    int rd = hegel__read_deadline (fds[0], &h, sizeof h, dl);
++    if (rd == -2) timed_out_ms = timeout_ms;
++    if (rd != 0) break;
+     uint8_t * payload = malloc (h.len ? h.len : 1);
+     if (!payload) abort ();
+-    if (h.len && hegel__read_full (fds[0], payload, h.len) != 0) { free (payload); break; }
++    rd = h.len ? hegel__read_deadline (fds[0], payload, h.len, dl) : 0;
++    if (rd == -2) timed_out_ms = timeout_ms;
++    if (rd != 0) { free (payload); break; }
+     int done = 0;
+     /* Only notes and the terminal verdicts (DONE .. HEALTH) come from an
+     ** isolated child; ops numbered after HEALTH are ordinary requests. */
+@@ -1157,12 +1219,13 @@ int hegel__isolate_enter (hegel_testcase * tc, const char * site)
+     if (done) break;
+   }
+   close (fds[0]);
++  if (timed_out_ms) kill (pid, SIGKILL);
+   int wstatus = 0;
+   while (waitpid (pid, &wstatus, 0) < 0) { /* EINTR */ }
+ 
+   switch (out.status) {
+     case -1:
+-      report_iso_crash (tc, site, wstatus);
++      report_iso_crash (tc, site, wstatus, timed_out_ms);
+       break;
+     case HG_STATUS_VALID:
+       return 0;
+diff --git a/hegel_c.h b/hegel_c.h
+index b5abc84..175a8ad 100644
+--- a/hegel_c.h
++++ b/hegel_c.h
+@@ -112,8 +112,46 @@ typedef struct {
+   const char *        test_file;        /* test location (Antithesis reports), */
+   uint32_t            test_line;        /*   NULL test_file: "<binary>", line 0 */
+   const char *        test_function;    /* NULL: suite test name, else "run<N>" */
++  /* ---- hegel-c's own (see "Timeouts" below) ---- */
++  int64_t             timeout_ms;       /* per-case deadline; 0: 10 s, HEGEL_OFF: none */
+ } hegel_run_options;
+ 
++/* ---- Timeouts ----
++**
++** A forked body that is still running after timeout_ms milliseconds is
++** killed (SIGKILL) and the case fails, like a crash: it shrinks, and the
++** report says "timed out after N ms".  So an infinite loop or a deadlock
++** in the code under test is a counterexample, not a hung test run.
++**
++** What is timed is a forked body's wall time: the whole test case under
++** the fork runners (engine time serving its draws included), the block
++** under HEGEL_ISOLATED in nofork mode.  Nofork code outside a block has
++** no deadline: nothing could kill it but the run itself.
++**
++** The origin (which bug this is, to the shrinker) is "timeout" for a
++** fork-mode case and the block's "HEGEL_ISOLATED at file:line" inside a
++** block, so a bug that hangs on some inputs and crashes on others
++** shrinks as one failure there.
++**
++** timeout_ms: 0 is the default, HEGEL_DEFAULT_TIMEOUT_MS (10 s);
++** HEGEL_OFF is no deadline; any other value is milliseconds.
++** HEGEL_C_TIMEOUT_MS in the environment overrides the option, with 0 for
++** no deadline — for a slow machine, an ASan build or a debugger session,
++** with no rebuild.  The runners without options (hegel_run_test, the
++** suite, the state machine runners) use the environment or the default.
++**
++** Cost and limits:
++**   - Every execution that hangs costs the whole timeout, and shrinking a
++**     hang replays it many times: a test meant to find hangs wants a
++**     timeout a few times its slowest honest case (hundreds of ms), not
++**     the default.
++**   - A case that runs close to the timeout fails on some replays and
++**     not on others: the engine then reports the failure with a
++**     "nondeterministic" caveat, or the run as flaky.  Raise the timeout.
++**   - Only the forked body is killed.  Processes it started itself
++**     (MPI_Comm_spawn workers, a shell) are left running. */
++#define HEGEL_DEFAULT_TIMEOUT_MS 10000
++
+ /* report_multiple: by default a run stops at its first failure (one bug
+ ** per run: a second one stays hidden until the first is fixed).  With it,
+ ** the engine keeps looking and shrinks every failure with a distinct
+@@ -976,11 +1014,13 @@ char * hegel_draw_grammar_with (hegel_testcase * tc, const char * grammar,
+ ** Under hegel_run_test_nofork the block runs in a forked child that sees
+ ** every value drawn before it (copy-on-write — nothing is serialized);
+ ** a crash there is a failure whose origin names the block, and it
+-** shrinks like any other.  HEGEL_ASSERT / hegel_assume / hegel_note
++** shrinks like any other; so is a block still running at the run's
++** timeout (hegel_run_options.timeout_ms, 10 s by default), whose child
++** is killed.  HEGEL_ASSERT / hegel_assume / hegel_note
+ ** inside the block work as usual.  Under the fork runners the whole case
+ ** is already isolated, so the block runs inline.
+ **
+-** The block is one bug: every failure inside it — crash, abort,
++** The block is one bug: every failure inside it — crash, abort, timeout,
+ ** HEGEL_ASSERT, hegel_fail — reports origin "HEGEL_ISOLATED at file:line"
+ ** (the message still says which).  So code whose one bug shows up as a
+ ** crash on some runs and a bad result on others (memory garbage decides)
+diff --git a/tests/selftest/Makefile b/tests/selftest/Makefile
+index 8dc4043..e0c212b 100644
+--- a/tests/selftest/Makefile
++++ b/tests/selftest/Makefile
+@@ -92,7 +92,8 @@ TESTS_SHRINK = test_recursive_shrinks \
+                test_value_draws_shrink \
+                test_repeat_shrinks \
+                test_repeat_crash_shrinks \
+-               test_grammar_shrinks
++               test_grammar_shrinks \
++               test_timeout_hang
+ 
+ ALL_TESTS = $(TESTS_PASS) $(TESTS_FAIL) $(TESTS_CRASH) $(TESTS_HEALTH) $(TESTS_SHRINK)
+ 
+diff --git a/tests/selftest/test_timeout_hang.c b/tests/selftest/test_timeout_hang.c
+new file mode 100644
+index 0000000..9d8c7fa
+--- /dev/null
++++ b/tests/selftest/test_timeout_hang.c
+@@ -0,0 +1,128 @@
++/* SPDX-License-Identifier: MIT
++** Copyright (c) 2026 c4ffein
++** Part of hegel-c — see hegel/LICENSE for terms. */
++/*
++** Test: code under test that never returns is a failure that shrinks,
++**       not a hung run — the forked body is killed at the run's timeout.
++**
++** EXPECTED_SHRINK: 8 8
++**
++** Layer 1: ring_walk() hops around a ring of 8 slots, `step` slots at a
++**          time, until it lands on a slot other than 0.  With a step
++**          that is a multiple of 8 it lands on slot 0 for ever (the
++**          deliberate bug: no bound on the number of hops).
++** Layer 2: draw a step in 1..100 and walk.  Run
++**            - fork mode: the case's child hangs; the runner kills it at
++**              the deadline and the case fails with origin "timeout";
++**            - nofork, the walk inside HEGEL_ISOLATED: the block's child
++**              hangs and is killed; the failure's origin is the block.
++**          Both with a 300 ms timeout (the default, 10 s, would spend
++**          minutes shrinking: every hanging execution costs the whole
++**          timeout).  The step of the last execution (the final replay
++**          of the shrunk case) is kept in shared memory.
++** Layer 3: prints "shrunk: A B" for the Makefile's TESTS_SHRINK check
++**          and exits 1 when both runs failed.  The smallest step that
++**          hangs is 8.
++**
++** Expected: EXIT non-zero with "shrunk: 8 8".
++*/
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++
++#include "hegel_c.h"
++
++/* ---- Layer 1: function under test ---- */
++
++#define RING 8
++
++static
++int
++ring_walk (
++int                         step)
++{
++  volatile int        pos = 0;                /* volatile: the loop is really run */
++  int                 hops = 0;
++
++  do {
++    pos = (pos + step) % RING;
++    hops ++;
++  } while (pos == 0);                         /* BUG: no bound on hops */
++  return (hops);
++}
++
++/* ---- Layer 2: hegel tests ---- */
++
++static int *        g_last_step;              /* shared with fork children */
++
++static
++void
++testFork (
++hegel_testcase *            tc)
++{
++  int                 step = hegel_draw_int (tc, 1, 100);
++  int                 hops;
++
++  *g_last_step = step;
++  hops = ring_walk (step);
++  HEGEL_ASSERT (hops >= 1, "ring_walk(%d) = %d", step, hops);
++}
++
++static
++void
++testIsolated (
++hegel_testcase *            tc)
++{
++  int                 step = hegel_draw_int (tc, 1, 100);
++
++  *g_last_step = step;
++  HEGEL_ISOLATED (tc) {
++    int               hops = ring_walk (step);
++
++    HEGEL_ASSERT (hops >= 1, "ring_walk(%d) = %d", step, hops);
++  }
++}
++
++/* ---- Layer 3: runner (see Makefile TESTS_SHRINK) ---- */
++
++static
++int
++run (
++void                     (* fn) (hegel_testcase *),
++int                         use_fork)
++{
++  hegel_run_options   o;
++  int                 failed;
++
++  memset (&o, 0, sizeof o);
++  o.test_cases = 200;
++  o.timeout_ms = 300;
++  *g_last_step = -1;
++  failed = use_fork ? hegel_run_test_with (fn, &o) : hegel_run_test_nofork_with (fn, &o);
++  return (failed ? *g_last_step : -1);
++}
++
++int
++main (
++int                 argc,
++char *              argv[])
++{
++  int                 a;
++  int                 b;
++
++  (void) argc;
++  (void) argv;
++
++  g_last_step = mmap (NULL, sizeof *g_last_step, PROT_READ | PROT_WRITE,
++                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++  if (g_last_step == MAP_FAILED) {
++    perror ("mmap");
++    return (2);
++  }
++
++  a = run (testFork, 1);
++  b = run (testIsolated, 0);
++  printf ("shrunk: %d %d\n", a, b);
++  return ((a > 0 && b > 0) ? 1 : 0);
++}
+-- 
+2.43.0
+

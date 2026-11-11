@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/hegel-c",
+  "remote": "https://github.com/c4ffein/hegel-c",
+  "base_branch": "main",
+  "base_sha": "ceefde0e8f0c07817687b7516aad33a176aa1fd0",
+  "created": "2026-11-11",
+  "patches": 1,
+  "title": "experiments/libhegel-vs-hegel-c: the graph pair under nofork + HEGEL_ISOLATED"
+}

@@ -1,0 +1,31 @@
+From f5cca5ab3f279af6f2fed8de8b7406f2854091fb Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 19:37:20 +0000
+Subject: [PATCH 3/3] README: say that hegel-c is Linux only for now
+
+The loader looks for libhegel.so, LIBHEGEL_SHA256_* pins linux-amd64 and
+linux-arm64 only, and core/hegel_runner.c reads /proc/self/exe and
+/proc/self/cmdline (fork-clean mode, the database key, the test
+location).  The README did not say so.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvrCDpVjyeVdC5cqgPz
+---
+ README.md | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/README.md b/README.md
+index 4f0e3d7..1fb6e8c 100644
+--- a/README.md
++++ b/README.md
+@@ -65,6 +65,7 @@ Until 2026-10 hegel-c also had a declarative schema layer (`hegel_gen.h`: descri
+ - **Pure C public API, no C++.** A separate C++ Hegel binding is provided by the Hegel team. This lib stays pure C at the surface.
+ - **Based on the official minimal hegel-c.** The main hegel now includes a low-level C header for FFI bindings, also called hegel-c. This repo is only a wrapper enabling more features.
+ - **Pinned engine, watched upstream.** The engine version is pinned (`LIBHEGEL_VERSION` in the Makefile); a CI job checks every 6 hours for newer libhegel releases (`make check-libhegel-upstream` runs the same check locally).
++- **Linux only, for now.** The runtime loads `libhegel.so`, the Makefile pins the two Linux engine builds (amd64, arm64), and fork-clean mode, the database key and the test location read `/proc/self`. Nothing has been built or run on macOS or Windows.
+ 
+ ## Documentation
+ 
+-- 
+2.43.0
+

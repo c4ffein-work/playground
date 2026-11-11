@@ -1,0 +1,57 @@
+From d55e5342495f6b0c6047fde751127641e65f5177 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 11 Nov 2026 19:37:38 +0000
+Subject: [PATCH 1/2] HEGEL_DRAW_BOOL () calls hegel_draw_bool
+
+The header says of the draw shorthands "same choices as the call they
+expand to", and CLAUDE.md calls them "the primitives".  That held for
+every one but HEGEL_DRAW_BOOL, which expanded to hegel_draw_int (tc, 0, 1):
+an integer choice where hegel_draw_bool makes a boolean one, traced as
+"Draw N: 1" where the primitive prints "true".
+
+It now expands to hegel_draw_bool (tc).  Both shrink to false.
+
+This changes the choice sequence of every test that uses the macro
+(in this repository: tests/irl/linux/bootconfig_rediscovery and the
+schema experiments), so their HEGEL_C_REPRODUCE blobs and HEGEL_DATABASE
+entries from before this commit no longer replay, and a seeded run sees
+different cases.
+
+Not built or run: written in a sandbox that could not compile the
+repository.  Run make test and the bootconfig_rediscovery pin before
+keeping it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_019ndjvrCDpVjyeVdC5cqgPz
+---
+ hegel_c.h | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/hegel_c.h b/hegel_c.h
+index b5abc84..da5f72f 100644
+--- a/hegel_c.h
++++ b/hegel_c.h
+@@ -306,7 +306,7 @@ int hegel_draw_regex (hegel_testcase * tc, const char * pattern,
+ **     int     y = HEGEL_DRAW_INT    ();           /. INT_MIN..INT_MAX ./
+ **     int64_t a = HEGEL_DRAW_I64    (-100, 100);
+ **     double  d = HEGEL_DRAW_DOUBLE (0.0, 1.0);
+-**     bool    b = HEGEL_DRAW_BOOL   ();           /. 0 or 1 ./
++**     bool    b = HEGEL_DRAW_BOOL   ();
+ **
+ ** Same choices as the call they expand to, so they shrink the same. */
+ 
+@@ -340,9 +340,8 @@ int hegel_draw_regex (hegel_testcase * tc, const char * pattern,
+ #define HEGEL__DRAW_DOUBLE_2(lo, hi) hegel_draw_double ((tc), (lo),     (hi))
+ #define HEGEL_DRAW_DOUBLE(...)       HEGEL__DISPATCH (HEGEL__DRAW_DOUBLE, __VA_ARGS__)
+ 
+-/* Bool takes no range.  Draws hegel_draw_int (0, 1), so it shrinks to
+-** false like any 0/1 draw. */
+-#define HEGEL__DRAW_BOOL_0() ((bool)(hegel_draw_int ((tc), 0, 1)))
++/* Bool takes no range. */
++#define HEGEL__DRAW_BOOL_0() hegel_draw_bool ((tc))
+ #define HEGEL_DRAW_BOOL(...) HEGEL__DISPATCH (HEGEL__DRAW_BOOL, __VA_ARGS__)
+ 
+ /* ---- Value draws: dates, times, UUIDs, IP addresses, emails, URLs, domains ----
+-- 
+2.43.0
+
