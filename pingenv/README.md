@@ -72,6 +72,23 @@ What it does and does not do:
   single byte ranges are supported.
 - No compression and no content negotiation.
 
+## Layouts
+
+The same image covers three setups; only the variables differ.
+
+- **Proxy only.** Every route has an `UPSTREAM`.
+- **One container doing both.** Some routes have an `UPSTREAM`, others a
+  `ROOT`. See [`docker-compose.yml`](docker-compose.yml).
+- **Edge plus file server.** One container terminates TLS and proxies; a
+  second one, with TLS off, serves the directory. The file server's `HOST`
+  must be the same as the edge's, since the client's `Host` header is passed
+  through. See [`docker-compose.split.yml`](docker-compose.split.yml).
+
+The split costs one extra hop per file request. What it buys: the site can be
+redeployed by restarting the file server alone, without dropping the edge's
+connections or its other routes, and the container holding the certificates
+has no access to the content.
+
 ## Global settings
 
 | Variable | Default | Meaning |

@@ -52,7 +52,7 @@ field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.ar
 HTTP=18080
 HTTPS=18443
 RESOLVE=()
-for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test other.test; do
+for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test split.pingenv.test other.test; do
     RESOLVE+=(--resolve "$name:$HTTP:127.0.0.1" --resolve "$name:$HTTPS:127.0.0.1")
 done
 get() { curl -sS --max-time 10 "${RESOLVE[@]}" "$@"; }
@@ -103,6 +103,7 @@ env -i \
     PINGENV_ROUTE_ASSETS_ROOT="$SITE" PINGENV_ROUTE_ASSETS_CACHE_CONTROL='public, max-age=60' \
     PINGENV_ROUTE_LIVE_HOST=live.pingenv.test PINGENV_ROUTE_LIVE_ROOT="$SITE" \
     PINGENV_ROUTE_LIVE_MEMORY_MAX_FILE=0 \
+    PINGENV_ROUTE_SPLIT_HOST=split.pingenv.test PINGENV_ROUTE_SPLIT_UPSTREAM=127.0.0.1:18090 \
     PINGENV_ROUTE_WILD_HOST='*.wild.pingenv.test' PINGENV_ROUTE_WILD_UPSTREAM=127.0.0.1:18001 \
     "$BIN" >"$WORK/selfsigned.log" 2>&1 &
 GATE=$!; PIDS+=($GATE)
@@ -213,6 +214,25 @@ echo 'new' >"$SITE/new.txt"
 check "memory copy is a startup snapshot" "$(get -k "$S/css/site.css")" 'body{}'
 check "disk route sees the change" "$(get -k "$L/css/site.css")" 'body{color:red}'
 check "files added later are served from disk" "$(get -k "$S/new.txt") $(src 'site.pingenv.test/new.txt')" 'new upstream=disk'
+
+echo "== split layout: one pingenv as the edge, another as the file server"
+env -i PINGENV_HTTP_ADDR=127.0.0.1:18090 \
+    PINGENV_ROUTE_FILES_HOST=split.pingenv.test PINGENV_ROUTE_FILES_ROOT="$SITE" \
+    "$BIN" >"$WORK/inner.log" 2>&1 &
+INNER=$!; PIDS+=($INNER)
+wait_for_port 18090
+P="https://split.pingenv.test:$HTTPS"
+check "file served through both" "$(get -k "$P/docs/")" '<h1>docs</h1>'
+check "edge proxied it, file server answered from memory" \
+    "$(src 'split.pingenv.test/docs/') $(sleep 0.2; grep -c 'split.pingenv.test/docs/ 200 route=files upstream=memory' "$WORK/inner.log")" \
+    "upstream= 1"
+check "large file through both is intact" "$(get -k "$P/big.bin" | sha256sum)" "$BIG_SUM"
+check "range through both" "$(code -r 0-99 "$P/big.bin") $(hdr content-range -r 0-99 "$P/big.bin")" "206 bytes 0-99/300000"
+check "304 through both" "$(code -H "If-None-Match: $(hdr etag "$P/big.bin")" "$P/big.bin")" 304
+kill -TERM $INNER
+wait_for_exit $INNER
+check "file server down gives 502 on its route" "$(code "$P/docs/")" 502
+check "other routes are unaffected" "$(get -k "https://app.pingenv.test:$HTTPS/" | field 'd["upstream"]')" A
 
 kill -TERM $GATE
 wait_for_exit $GATE
