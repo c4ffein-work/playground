@@ -1,4 +1,8 @@
-//! Configuration, read only from environment variables.
+//! Configuration, read only from `PINGENV_*` environment variables.
+//!
+//! Every variable carries the prefix so that anything unrecognised under it is
+//! an error: a typo is reported instead of being silently ignored, and
+//! unrelated variables in the environment can never be mistaken for settings.
 //!
 //! Parsing takes an iterator of pairs rather than reading the process
 //! environment directly, so the whole thing is testable. Every problem found is
@@ -44,6 +48,18 @@ pub struct CertFiles {
     pub key: PathBuf,
 }
 
+/// A directory served straight from this process instead of an upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticSite {
+    pub root: PathBuf,
+    /// Files up to this size are read into memory at startup; larger ones are
+    /// streamed from disk. Zero keeps everything on disk.
+    pub memory_max_file: u64,
+    /// Served for paths that match no file, for single-page applications.
+    pub fallback: Option<String>,
+    pub cache_control: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Route {
     /// The `<NAME>` part of `ROUTE_<NAME>_*`, lowercased. Used in logs.
@@ -54,7 +70,9 @@ pub struct Route {
     /// (except for the root itself).
     pub path: String,
     pub strip_prefix: bool,
+    /// Empty when the route serves files.
     pub upstreams: Vec<Upstream>,
+    pub site: Option<StaticSite>,
     /// Overrides the `Host` header sent to the upstream.
     pub set_host: Option<String>,
     pub cert_files: Option<CertFiles>,
@@ -80,20 +98,49 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub acme: AcmeConfig,
     pub routes: Vec<Route>,
+    /// Upper bound on file bytes held in memory across all routes.
+    pub memory_max_total: u64,
     pub threads: usize,
     pub shutdown_grace_seconds: u64,
     pub log_level: log::LevelFilter,
 }
 
+pub const PREFIX: &str = "PINGENV_";
+
+const GLOBALS: &[&str] = &[
+    "TLS_MODE",
+    "HTTP_ADDR",
+    "HTTPS_ADDR",
+    "HTTPS_REDIRECT",
+    "HTTPS_REDIRECT_PORT",
+    "DATA_DIR",
+    "ACME_EMAIL",
+    "ACME_STAGING",
+    "ACME_DIRECTORY_URL",
+    "ACME_CA_FILE",
+    "MEMORY_MAX_TOTAL",
+    "THREADS",
+    "SHUTDOWN_GRACE_SECONDS",
+    "LOG_LEVEL",
+];
+
 const ROUTE_FIELDS: &[&str] = &[
+    "MEMORY_MAX_FILE",
+    "CACHE_CONTROL",
     "TLS_CERT_FILE",
     "TLS_KEY_FILE",
     "STRIP_PREFIX",
     "SET_HOST",
     "UPSTREAM",
+    "FALLBACK",
     "HOST",
     "PATH",
+    "ROOT",
 ];
+
+const DEFAULT_MEMORY_MAX_FILE: u64 = 1024 * 1024;
+const DEFAULT_MEMORY_MAX_TOTAL: u64 = 128 * 1024 * 1024;
+const DEFAULT_CACHE_CONTROL: &str = "no-cache";
 
 impl Config {
     pub fn from_env<I>(vars: I) -> Result<Config, Vec<String>>
@@ -104,7 +151,10 @@ impl Config {
         let mut globals: BTreeMap<String, String> = BTreeMap::new();
         let mut raw_routes: BTreeMap<String, BTreeMap<&'static str, String>> = BTreeMap::new();
 
-        for (key, value) in vars {
+        for (full_key, value) in vars {
+            let Some(key) = full_key.strip_prefix(PREFIX).map(str::to_string) else {
+                continue;
+            };
             let value = value.trim().to_string();
             if let Some(rest) = key.strip_prefix("ROUTE_") {
                 // Longest field name first, so `ROUTE_A_TLS_CERT_FILE` is not
@@ -121,12 +171,14 @@ impl Config {
                             .insert(field, value);
                     }
                     None => errors.push(format!(
-                        "{key}: unknown route setting (expected ROUTE_<NAME>_ followed by one of {})",
+                        "{full_key}: unknown route setting (expected {PREFIX}ROUTE_<NAME>_ followed by one of {})",
                         ROUTE_FIELDS.join(", ")
                     )),
                 }
-            } else {
+            } else if GLOBALS.contains(&key.as_str()) {
                 globals.insert(key, value);
+            } else {
+                errors.push(format!("{full_key}: unknown setting"));
             }
         }
 
@@ -143,38 +195,59 @@ impl Config {
             Some("manual") => TlsMode::Manual,
             Some(other) => {
                 errors.push(format!(
-                    "TLS_MODE: '{other}' is not one of off, acme, selfsigned, manual"
+                    "PINGENV_TLS_MODE: '{other}' is not one of off, acme, selfsigned, manual"
                 ));
                 TlsMode::Off
             }
         };
 
-        let http_addr = parse_addr(&mut errors, "HTTP_ADDR", get("HTTP_ADDR"), "0.0.0.0:80");
-        let https_addr = parse_addr(&mut errors, "HTTPS_ADDR", get("HTTPS_ADDR"), "0.0.0.0:443");
+        let http_addr = parse_addr(
+            &mut errors,
+            "PINGENV_HTTP_ADDR",
+            get("HTTP_ADDR"),
+            "0.0.0.0:80",
+        );
+        let https_addr = parse_addr(
+            &mut errors,
+            "PINGENV_HTTPS_ADDR",
+            get("HTTPS_ADDR"),
+            "0.0.0.0:443",
+        );
         let https_redirect = parse_bool(
             &mut errors,
-            "HTTPS_REDIRECT",
+            "PINGENV_HTTPS_REDIRECT",
             get("HTTPS_REDIRECT"),
             tls != TlsMode::Off,
         );
         if https_redirect && tls == TlsMode::Off {
-            errors.push("HTTPS_REDIRECT: cannot redirect to HTTPS while TLS_MODE is off".into());
+            errors.push(
+                "PINGENV_HTTPS_REDIRECT: cannot redirect to HTTPS while PINGENV_TLS_MODE is off"
+                    .into(),
+            );
         }
         let https_redirect_port = parse_num(
             &mut errors,
-            "HTTPS_REDIRECT_PORT",
+            "PINGENV_HTTPS_REDIRECT_PORT",
             get("HTTPS_REDIRECT_PORT"),
             443u16,
         );
 
-        let staging = parse_bool(&mut errors, "ACME_STAGING", get("ACME_STAGING"), false);
+        let staging = parse_bool(
+            &mut errors,
+            "PINGENV_ACME_STAGING",
+            get("ACME_STAGING"),
+            false,
+        );
         let directory_url = match get("ACME_DIRECTORY_URL") {
             Some(url) => {
                 if staging {
-                    errors.push("ACME_STAGING and ACME_DIRECTORY_URL are both set; use one".into());
+                    errors.push(
+                        "PINGENV_ACME_STAGING and PINGENV_ACME_DIRECTORY_URL are both set; use one"
+                            .into(),
+                    );
                 }
                 if !url.starts_with("https://") {
-                    errors.push("ACME_DIRECTORY_URL: must start with https://".into());
+                    errors.push("PINGENV_ACME_DIRECTORY_URL: must start with https://".into());
                 }
                 url
             }
@@ -186,18 +259,31 @@ impl Config {
             && (!e.contains('@') || e.contains(char::is_whitespace))
         {
             errors.push(format!(
-                "ACME_EMAIL: '{e}' does not look like an email address"
+                "PINGENV_ACME_EMAIL: '{e}' does not look like an email address"
             ));
         }
 
         let default_threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let threads = parse_num(&mut errors, "THREADS", get("THREADS"), default_threads);
+        let memory_max_total = match get("MEMORY_MAX_TOTAL") {
+            None => DEFAULT_MEMORY_MAX_TOTAL,
+            Some(v) => parse_size(&v).unwrap_or_else(|why| {
+                errors.push(format!("PINGENV_MEMORY_MAX_TOTAL: '{v}' {why}"));
+                0
+            }),
+        };
+
+        let threads = parse_num(
+            &mut errors,
+            "PINGENV_THREADS",
+            get("THREADS"),
+            default_threads,
+        );
         if threads == 0 {
-            errors.push("THREADS: must be at least 1".into());
+            errors.push("PINGENV_THREADS: must be at least 1".into());
         }
         let shutdown_grace_seconds = parse_num(
             &mut errors,
-            "SHUTDOWN_GRACE_SECONDS",
+            "PINGENV_SHUTDOWN_GRACE_SECONDS",
             get("SHUTDOWN_GRACE_SECONDS"),
             5u64,
         );
@@ -205,7 +291,7 @@ impl Config {
             None => log::LevelFilter::Info,
             Some(v) => v.parse().unwrap_or_else(|_| {
                 errors.push(format!(
-                    "LOG_LEVEL: '{v}' is not one of off, error, warn, info, debug, trace"
+                    "PINGENV_LOG_LEVEL: '{v}' is not one of off, error, warn, info, debug, trace"
                 ));
                 log::LevelFilter::Info
             }),
@@ -219,7 +305,9 @@ impl Config {
         }
         if raw_routes.is_empty() {
             errors.push(
-                "no routes configured: set ROUTE_<NAME>_HOST and ROUTE_<NAME>_UPSTREAM".into(),
+                "no routes configured: set PINGENV_ROUTE_<NAME>_HOST and either \
+                 PINGENV_ROUTE_<NAME>_UPSTREAM or PINGENV_ROUTE_<NAME>_ROOT"
+                    .into(),
             );
         }
 
@@ -228,20 +316,20 @@ impl Config {
             for host in &route.hosts {
                 if !seen.insert((host.clone(), route.path.clone())) {
                     errors.push(format!(
-                        "ROUTE_{}_HOST: {host}{} is already served by another route",
+                        "PINGENV_ROUTE_{}_HOST: {host}{} is already served by another route",
                         route.name.to_uppercase(),
                         route.path
                     ));
                 }
             }
-            let var = |f: &str| format!("ROUTE_{}_{f}", route.name.to_uppercase());
+            let var = |f: &str| format!("PINGENV_ROUTE_{}_{f}", route.name.to_uppercase());
             match (tls, &route.cert_files) {
                 (TlsMode::Off, Some(_)) => errors.push(format!(
-                    "{}: certificate files are set but TLS_MODE is off",
+                    "{}: certificate files are set but PINGENV_TLS_MODE is off",
                     var("TLS_CERT_FILE")
                 )),
                 (TlsMode::Manual, None) => errors.push(format!(
-                    "{} and {}: required when TLS_MODE is manual",
+                    "{} and {}: required when PINGENV_TLS_MODE is manual",
                     var("TLS_CERT_FILE"),
                     var("TLS_KEY_FILE")
                 )),
@@ -277,6 +365,7 @@ impl Config {
                 ca_file: get("ACME_CA_FILE").map(PathBuf::from),
             },
             routes,
+            memory_max_total,
             threads,
             shutdown_grace_seconds,
             log_level,
@@ -305,7 +394,7 @@ fn parse_route(
     name: &str,
     fields: &BTreeMap<&'static str, String>,
 ) -> Option<Route> {
-    let var = |f: &str| format!("ROUTE_{name}_{f}");
+    let var = |f: &str| format!("PINGENV_ROUTE_{name}_{f}");
     let field = |f: &str| fields.get(f).filter(|v| !v.is_empty());
     let before = errors.len();
 
@@ -314,7 +403,7 @@ fn parse_route(
         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     {
         errors.push(format!(
-            "ROUTE_{name}_*: route names may only contain A-Z, 0-9 and _"
+            "PINGENV_ROUTE_{name}_*: route names may only contain A-Z, 0-9 and _"
         ));
     }
 
@@ -334,7 +423,17 @@ fn parse_route(
 
     let mut upstreams = Vec::new();
     match field("UPSTREAM") {
-        None => errors.push(format!("{}: missing", var("UPSTREAM"))),
+        None if field("ROOT").is_some() => {}
+        None => errors.push(format!(
+            "{} or {}: one of them is required",
+            var("UPSTREAM"),
+            var("ROOT")
+        )),
+        Some(_) if field("ROOT").is_some() => errors.push(format!(
+            "{} and {}: a route either proxies or serves files, not both",
+            var("UPSTREAM"),
+            var("ROOT")
+        )),
         Some(raw) => {
             for item in raw.split(',').map(str::trim).filter(|u| !u.is_empty()) {
                 match parse_upstream(item) {
@@ -384,15 +483,99 @@ fn parse_route(
         }
     };
 
+    let site = match field("ROOT") {
+        Some(root) => {
+            if !root.starts_with('/') {
+                errors.push(format!(
+                    "{}: '{root}' must be an absolute path",
+                    var("ROOT")
+                ));
+            }
+            for upstream_only in ["STRIP_PREFIX", "SET_HOST"] {
+                if field(upstream_only).is_some() {
+                    errors.push(format!(
+                        "{}: only applies to routes with an upstream",
+                        var(upstream_only)
+                    ));
+                }
+            }
+            let fallback = field("FALLBACK").cloned();
+            if let Some(f) = &fallback
+                && !f.starts_with('/')
+            {
+                errors.push(format!("{}: '{f}' must start with /", var("FALLBACK")));
+            }
+            let memory_max_file = match field("MEMORY_MAX_FILE") {
+                None => DEFAULT_MEMORY_MAX_FILE,
+                Some(v) => parse_size(v).unwrap_or_else(|why| {
+                    errors.push(format!("{}: '{v}' {why}", var("MEMORY_MAX_FILE")));
+                    0
+                }),
+            };
+            let cache_control = field("CACHE_CONTROL")
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_CACHE_CONTROL.into());
+            if !cache_control
+                .chars()
+                .all(|c| c.is_ascii_graphic() || c == ' ')
+            {
+                errors.push(format!("{}: must be printable ASCII", var("CACHE_CONTROL")));
+            }
+            Some(StaticSite {
+                root: PathBuf::from(root),
+                memory_max_file,
+                fallback,
+                cache_control,
+            })
+        }
+        None => {
+            for files_only in ["FALLBACK", "MEMORY_MAX_FILE", "CACHE_CONTROL"] {
+                if field(files_only).is_some() {
+                    errors.push(format!(
+                        "{}: only applies to routes with a {}",
+                        var(files_only),
+                        var("ROOT")
+                    ));
+                }
+            }
+            None
+        }
+    };
+
     (errors.len() == before).then(|| Route {
         name: name.to_ascii_lowercase(),
         hosts,
         path,
         strip_prefix,
         upstreams,
+        site,
         set_host,
         cert_files,
     })
+}
+
+/// Parses a byte count: a bare number, or one with a `KiB`/`MiB`/`GiB`
+/// (powers of 1024) or `KB`/`MB`/`GB` (powers of 1000) suffix.
+pub fn parse_size(text: &str) -> Result<u64, &'static str> {
+    const UNITS: &[(&str, u64)] = &[
+        ("KIB", 1 << 10),
+        ("MIB", 1 << 20),
+        ("GIB", 1 << 30),
+        ("KB", 1_000),
+        ("MB", 1_000_000),
+        ("GB", 1_000_000_000),
+        ("B", 1),
+    ];
+    let upper = text.trim().to_ascii_uppercase();
+    let (digits, factor) = UNITS
+        .iter()
+        .find_map(|(unit, factor)| Some((upper.strip_suffix(unit)?.trim_end(), *factor)))
+        .unwrap_or((upper.as_str(), 1));
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(factor))
+        .ok_or("is not a size like 0, 65536, 512KiB or 2MiB")
 }
 
 fn validate_host(host: &str, allow_wildcard: bool) -> Result<(), &'static str> {
@@ -511,8 +694,8 @@ mod tests {
     #[test]
     fn minimal_config() {
         let cfg = env(&[
-            ("ROUTE_APP_HOST", "Example.com, www.example.com"),
-            ("ROUTE_APP_UPSTREAM", "app:8080"),
+            ("PINGENV_ROUTE_APP_HOST", "Example.com, www.example.com"),
+            ("PINGENV_ROUTE_APP_UPSTREAM", "app:8080"),
             ("PATH", "/usr/bin"),
         ])
         .unwrap();
@@ -536,16 +719,16 @@ mod tests {
     #[test]
     fn route_names_may_contain_underscores() {
         let cfg = env(&[
-            ("ROUTE_MY_API_HOST", "api.example.com"),
+            ("PINGENV_ROUTE_MY_API_HOST", "api.example.com"),
             (
-                "ROUTE_MY_API_UPSTREAM",
+                "PINGENV_ROUTE_MY_API_UPSTREAM",
                 "https://backend.internal, http://other:81/",
             ),
-            ("ROUTE_MY_API_PATH", "/v1/"),
-            ("ROUTE_MY_API_STRIP_PREFIX", "true"),
-            ("ROUTE_MY_API_TLS_CERT_FILE", "/c.pem"),
-            ("ROUTE_MY_API_TLS_KEY_FILE", "/k.pem"),
-            ("TLS_MODE", "manual"),
+            ("PINGENV_ROUTE_MY_API_PATH", "/v1/"),
+            ("PINGENV_ROUTE_MY_API_STRIP_PREFIX", "true"),
+            ("PINGENV_ROUTE_MY_API_TLS_CERT_FILE", "/c.pem"),
+            ("PINGENV_ROUTE_MY_API_TLS_KEY_FILE", "/k.pem"),
+            ("PINGENV_TLS_MODE", "manual"),
         ])
         .unwrap();
         let r = &cfg.routes[0];
@@ -575,23 +758,28 @@ mod tests {
     #[test]
     fn reports_every_problem_at_once() {
         let errs = env(&[
-            ("ROUTE_A_HOST", "https://example.com"),
-            ("ROUTE_A_UPSTREAM", "app"),
-            ("ROUTE_B_HOST", "b.example.com"),
-            ("ROUTE_C_HOSTT", "typo.example.com"),
-            ("TLS_MODE", "letsencrypt"),
-            ("HTTP_ADDR", "80"),
+            ("PINGENV_ROUTE_A_HOST", "https://example.com"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "app"),
+            ("PINGENV_ROUTE_B_HOST", "b.example.com"),
+            ("PINGENV_ROUTE_C_HOSTT", "typo.example.com"),
+            ("PINGENV_TLS_MODE", "letsencrypt"),
+            ("PINGENV_HTTP_ADDR", "80"),
         ])
         .unwrap_err();
         let all = errs.join("\n");
-        assert!(all.contains("ROUTE_A_HOST"), "{all}");
+        assert!(all.contains("PINGENV_ROUTE_A_HOST"), "{all}");
         assert!(
-            all.contains("ROUTE_A_UPSTREAM: 'app' needs a port"),
+            all.contains("PINGENV_ROUTE_A_UPSTREAM: 'app' needs a port"),
             "{all}"
         );
-        assert!(all.contains("ROUTE_B_UPSTREAM: missing"), "{all}");
         assert!(
-            all.contains("ROUTE_C_HOSTT: unknown route setting"),
+            all.contains(
+                "PINGENV_ROUTE_B_UPSTREAM or PINGENV_ROUTE_B_ROOT: one of them is required"
+            ),
+            "{all}"
+        );
+        assert!(
+            all.contains("PINGENV_ROUTE_C_HOSTT: unknown route setting"),
             "{all}"
         );
         assert!(all.contains("TLS_MODE"), "{all}");
@@ -600,17 +788,17 @@ mod tests {
 
     #[test]
     fn no_routes_is_an_error() {
-        let errs = env(&[("TLS_MODE", "off")]).unwrap_err();
+        let errs = env(&[("PINGENV_TLS_MODE", "off")]).unwrap_err();
         assert!(errs[0].contains("no routes configured"));
     }
 
     #[test]
     fn duplicate_host_and_path_is_an_error() {
         let errs = env(&[
-            ("ROUTE_A_HOST", "example.com"),
-            ("ROUTE_A_UPSTREAM", "a:1"),
-            ("ROUTE_B_HOST", "example.com"),
-            ("ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_A_HOST", "example.com"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
+            ("PINGENV_ROUTE_B_HOST", "example.com"),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
         ])
         .unwrap_err();
         assert!(
@@ -622,9 +810,9 @@ mod tests {
     #[test]
     fn acme_rejects_wildcards_without_cert_files() {
         let errs = env(&[
-            ("TLS_MODE", "acme"),
-            ("ROUTE_A_HOST", "*.example.com"),
-            ("ROUTE_A_UPSTREAM", "a:1"),
+            ("PINGENV_TLS_MODE", "acme"),
+            ("PINGENV_ROUTE_A_HOST", "*.example.com"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
         ])
         .unwrap_err();
         assert!(errs[0].contains("wildcard"), "{errs:?}");
@@ -633,14 +821,14 @@ mod tests {
     #[test]
     fn acme_hosts_skip_routes_with_their_own_certificate() {
         let cfg = env(&[
-            ("TLS_MODE", "acme"),
-            ("ACME_STAGING", "true"),
-            ("ROUTE_A_HOST", "a.example.com,b.example.com"),
-            ("ROUTE_A_UPSTREAM", "a:1"),
-            ("ROUTE_B_HOST", "*.corp.example.com"),
-            ("ROUTE_B_UPSTREAM", "b:1"),
-            ("ROUTE_B_TLS_CERT_FILE", "/c.pem"),
-            ("ROUTE_B_TLS_KEY_FILE", "/k.pem"),
+            ("PINGENV_TLS_MODE", "acme"),
+            ("PINGENV_ACME_STAGING", "true"),
+            ("PINGENV_ROUTE_A_HOST", "a.example.com,b.example.com"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
+            ("PINGENV_ROUTE_B_HOST", "*.corp.example.com"),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_B_TLS_CERT_FILE", "/c.pem"),
+            ("PINGENV_ROUTE_B_TLS_KEY_FILE", "/k.pem"),
         ])
         .unwrap();
         assert_eq!(cfg.acme_hosts(), ["a.example.com", "b.example.com"]);
@@ -650,11 +838,87 @@ mod tests {
     #[test]
     fn redirect_without_tls_is_an_error() {
         let errs = env(&[
-            ("HTTPS_REDIRECT", "true"),
-            ("ROUTE_A_HOST", "example.com"),
-            ("ROUTE_A_UPSTREAM", "a:1"),
+            ("PINGENV_HTTPS_REDIRECT", "true"),
+            ("PINGENV_ROUTE_A_HOST", "example.com"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
         ])
         .unwrap_err();
         assert!(errs[0].contains("HTTPS_REDIRECT"), "{errs:?}");
+    }
+
+    #[test]
+    fn unprefixed_variables_are_ignored_and_unknown_prefixed_ones_are_errors() {
+        let errs = env(&[
+            ("PINGENV_ROUTE_A_HOST", "example.com"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
+            // Neither of these is ours: a Kubernetes service link and a stray global.
+            ("ROUTE_X_SERVICE_HOST", "10.0.0.1"),
+            ("TLS_MODE", "acme"),
+            ("PINGENV_TLS_MOD", "acme"),
+        ])
+        .unwrap_err();
+        assert_eq!(errs, ["PINGENV_TLS_MOD: unknown setting"]);
+    }
+
+    #[test]
+    fn static_route() {
+        let cfg = env(&[
+            ("PINGENV_ROUTE_SITE_HOST", "example.com"),
+            ("PINGENV_ROUTE_SITE_ROOT", "/srv/site"),
+            ("PINGENV_ROUTE_SITE_MEMORY_MAX_FILE", "64KiB"),
+            ("PINGENV_ROUTE_SITE_FALLBACK", "/index.html"),
+            ("PINGENV_MEMORY_MAX_TOTAL", "10MB"),
+        ])
+        .unwrap();
+        let route = &cfg.routes[0];
+        assert!(route.upstreams.is_empty());
+        assert_eq!(
+            route.site,
+            Some(StaticSite {
+                root: "/srv/site".into(),
+                memory_max_file: 65536,
+                fallback: Some("/index.html".into()),
+                cache_control: "no-cache".into(),
+            })
+        );
+        assert_eq!(cfg.memory_max_total, 10_000_000);
+    }
+
+    #[test]
+    fn a_route_proxies_or_serves_files_but_not_both() {
+        let errs = env(&[
+            ("PINGENV_ROUTE_A_HOST", "a.test"),
+            ("PINGENV_ROUTE_A_ROOT", "relative"),
+            ("PINGENV_ROUTE_A_UPSTREAM", "a:1"),
+            ("PINGENV_ROUTE_A_STRIP_PREFIX", "true"),
+            ("PINGENV_ROUTE_B_HOST", "b.test"),
+            ("PINGENV_ROUTE_B_UPSTREAM", "b:1"),
+            ("PINGENV_ROUTE_B_FALLBACK", "/index.html"),
+        ])
+        .unwrap_err();
+        let all = errs.join("\n");
+        assert!(all.contains("not both"), "{all}");
+        assert!(all.contains("must be an absolute path"), "{all}");
+        assert!(
+            all.contains("PINGENV_ROUTE_A_STRIP_PREFIX: only applies"),
+            "{all}"
+        );
+        assert!(
+            all.contains("PINGENV_ROUTE_B_FALLBACK: only applies"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("0"), Ok(0));
+        assert_eq!(parse_size("1500"), Ok(1500));
+        assert_eq!(parse_size("2kib"), Ok(2048));
+        assert_eq!(parse_size("1 MiB"), Ok(1 << 20));
+        assert_eq!(parse_size("3MB"), Ok(3_000_000));
+        assert_eq!(parse_size("1GiB"), Ok(1 << 30));
+        assert!(parse_size("lots").is_err());
+        assert!(parse_size("-1").is_err());
+        assert!(parse_size("99999999999999GiB").is_err());
     }
 }

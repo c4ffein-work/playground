@@ -52,7 +52,7 @@ field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(eval(sys.ar
 HTTP=18080
 HTTPS=18443
 RESOLVE=()
-for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test other.test; do
+for name in app.pingenv.test lb.pingenv.test sub.wild.pingenv.test site.pingenv.test live.pingenv.test other.test; do
     RESOLVE+=(--resolve "$name:$HTTP:127.0.0.1" --resolve "$name:$HTTPS:127.0.0.1")
 done
 get() { curl -sS --max-time 10 "${RESOLVE[@]}" "$@"; }
@@ -63,20 +63,47 @@ wait_for_port 18001; wait_for_port 18002
 
 echo "== configuration errors"
 set +e
-OUT="$(env -i ROUTE_A_HOST=a.test ROUTE_B_UPSTREAM=b TLS_MODE=nope "$BIN" 2>&1)"; CODE=$?
+OUT="$(env -i PINGENV_ROUTE_A_HOST=a.test PINGENV_ROUTE_B_UPSTREAM=b PINGENV_TLS_MODE=nope "$BIN" 2>&1)"; CODE=$?
 set -e
 check "invalid configuration exits with 2" "$CODE" 2
 check "reports all problems" "$(grep -c '^  - ' <<<"$OUT")" 4
+set +e
+OUT="$(env -i PINGENV_ROUTE_A_HOST=a.test PINGENV_ROUTE_A_UPSTREAM=a:1 PINGENV_TLS_MOD=acme TLS_MODE=bogus "$BIN" 2>&1)"; CODE=$?
+set -e
+check "unknown PINGENV_ variable is an error, unprefixed ones are ignored" \
+    "$CODE $(grep -c '^  - ' <<<"$OUT") $(grep -c 'PINGENV_TLS_MOD: unknown setting' <<<"$OUT")" "2 1 1"
+
+# A site to serve: small files, one file above the in-memory limit, things
+# that must never be served, and a symlink pointing out of the root.
+SITE="$WORK/site"
+mkdir -p "$SITE/css" "$SITE/docs" "$SITE/.git" "$SITE/.well-known" "$SITE/empty"
+echo '<h1>home</h1>' >"$SITE/index.html"
+echo 'body{}' >"$SITE/css/site.css"
+echo '<h1>docs</h1>' >"$SITE/docs/index.html"
+echo 'SECRET=1' >"$SITE/.env"
+echo 'x' >"$SITE/.git/config"
+echo 'Contact: mailto:x@pingenv.test' >"$SITE/.well-known/security.txt"
+echo 'outside' >"$WORK/outside.txt"
+ln -s "$WORK/outside.txt" "$SITE/escape.txt"
+ln -s "$SITE/css/site.css" "$SITE/inside.css"
+head -c 300000 /dev/urandom >"$SITE/big.bin"
+BIG_SUM="$(sha256sum <"$SITE/big.bin")"
 
 echo "== self-signed mode"
 env -i \
-    HTTP_ADDR=127.0.0.1:$HTTP HTTPS_ADDR=127.0.0.1:$HTTPS HTTPS_REDIRECT_PORT=$HTTPS \
-    TLS_MODE=selfsigned \
-    ROUTE_APP_HOST=app.pingenv.test ROUTE_APP_UPSTREAM=127.0.0.1:18001 \
-    ROUTE_API_HOST=app.pingenv.test ROUTE_API_PATH=/api ROUTE_API_STRIP_PREFIX=true \
-    ROUTE_API_UPSTREAM=localhost:18002 ROUTE_API_SET_HOST=backend.internal \
-    ROUTE_LB_HOST=lb.pingenv.test ROUTE_LB_UPSTREAM=127.0.0.1:18001,127.0.0.1:18009,127.0.0.1:18002 \
-    ROUTE_WILD_HOST='*.wild.pingenv.test' ROUTE_WILD_UPSTREAM=127.0.0.1:18001 \
+    PINGENV_HTTP_ADDR=127.0.0.1:$HTTP PINGENV_HTTPS_ADDR=127.0.0.1:$HTTPS PINGENV_HTTPS_REDIRECT_PORT=$HTTPS \
+    PINGENV_TLS_MODE=selfsigned \
+    PINGENV_ROUTE_APP_HOST=app.pingenv.test PINGENV_ROUTE_APP_UPSTREAM=127.0.0.1:18001 \
+    PINGENV_ROUTE_API_HOST=app.pingenv.test PINGENV_ROUTE_API_PATH=/api PINGENV_ROUTE_API_STRIP_PREFIX=true \
+    PINGENV_ROUTE_API_UPSTREAM=localhost:18002 PINGENV_ROUTE_API_SET_HOST=backend.internal \
+    PINGENV_ROUTE_LB_HOST=lb.pingenv.test PINGENV_ROUTE_LB_UPSTREAM=127.0.0.1:18001,127.0.0.1:18009,127.0.0.1:18002 \
+    PINGENV_ROUTE_SITE_HOST=site.pingenv.test PINGENV_ROUTE_SITE_ROOT="$SITE" \
+    PINGENV_ROUTE_SITE_MEMORY_MAX_FILE=64KiB PINGENV_ROUTE_SITE_FALLBACK=/index.html \
+    PINGENV_ROUTE_ASSETS_HOST=app.pingenv.test PINGENV_ROUTE_ASSETS_PATH=/static \
+    PINGENV_ROUTE_ASSETS_ROOT="$SITE" PINGENV_ROUTE_ASSETS_CACHE_CONTROL='public, max-age=60' \
+    PINGENV_ROUTE_LIVE_HOST=live.pingenv.test PINGENV_ROUTE_LIVE_ROOT="$SITE" \
+    PINGENV_ROUTE_LIVE_MEMORY_MAX_FILE=0 \
+    PINGENV_ROUTE_WILD_HOST='*.wild.pingenv.test' PINGENV_ROUTE_WILD_UPSTREAM=127.0.0.1:18001 \
     "$BIN" >"$WORK/selfsigned.log" 2>&1 &
 GATE=$!; PIDS+=($GATE)
 wait_for_port $HTTP; wait_for_port $HTTPS
@@ -122,9 +149,81 @@ check "wildcard host" \
 check "access log has one line per request" \
     "$(grep -c 'route=api upstream=localhost:18002' "$WORK/selfsigned.log")" 1
 
+echo "== static files"
+S="https://site.pingenv.test:$HTTPS"
+code() { get -k -o /dev/null -w '%{http_code}' "$@"; }
+hdr() { get -k -o /dev/null -D - "${@:2}" | tr -d '\r' | awk -F': ' -v h="$1" 'tolower($1)==tolower(h){print $2}'; }
+src() { sleep 0.2; grep "$1 " "$WORK/selfsigned.log" | tail -1 | grep -o 'upstream=[a-z-]*'; }
+
+check "serves the index for /" "$(get -k "$S/")" '<h1>home</h1>'
+check "content type" "$(hdr content-type "$S/css/site.css")" 'text/css; charset=utf-8'
+check "small file comes from memory" "$(src 'site.pingenv.test/css/site.css')" upstream=memory
+check "default Cache-Control" "$(hdr cache-control "$S/css/site.css")" no-cache
+check "large file is intact" "$(get -k "$S/big.bin" | sha256sum)" "$BIG_SUM"
+check "large file is streamed from disk" "$(src 'site.pingenv.test/big.bin')" upstream=disk
+check "large file over HTTP/2 is intact" "$(get -k --http2 "$S/big.bin" | sha256sum)" "$BIG_SUM"
+check "HEAD has a length and no body" \
+    "$(get -k -I "$S/big.bin" | tr -d '\r' | awk -F': ' 'tolower($1)=="content-length"{print $2}') $(get -k -I -o /dev/null -w '%{size_download}' "$S/big.bin")" "300000 0"
+
+check "range on a disk file" \
+    "$(get -k -r 100000-100099 "$S/big.bin" | sha256sum)" "$(tail -c +100001 "$SITE/big.bin" | head -c 100 | sha256sum)"
+check "range status and Content-Range" \
+    "$(code -r 100000-100099 "$S/big.bin") $(hdr content-range -r 100000-100099 "$S/big.bin")" "206 bytes 100000-100099/300000"
+check "suffix range on a memory file" "$(get -k -r -3 "$S/css/site.css")" "{}"
+check "range past the end is 416" "$(code -r 999999- "$S/big.bin")" 416
+
+ETAG="$(hdr etag "$S/css/site.css")"
+check "If-None-Match gives 304" "$(code -H "If-None-Match: $ETAG" "$S/css/site.css")" 304
+check "If-None-Match with another tag gives 200" "$(code -H 'If-None-Match: "nope"' "$S/css/site.css")" 200
+check "If-Modified-Since gives 304" \
+    "$(code -H "If-Modified-Since: $(hdr last-modified "$S/big.bin")" "$S/big.bin")" 304
+check "If-Range with a stale tag sends the whole file" \
+    "$(code -r 0-9 -H 'If-Range: "stale"' "$S/big.bin")" 200
+
+check "directory without slash redirects" \
+    "$(get -k -o /dev/null -w '%{http_code} %{redirect_url}' "$S/docs?x=1")" "308 $S/docs/?x=1"
+check "directory index" "$(get -k "$S/docs/")" '<h1>docs</h1>'
+check "directory without index is not listed" "$(code "https://live.pingenv.test:$HTTPS/empty/")" 404
+check "dotfile is refused" "$(code "$S/.env")" 404
+check "dot directory is refused" "$(code "$S/.git/config")" 404
+check ".well-known is served" "$(code "$S/.well-known/security.txt")" 200
+check "traversal is refused" "$(code --path-as-is "$S/css/../../outside.txt")" 404
+check "encoded traversal is refused" "$(code --path-as-is "$S/%2e%2e/outside.txt")" 404
+check "encoded slash traversal is refused" "$(code --path-as-is "$S/css%2f..%2f..%2foutside.txt")" 404
+check "symlink out of the root is refused" "$(code "$S/escape.txt")" 404
+check "symlink inside the root is served" "$(get -k "$S/inside.css")" 'body{}'
+check "fallback for application routes" "$(get -k "$S/users/42")" '<h1>home</h1>'
+check "no fallback for missing assets" "$(code "$S/missing.js")" 404
+check "POST is refused" "$(code -X POST "$S/")" 405
+
+A="https://app.pingenv.test:$HTTPS/static"
+check "files under a path prefix" "$(get -k "$A/css/site.css")" 'body{}'
+check "prefix root serves the index" "$(get -k "$A/")" '<h1>home</h1>'
+check "prefix without slash redirects" \
+    "$(get -k -o /dev/null -w '%{http_code} %{redirect_url}' "$A")" "308 $A/"
+check "custom Cache-Control" "$(hdr cache-control "$A/css/site.css")" 'public, max-age=60'
+check "no fallback unless configured" "$(code "$A/users/42")" 404
+check "other paths still reach the upstream" \
+    "$(get -k "https://app.pingenv.test:$HTTPS/statics" | field 'd["upstream"]')" A
+
+L="https://live.pingenv.test:$HTTPS"
+check "limit 0 serves small files from disk" "$(get -k "$L/css/site.css") $(src 'live.pingenv.test/css/site.css')" 'body{} upstream=disk'
+echo 'body{color:red}' >"$SITE/css/site.css"
+echo 'new' >"$SITE/new.txt"
+check "memory copy is a startup snapshot" "$(get -k "$S/css/site.css")" 'body{}'
+check "disk route sees the change" "$(get -k "$L/css/site.css")" 'body{color:red}'
+check "files added later are served from disk" "$(get -k "$S/new.txt") $(src 'site.pingenv.test/new.txt')" 'new upstream=disk'
+
 kill -TERM $GATE
 wait_for_exit $GATE
 check "exits on SIGTERM within 10s" "$(kill -0 $GATE 2>/dev/null && echo running || echo stopped)" stopped
+
+set +e
+OUT="$(env -i PINGENV_ROUTE_S_HOST=s.test PINGENV_ROUTE_S_ROOT="$SITE" PINGENV_MEMORY_MAX_TOTAL=10 \
+    PINGENV_HTTP_ADDR=127.0.0.1:$HTTP "$BIN" 2>&1)"; CODE=$?
+set -e
+check "exceeding the memory cap fails at startup" \
+    "$CODE $(grep -c 'exceed PINGENV_MEMORY_MAX_TOTAL' <<<"$OUT")" "1 1"
 
 if [[ -n "$PEBBLE_DIR" ]]; then
     echo "== acme mode (Pebble)"
@@ -141,10 +240,10 @@ if [[ -n "$PEBBLE_DIR" ]]; then
 
     start_acme() {
         # Pebble validates on port 5002 (httpPort in its config).
-        env -i HTTP_ADDR=127.0.0.1:5002 HTTPS_ADDR=127.0.0.1:$HTTPS HTTPS_REDIRECT=false \
-            TLS_MODE=acme ACME_DIRECTORY_URL=https://localhost:14000/dir \
-            ACME_CA_FILE="$MINICA" ACME_EMAIL=ops@pingenv.test DATA_DIR="$WORK/data" \
-            ROUTE_APP_HOST=app.pingenv.test ROUTE_APP_UPSTREAM=127.0.0.1:18001 \
+        env -i PINGENV_HTTP_ADDR=127.0.0.1:5002 PINGENV_HTTPS_ADDR=127.0.0.1:$HTTPS PINGENV_HTTPS_REDIRECT=false \
+            PINGENV_TLS_MODE=acme PINGENV_ACME_DIRECTORY_URL=https://localhost:14000/dir \
+            PINGENV_ACME_CA_FILE="$MINICA" PINGENV_ACME_EMAIL=ops@pingenv.test PINGENV_DATA_DIR="$WORK/data" \
+            PINGENV_ROUTE_APP_HOST=app.pingenv.test PINGENV_ROUTE_APP_UPSTREAM=127.0.0.1:18001 \
             "$BIN" >"$1" 2>&1 &
         GATE=$!; PIDS+=($GATE)
         wait_for_port $HTTPS

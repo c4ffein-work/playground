@@ -3,7 +3,7 @@
 //!
 //! Each host gets its own certificate, so one host with broken DNS cannot
 //! hold up the others. Certificates and the account key live under
-//! `DATA_DIR`; that directory has to survive restarts, or every restart
+//! `PINGENV_DATA_DIR`; that directory has to survive restarts, or every restart
 //! requests new certificates and runs into the CA's rate limits.
 
 use std::collections::HashMap;
@@ -59,7 +59,7 @@ impl ChallengeStore {
 pub struct AcmeService {
     config: AcmeConfig,
     hosts: Vec<String>,
-    /// `DATA_DIR/acme/<ca host>`: keeps staging and production material apart,
+    /// `PINGENV_DATA_DIR/acme/<ca host>`: keeps staging and production material apart,
     /// so switching CA never reuses a certificate from the other one.
     dir: PathBuf,
     store: Arc<CertStore>,
@@ -90,7 +90,7 @@ impl AcmeService {
         let dir = data_dir.join("acme").join(ca);
         std::fs::create_dir_all(dir.join("certs")).map_err(|e| {
             format!(
-                "cannot create {}: {e} (is DATA_DIR writable?)",
+                "cannot create {}: {e} (is PINGENV_DATA_DIR writable?)",
                 dir.display()
             )
         })?;

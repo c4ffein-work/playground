@@ -1,6 +1,6 @@
-# Example: two services behind pingenv with Let's Encrypt certificates.
-# Both host names must already point at this machine, and ports 80 and 443
-# must be reachable from the internet.
+# Example: a static site and an API behind pingenv, with Let's Encrypt
+# certificates. The host names must already point at this machine, and ports
+# 80 and 443 must be reachable from the internet.
 services:
   pingenv:
     build: .
@@ -10,21 +10,22 @@ services:
       - "443:443"
     volumes:
       - pingenv-data:/data
+      - ./site:/srv/site:ro
     environment:
-      TLS_MODE: acme
-      ACME_STAGING: "true" # remove once it works, to get trusted certificates
-      ACME_EMAIL: you@example.com
+      PINGENV_TLS_MODE: acme
+      PINGENV_ACME_STAGING: "true" # remove once it works, to get trusted certificates
+      PINGENV_ACME_EMAIL: you@example.com
 
-      ROUTE_WEB_HOST: example.com,www.example.com
-      ROUTE_WEB_UPSTREAM: web:80
+      # Files served by pingenv itself. The directory is a bind mount that can
+      # change while running, so nothing is held in memory.
+      PINGENV_ROUTE_SITE_HOST: example.com,www.example.com
+      PINGENV_ROUTE_SITE_ROOT: /srv/site
+      PINGENV_ROUTE_SITE_MEMORY_MAX_FILE: "0"
 
-      ROUTE_API_HOST: example.com
-      ROUTE_API_PATH: /api
-      ROUTE_API_STRIP_PREFIX: "true"
-      ROUTE_API_UPSTREAM: api:8080
-
-  web:
-    image: nginx:alpine
+      PINGENV_ROUTE_API_HOST: example.com
+      PINGENV_ROUTE_API_PATH: /api
+      PINGENV_ROUTE_API_STRIP_PREFIX: "true"
+      PINGENV_ROUTE_API_UPSTREAM: api:8080
 
   api:
     image: traefik/whoami

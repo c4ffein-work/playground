@@ -1,6 +1,7 @@
 mod acme;
 mod certs;
 mod config;
+mod files;
 mod proxy;
 
 use std::process::ExitCode;
@@ -16,6 +17,7 @@ use pingora::services::background::background_service;
 use crate::acme::{AcmeService, ChallengeStore};
 use crate::certs::{BoxError, CertStore};
 use crate::config::{Config, TlsMode};
+use crate::files::Site;
 
 fn main() -> ExitCode {
     let vars = std::env::vars_os()
@@ -67,6 +69,21 @@ fn run(config: Config) -> Result<(), BoxError> {
         }
     }
 
+    let mut memory_used = 0;
+    let sites = config
+        .routes
+        .iter()
+        .map(|route| {
+            route
+                .site
+                .as_ref()
+                .map(|site| {
+                    Site::load(&route.name, site, config.memory_max_total, &mut memory_used)
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
     let acme_hosts = config.acme_hosts();
     let acme = if acme_hosts.is_empty() {
         None
@@ -91,7 +108,7 @@ fn run(config: Config) -> Result<(), BoxError> {
 
     let mut service = http_proxy_service(
         &server.configuration,
-        proxy::Gateway::new(&config, challenges),
+        proxy::Gateway::new(&config, sites, challenges),
     );
     service.add_tcp(&config.http_addr.to_string());
     info!("listening for HTTP on {}", config.http_addr);
@@ -108,7 +125,10 @@ fn run(config: Config) -> Result<(), BoxError> {
         );
     }
     for route in &config.routes {
-        let upstreams: Vec<String> = route.upstreams.iter().map(|u| u.authority()).collect();
+        let mut upstreams: Vec<String> = route.upstreams.iter().map(|u| u.authority()).collect();
+        if let Some(site) = &route.site {
+            upstreams.push(format!("files in {}", site.root.display()));
+        }
         info!(
             "route {}: {}{} -> {}",
             route.name,

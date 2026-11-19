@@ -15,6 +15,7 @@ use pingora::prelude::*;
 
 use crate::acme::{CHALLENGE_PREFIX, ChallengeStore};
 use crate::config::{Config, Route, Upstream};
+use crate::files::{self, Site};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upstream names are re-resolved this often, so a container that comes back
@@ -128,6 +129,8 @@ impl Resolver {
 
 pub struct Gateway {
     router: Router,
+    /// One entry per route; `Some` for routes that serve files.
+    sites: Vec<Option<Site>>,
     counters: Vec<AtomicUsize>,
     resolver: Resolver,
     challenges: Arc<ChallengeStore>,
@@ -136,8 +139,9 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    pub fn new(config: &Config, challenges: Arc<ChallengeStore>) -> Self {
+    pub fn new(config: &Config, sites: Vec<Option<Site>>, challenges: Arc<ChallengeStore>) -> Self {
         Self {
+            sites,
             counters: config.routes.iter().map(|_| AtomicUsize::new(0)).collect(),
             router: Router::new(config.routes.clone()),
             resolver: Resolver::default(),
@@ -161,7 +165,7 @@ fn is_tls(session: &Session) -> bool {
     session.digest().is_some_and(|d| d.ssl_digest.is_some())
 }
 
-async fn respond(
+pub(crate) async fn respond(
     session: &mut Session,
     status: u16,
     headers: &[(&'static str, String)],
@@ -240,6 +244,13 @@ impl ProxyHttp for Gateway {
             return Ok(true);
         }
         ctx.host = host;
+
+        if let Some(site) = &self.sites[route] {
+            let prefix = &self.router.routes[route].path;
+            let source = files::serve(site, session, prefix).await?;
+            ctx.upstream = Some(source.to_string());
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -358,6 +369,7 @@ mod tests {
             path: path.into(),
             strip_prefix: false,
             upstreams: vec![],
+            site: None,
             set_host: None,
             cert_files: None,
         }
