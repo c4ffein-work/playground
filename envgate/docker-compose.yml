@@ -1,0 +1,34 @@
+# Example: two services behind envgate with Let's Encrypt certificates.
+# Both host names must already point at this machine, and ports 80 and 443
+# must be reachable from the internet.
+services:
+  envgate:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - envgate-data:/data
+    environment:
+      TLS_MODE: acme
+      ACME_STAGING: "true" # remove once it works, to get trusted certificates
+      ACME_EMAIL: you@example.com
+
+      ROUTE_WEB_HOST: example.com,www.example.com
+      ROUTE_WEB_UPSTREAM: web:80
+
+      ROUTE_API_HOST: example.com
+      ROUTE_API_PATH: /api
+      ROUTE_API_STRIP_PREFIX: "true"
+      ROUTE_API_UPSTREAM: api:8080
+
+  web:
+    image: nginx:alpine
+
+  api:
+    image: traefik/whoami
+    command: ["--port=8080"]
+
+volumes:
+  envgate-data:
