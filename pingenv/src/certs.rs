@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn private_files_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("envgate-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pingenv-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("key.pem");
         write_private(&path, b"one").unwrap();

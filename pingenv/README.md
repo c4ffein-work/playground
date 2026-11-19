@@ -1,15 +1,15 @@
-# envgate
+# pingenv
 
 A small reverse proxy built on [Pingora](https://github.com/cloudflare/pingora),
 configured **only by environment variables**, with certificate issuance and
 renewal built in. No config file, no admin UI, no sidecar.
 
 ```sh
-docker run -p 80:80 -p 443:443 -v envgate-data:/data \
+docker run -p 80:80 -p 443:443 -v pingenv-data:/data \
   -e TLS_MODE=acme \
   -e ROUTE_APP_HOST=app.example.com \
   -e ROUTE_APP_UPSTREAM=app:8080 \
-  envgate
+  pingenv
 ```
 
 See [`docker-compose.yml`](docker-compose.yml) for a fuller example.
@@ -71,7 +71,7 @@ challenge. Using this mode means you accept the CA's terms of service.
 ## Behaviour worth knowing
 
 - `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` are
-  **overwritten**, not appended to: envgate assumes it is the edge. Don't put
+  **overwritten**, not appended to: pingenv assumes it is the edge. Don't put
   it behind another proxy if your app relies on those.
 - Upstream names are re-resolved every 10 seconds, so a container that returns
   with a new address is picked up.

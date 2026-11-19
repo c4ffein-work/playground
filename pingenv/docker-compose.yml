@@ -1,15 +1,15 @@
-# Example: two services behind envgate with Let's Encrypt certificates.
+# Example: two services behind pingenv with Let's Encrypt certificates.
 # Both host names must already point at this machine, and ports 80 and 443
 # must be reachable from the internet.
 services:
-  envgate:
+  pingenv:
     build: .
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - envgate-data:/data
+      - pingenv-data:/data
     environment:
       TLS_MODE: acme
       ACME_STAGING: "true" # remove once it works, to get trusted certificates
@@ -31,4 +31,4 @@ services:
     command: ["--port=8080"]
 
 volumes:
-  envgate-data:
+  pingenv-data:

@@ -8,8 +8,8 @@ commit and push freely without asking for confirmation.
 - `README.md` + `hello.svg` — the animated intro for people discovering the repo.
 - `patches/` — the patch drop-box (see below).
 - `scripts/new-patch.sh`, `scripts/apply-patch.sh` — export / apply a series.
-- `envgate/` — a Rust reverse proxy on Pingora, configured by environment
-  variables only (see `envgate/README.md`). `cargo test` and `tests/e2e.sh`
+- `pingenv/` — a Rust reverse proxy on Pingora, configured by environment
+  variables only (see `pingenv/README.md`). `cargo test` and `tests/e2e.sh`
   from inside it.
 - `clones/` — **gitignored**. Put local clones of patch-target repos here
   (`clones/<repo>`), not in the repo root and not in `/tmp`. Anything under

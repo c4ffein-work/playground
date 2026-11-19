@@ -621,25 +621,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "envgate"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "bytes",
- "env_logger",
- "http",
- "instant-acme",
- "log",
- "pingora",
- "rcgen",
- "rustls",
- "serde_json",
- "tokio",
- "x509-parser 0.18.1",
-]
-
-[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1483,6 +1464,25 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pingenv"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bytes",
+ "env_logger",
+ "http",
+ "instant-acme",
+ "log",
+ "pingora",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "tokio",
+ "x509-parser 0.18.1",
+]
 
 [[package]]
 name = "pingora"

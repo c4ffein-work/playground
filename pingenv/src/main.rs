@@ -23,7 +23,7 @@ fn main() -> ExitCode {
     let config = match Config::from_env(vars) {
         Ok(config) => config,
         Err(problems) => {
-            eprintln!("envgate: invalid configuration");
+            eprintln!("pingenv: invalid configuration");
             for problem in problems {
                 eprintln!("  - {problem}");
             }
