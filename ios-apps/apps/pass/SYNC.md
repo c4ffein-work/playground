@@ -82,15 +82,21 @@ The member's line of work is the owner's history plus its own commits.
 
 ## The owner's side (the computer)
 
+The settings are in the store's git configuration (`pass-sync.device`, `pass-sync.url`,
+`pass-sync.key`, one `pass-sync.peer` per member), written by `pass sync setup` and `pass sync peer`.
+The drop zone may also be a local directory (a USB stick, a synced folder): same files, same rules.
+
 - `pass sync push`: publish the current tip.
 - `pass sync fetch`: take each member's file, as above, then say for each member how many commits
   it has that the store does not, and what they touch.
 - `pass sync log <member>` / `pass sync diff <member>`: the member's outstanding commits, with who
   signed each, and the decrypted difference.
 - `pass sync merge <member>`: take the member's commits. Refused unless
-  - every outstanding commit is signed by that member's key or by the owner's,
-  - they touch nothing but `*.gpg` files, and
-  - the result is a fast-forward (the member has already merged the owner's tip).
+  - the result is a fast-forward (the member has already merged the owner's tip),
+  - every outstanding commit is signed by that member's key or by the owner's, and
+  - between the store and the member's tip, nothing differs but entries: regular files named
+    `*.gpg`, with no component of their path starting with a dot. No `.gpg-id`, nothing under
+    `.extensions/`, no symbolic link.
 
   When it is not a fast-forward, publish (`pass sync push`) and let the member merge first.
   Then publishes the new tip.

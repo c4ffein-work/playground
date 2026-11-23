@@ -48,6 +48,9 @@ There is no quota: a device can fill the volume. Give it a small one.
 publishing by upload-then-rename, the confinement to the directory, the refusals listed above,
 the configuration errors, and the host key across restarts.
 
+`PASS_PY=/path/to/pass.py ./test-pass-py.sh` runs the computer's side for real: `pass.py sync` over
+sftp against the same server, with a phone played by `sftp`, `gpg` and `git`.
+
 **The image itself has not been built**: where this was written, a Docker build has no network to
 fetch `openssh-server`. The Dockerfile is five lines around the tested script; build it once and
 run `docker logs` to check it starts.
