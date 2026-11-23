@@ -152,7 +152,7 @@ added NAME
 changed NAME
 moved OLD -> NEW
 removed NAME
-readers DIR: DEVICE DEVICE ...        the new set, names in order; "inherited" when the file is removed
+readers DIR: DEVICE DEVICE ...        the new set, names sorted; "inherited" when the file is removed
 stale NAME                            in their tip, not encrypted for its readers
 conflict NAME                         needs a choice (an entry name, or a directory with its slash)
 ```
