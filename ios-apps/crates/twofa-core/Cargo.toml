@@ -1,0 +1,15 @@
+[package]
+name = "twofa-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "TOTP/HOTP codes and the rsc/2fa keychain file (github.com/c4ffein/2fa), exposed to Swift through UniFFI"
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+ring = "0.17"
+thiserror = "2"
+uniffi = "0.32"

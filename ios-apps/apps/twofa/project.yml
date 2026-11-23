@@ -1,0 +1,50 @@
+# XcodeGen spec: `make xcode APP=twofa` (from ios-apps/) builds the Rust core and generates Twofa.xcodeproj.
+# Before the first build on a device, change dev.cafeine to an identifier of your own,
+# and set DEVELOPMENT_TEAM (or pick the team in Xcode > Signing & Capabilities).
+name: Twofa
+options:
+  bundleIdPrefix: dev.cafeine
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+packages:
+  TwofaKit:
+    path: Package
+targets:
+  Twofa:
+    type: application
+    platform: iOS
+    sources: [App]
+    dependencies:
+      - package: TwofaKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cafeine.twofa
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: 2fa
+        UILaunchScreen: {}
+        # HMAC-SHA-1 to compute codes is authentication, not encryption; the app opens no connection at all.
+        ITSAppUsesNonExemptEncryption: false
+        NSCameraUsageDescription: 2fa uses the camera to scan the QR code of a key. The image stays on this device.
+        NSFaceIDUsageDescription: 2fa can ask for Face ID before showing your codes.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    # No entitlements: the keys are in the keychain of this app alone (no access group, no app group),
+    # and there is neither network nor iCloud.
