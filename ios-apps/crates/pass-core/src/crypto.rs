@@ -120,9 +120,9 @@ impl Certificate {
             .collect()
     }
 
-    /// Whether a line of `.gpg-id` designates this key, the ways gpg reads `-r`:
-    /// a fingerprint, a long or short key id (of the key or of a subkey, with or
-    /// without `0x`, a trailing `!` ignored), an email address, or part of a user id.
+    /// Whether a line of `.gpg-id` designates this key, as SYNC.md reads one: its fingerprint
+    /// or a 16-hex key id (of the key or of a subkey, with or without `0x`, a trailing `!`
+    /// ignored), or a text found in one of its user ids, whatever the case.
     pub(crate) fn matches(&self, gpg_id: &str) -> bool {
         let wanted = gpg_id.trim().trim_end_matches('!');
         let hex: String = wanted
@@ -133,7 +133,7 @@ impl Certificate {
             .filter(|c| !c.is_whitespace())
             .map(|c| c.to_ascii_uppercase())
             .collect();
-        if matches!(hex.len(), 8 | 16 | 40 | 64) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if matches!(hex.len(), 16 | 40) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return self
                 .fingerprints()
                 .iter()
