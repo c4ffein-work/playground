@@ -16,20 +16,17 @@ public struct PeerSettings: Codable, Equatable, Sendable, Identifiable {
     public var fingerprint: String
     /// Its OpenPGP public key, armored.
     public var publicKey: String
-    /// The computer where the store is managed. Exactly one peer is.
-    public var isOwner: Bool
 
     public var id: String { name }
 
-    public init(name: String, fingerprint: String, publicKey: String, isOwner: Bool) {
+    public init(name: String, fingerprint: String, publicKey: String) {
         self.name = name
         self.fingerprint = fingerprint
         self.publicKey = publicKey
-        self.isOwner = isOwner
     }
 
     var peer: Peer {
-        Peer(name: name, fingerprint: fingerprint, publicKey: publicKey, isOwner: isOwner)
+        Peer(name: name, fingerprint: fingerprint, publicKey: publicKey)
     }
 }
 
@@ -41,7 +38,8 @@ public struct PassSettings: Codable, Equatable, Sendable {
     public var dropZoneURL = ""
     /// `SHA256:...` of the drop zone's host key. Nothing is sent to a server that presents another.
     public var dropZoneHostKey: String?
-    /// The other devices. Nothing received can add one or change a key.
+    /// The other devices: equals, each with its own file in the drop zone. Nothing received can
+    /// add one or change a key.
     public var peers: [PeerSettings] = []
 
     public var passphrasePolicy: PassphrasePolicy = .askEachTime
@@ -54,7 +52,8 @@ public struct PassSettings: Codable, Equatable, Sendable {
 
     private var trimmedURL: String { dropZoneURL.trimmingCharacters(in: .whitespacesAndNewlines) }
 
-    public var owner: PeerSettings? { peers.first(where: \.isOwner) }
+    /// Every device of the sync by name, this one included, sorted: what a folder's readers are chosen among.
+    public var deviceNames: [String] { ([deviceName] + peers.map(\.name)).sorted() }
 
     /// A usable device name, as the protocol defines it: `[a-z0-9][a-z0-9-]{0,31}`.
     public static func isDeviceName(_ name: String) -> Bool {
@@ -62,9 +61,10 @@ public struct PassSettings: Codable, Equatable, Sendable {
         return (1...32).contains(name.count) && name.allSatisfy(allowed.contains) && !name.hasPrefix("-")
     }
 
-    /// Enough is filled in to visit the drop zone: where it is, its pinned key, and who the owner is.
+    /// Enough is filled in to visit the drop zone: this device's name, where the zone is, and its
+    /// pinned key. The other devices can come later: a device alone publishes for those to come.
     public var isSyncComplete: Bool {
-        Self.isDeviceName(deviceName) && !trimmedURL.isEmpty && dropZoneHostKey != nil && owner != nil
+        Self.isDeviceName(deviceName) && !trimmedURL.isEmpty && dropZoneHostKey != nil
     }
 
     /// The drop zone, with this device's SSH key. `nil` while something is missing.
