@@ -23,7 +23,10 @@ const API_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum TlsTrust {
     /// The pinned certificate, which must also verify (chain and hostname)
     /// against the public roots, or against `extra_ca_pem` when given.
-    PinnedWithCa { sha256: String, extra_ca_pem: Option<String> },
+    PinnedWithCa {
+        sha256: String,
+        extra_ca_pem: Option<String>,
+    },
     /// The pinned certificate alone: for a self-signed one.
     PinnedOnly { sha256: String },
 }
@@ -129,7 +132,9 @@ impl From<pinned_http::Error> for CompanionError {
 }
 
 fn io_error(context: &str, e: std::io::Error) -> CompanionError {
-    CompanionError::Io { message: format!("{context}: {e}") }
+    CompanionError::Io {
+        message: format!("{context}: {e}"),
+    }
 }
 
 /// Told how far a transfer is. Called from the thread doing the transfer, often.
@@ -156,7 +161,9 @@ pub struct CompanionClient {
 }
 
 fn invalid(message: &str) -> CompanionError {
-    CompanionError::InvalidConfig { message: message.to_string() }
+    CompanionError::InvalidConfig {
+        message: message.to_string(),
+    }
 }
 
 /// The server's own rule for path parameters and client ids.
@@ -172,7 +179,11 @@ fn header_safe_filename(name: &str) -> String {
         .map(|c| if c.is_control() || c == '"' { '_' } else { c })
         .collect();
     let cleaned = cleaned.trim().trim_matches('\'');
-    if cleaned.is_empty() { "file".to_string() } else { cleaned.to_string() }
+    if cleaned.is_empty() {
+        "file".to_string()
+    } else {
+        cleaned.to_string()
+    }
 }
 
 #[derive(Deserialize)]
@@ -191,7 +202,10 @@ impl CompanionClient {
     }
 
     fn request(&self, method: &str, path: &str) -> ureq::Request {
-        self.http.agent.request(method, &self.url(path)).set("Authorization", &self.authorization)
+        self.http
+            .agent
+            .request(method, &self.url(path))
+            .set("Authorization", &self.authorization)
     }
 
     /// Turns anything but a 2xx into an error.
@@ -204,10 +218,15 @@ impl CompanionClient {
             Err(ureq::Error::Transport(transport)) => {
                 if let (Some(pinned), Some(served)) = (&self.http.pin, self.http.seen.get()) {
                     if *pinned != served {
-                        return Err(CompanionError::PinMismatch { pinned: pinned.clone(), served });
+                        return Err(CompanionError::PinMismatch {
+                            pinned: pinned.clone(),
+                            served,
+                        });
                     }
                 }
-                return Err(CompanionError::Network { message: transport.to_string() });
+                return Err(CompanionError::Network {
+                    message: transport.to_string(),
+                });
             }
         };
         let mut body = String::new();
@@ -228,7 +247,10 @@ impl CompanionClient {
         })
     }
 
-    fn json<T: for<'de> Deserialize<'de>>(&self, result: Result<ureq::Response, ureq::Error>) -> Result<T, CompanionError> {
+    fn json<T: for<'de> Deserialize<'de>>(
+        &self,
+        result: Result<ureq::Response, ureq::Error>,
+    ) -> Result<T, CompanionError> {
         let response = self.check(result)?;
         serde_json::from_reader(response.into_reader()).map_err(|e| CompanionError::Server {
             status: 200,
@@ -263,7 +285,9 @@ impl CompanionClient {
         let tail = format!("\r\n--{boundary}--\r\n");
         let total = head.len() as u64 + size + tail.len() as u64;
         // `take`: a file that grows meanwhile must not outrun the announced length.
-        let body = Cursor::new(head.into_bytes()).chain(content.take(size)).chain(Cursor::new(tail.into_bytes()));
+        let body = Cursor::new(head.into_bytes())
+            .chain(content.take(size))
+            .chain(Cursor::new(tail.into_bytes()));
         let result = self
             .request("POST", "/api/upload")
             .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
@@ -288,11 +312,18 @@ impl CompanionClient {
             return Err(invalid("the client secret is lowercase hex"));
         }
         let after_scheme = base_url.split_once("://").map(|(_, rest)| rest).unwrap_or("");
-        if after_scheme.is_empty() || after_scheme.contains(['/', '?', '#', '@']) || base_url.contains(char::is_whitespace) {
+        if after_scheme.is_empty()
+            || after_scheme.contains(['/', '?', '#', '@'])
+            || base_url.contains(char::is_whitespace)
+        {
             return Err(invalid("the server URL is http(s)://host[:port], with no path"));
         }
         let http = pinned_http::agent(&base_url, config.trust.as_ref().map(Trust::from).as_ref())?;
-        Ok(Arc::new(Self { base_url, authorization: format!("Bearer {client_id}:{client_secret}"), http }))
+        Ok(Arc::new(Self {
+            base_url,
+            authorization: format!("Bearer {client_id}:{client_secret}"),
+            http,
+        }))
     }
 
     /// Every file on the server, oldest first.
@@ -311,10 +342,15 @@ impl CompanionClient {
         let file = File::open(&path).map_err(|e| io_error("cannot open the file", e))?;
         let metadata = file.metadata().map_err(|e| io_error("cannot read the file", e))?;
         if !metadata.is_file() {
-            return Err(CompanionError::Io { message: "not a file".into() });
+            return Err(CompanionError::Io {
+                message: "not a file".into(),
+            });
         }
         let filename = filename.unwrap_or_else(|| {
-            Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
         });
         self.upload(&filename, file, metadata.len(), &progress)
     }
@@ -338,7 +374,10 @@ impl CompanionClient {
             return Err(CompanionError::NotFound);
         }
         let response = self.check(self.request("GET", &format!("/download/{file_id}")).call())?;
-        let total = response.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let total = response
+            .header("Content-Length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let part_path = format!("{dest_path}.part");
         let written = (|| {
             let mut part = File::create(&part_path)?;
@@ -382,7 +421,10 @@ impl CompanionClient {
 #[uniffi::export]
 pub fn fetch_fingerprint(url: String, extra_ca_pem: Option<String>) -> Result<CertificateFingerprint, CompanionError> {
     let found = pinned_http::fetch_fingerprint(&url, extra_ca_pem.as_deref())?;
-    Ok(CertificateFingerprint { sha256: found.sha256, chain_valid: found.chain_valid })
+    Ok(CertificateFingerprint {
+        sha256: found.sha256,
+        chain_valid: found.chain_valid,
+    })
 }
 
 /// The message of an error, for people. (The Swift `localizedDescription` of a
@@ -397,7 +439,12 @@ mod tests {
     use super::*;
 
     fn config(url: &str, id: &str, secret: &str) -> ServerConfig {
-        ServerConfig { url: url.into(), client_id: id.into(), client_secret: secret.into(), trust: None }
+        ServerConfig {
+            url: url.into(),
+            client_id: id.into(),
+            client_secret: secret.into(),
+            trust: None,
+        }
     }
 
     #[test]
@@ -420,7 +467,10 @@ mod tests {
             ("https://h:1", "a", "ab"), // https with no pin
         ] {
             let result = CompanionClient::new(config(url, id, secret));
-            assert!(matches!(result, Err(CompanionError::InvalidConfig { .. })), "{url:?} {id:?} {secret:?}");
+            assert!(
+                matches!(result, Err(CompanionError::InvalidConfig { .. })),
+                "{url:?} {id:?} {secret:?}"
+            );
         }
     }
 

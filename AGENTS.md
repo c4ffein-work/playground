@@ -11,6 +11,9 @@ commit and push freely without asking for confirmation.
 - `pingenv/` — a Rust reverse proxy on Pingora, configured by environment
   variables only (see `pingenv/README.md`). `cargo test` and `tests/e2e.sh`
   from inside it.
+- `ios-apps/` — iOS apps as thin SwiftUI shells over a Rust workspace (UniFFI);
+  first one is a client for `c4ffein/companion` (see `ios-apps/README.md`).
+  `make check` from inside it; the SwiftUI part needs a Mac to build.
 - `clones/` — **gitignored**. Put local clones of patch-target repos here
   (`clones/<repo>`), not in the repo root and not in `/tmp`. Anything under
   it is scratch: delete freely, never commit.

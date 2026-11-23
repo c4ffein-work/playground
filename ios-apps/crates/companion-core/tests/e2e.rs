@@ -27,7 +27,11 @@ impl Server {
         let script = std::env::var("COMPANION_PY").expect("set COMPANION_PY to the path of companion.py");
         let dir = std::env::temp_dir().join(format!("companion-e2e-{}", pinned_http::random_hex(8)));
         std::fs::create_dir_all(&dir).unwrap();
-        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
         // The launcher only matters where there is no IPv6: see its docstring.
         let child = Command::new("python3")
             .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/run_companion.py"))
@@ -41,7 +45,11 @@ impl Server {
             .stderr(Stdio::null())
             .spawn()
             .expect("cannot run python3");
-        let server = Self { child, url: format!("http://127.0.0.1:{port}"), dir };
+        let server = Self {
+            child,
+            url: format!("http://127.0.0.1:{port}"),
+            dir,
+        };
         let deadline = Instant::now() + Duration::from_secs(15);
         while ureq::get(&server.url).call().is_err() {
             assert!(Instant::now() < deadline, "the companion server did not start");
@@ -91,7 +99,10 @@ struct Recorder {
 
 impl ProgressListener for Recorder {
     fn on_progress(&self, done: u64, total: u64) {
-        assert!(done >= self.last_done.swap(done, Ordering::SeqCst), "progress goes forward");
+        assert!(
+            done >= self.last_done.swap(done, Ordering::SeqCst),
+            "progress goes forward"
+        );
         self.last_total.store(total, Ordering::SeqCst);
         self.calls.fetch_add(1, Ordering::SeqCst);
     }
@@ -110,11 +121,17 @@ fn upload_list_download() {
     let source = server.write("source.bin", &content);
 
     let up = Arc::new(Recorder::default());
-    let uploaded = client.upload_file(source, Some("été \"2026\".pdf".into()), Some(up.clone())).unwrap();
+    let uploaded = client
+        .upload_file(source, Some("été \"2026\".pdf".into()), Some(up.clone()))
+        .unwrap();
     assert_eq!(uploaded.filename, "été _2026_.pdf");
     assert_eq!(uploaded.size, content.len() as u64);
     assert!(up.calls.load(Ordering::SeqCst) > 1);
-    assert_eq!(up.last_done.load(Ordering::SeqCst), up.last_total.load(Ordering::SeqCst), "upload reported to the end");
+    assert_eq!(
+        up.last_done.load(Ordering::SeqCst),
+        up.last_total.load(Ordering::SeqCst),
+        "upload reported to the end"
+    );
 
     let files = client.list_files().unwrap();
     assert_eq!(files.len(), 1);
@@ -126,9 +143,14 @@ fn upload_list_download() {
 
     let down = Arc::new(Recorder::default());
     let dest = server.path("downloaded.bin");
-    let size = client.download_file(uploaded.id.clone(), dest.clone(), Some(down.clone())).unwrap();
+    let size = client
+        .download_file(uploaded.id.clone(), dest.clone(), Some(down.clone()))
+        .unwrap();
     assert_eq!(size, content.len() as u64);
-    assert!(std::fs::read(&dest).unwrap() == content, "the file comes back byte for byte");
+    assert!(
+        std::fs::read(&dest).unwrap() == content,
+        "the file comes back byte for byte"
+    );
     assert_eq!(down.last_done.load(Ordering::SeqCst), content.len() as u64);
     assert_eq!(down.last_total.load(Ordering::SeqCst), content.len() as u64);
     assert!(!PathBuf::from(format!("{dest}.part")).exists());
@@ -141,10 +163,14 @@ fn upload_names_and_bytes() {
     let client = server.client();
 
     // The name of the file itself when none is given.
-    let uploaded = client.upload_file(server.write("notes.txt", b"hello"), None, None).unwrap();
+    let uploaded = client
+        .upload_file(server.write("notes.txt", b"hello"), None, None)
+        .unwrap();
     assert_eq!((uploaded.filename.as_str(), uploaded.size), ("notes.txt", 5));
 
-    let uploaded = client.upload_bytes("pasted.txt".into(), b"from memory".to_vec()).unwrap();
+    let uploaded = client
+        .upload_bytes("pasted.txt".into(), b"from memory".to_vec())
+        .unwrap();
     let dest = server.path("pasted.out");
     client.download_file(uploaded.id, dest.clone(), None).unwrap();
     assert_eq!(std::fs::read(dest).unwrap(), b"from memory");
@@ -152,10 +178,18 @@ fn upload_names_and_bytes() {
     // An empty file is a file.
     let uploaded = client.upload_bytes("empty".into(), vec![]).unwrap();
     assert_eq!(uploaded.size, 0);
-    assert_eq!(client.download_file(uploaded.id, server.path("empty.out"), None).unwrap(), 0);
+    assert_eq!(
+        client
+            .download_file(uploaded.id, server.path("empty.out"), None)
+            .unwrap(),
+        0
+    );
 
     assert_eq!(client.list_files().unwrap().len(), 3);
-    assert!(matches!(client.upload_file(server.path("missing"), None, None), Err(CompanionError::Io { .. })));
+    assert!(matches!(
+        client.upload_file(server.path("missing"), None, None),
+        Err(CompanionError::Io { .. })
+    ));
 }
 
 #[test]
@@ -181,7 +215,10 @@ fn preview() {
     assert!(second > first);
     assert_eq!(client.preview_current().unwrap().filename.as_deref(), Some("photo.png"));
 
-    assert_eq!(client.set_preview("00000000-0000-0000-0000-000000000000".into()), Err(CompanionError::NotFound));
+    assert_eq!(
+        client.set_preview("00000000-0000-0000-0000-000000000000".into()),
+        Err(CompanionError::NotFound)
+    );
 }
 
 #[test]
@@ -214,8 +251,14 @@ fn errors_are_told_apart() {
 
     let dest = server.path("nothing.out");
     let unknown = "00000000-0000-0000-0000-000000000000".to_string();
-    assert_eq!(client.download_file(unknown, dest.clone(), None), Err(CompanionError::NotFound));
-    assert_eq!(client.download_file("../api/files".into(), dest.clone(), None), Err(CompanionError::NotFound));
+    assert_eq!(
+        client.download_file(unknown, dest.clone(), None),
+        Err(CompanionError::NotFound)
+    );
+    assert_eq!(
+        client.download_file("../api/files".into(), dest.clone(), None),
+        Err(CompanionError::NotFound)
+    );
     assert!(!PathBuf::from(&dest).exists() && !PathBuf::from(format!("{dest}.part")).exists());
 
     // A rotation that was started and not completed blocks the client: say so.
@@ -241,9 +284,15 @@ fn errors_are_told_apart() {
 #[test]
 #[ignore = "needs COMPANION_PY"]
 fn rate_limit_and_size_limit() {
-    let server = Server::start_with(&[("COMPANION_RATE_LIMIT_MAX", "2"), ("COMPANION_MAX_REQUEST_BODY", "1024")]);
+    let server = Server::start_with(&[
+        ("COMPANION_RATE_LIMIT_MAX", "2"),
+        ("COMPANION_MAX_REQUEST_BODY", "1024"),
+    ]);
     let client = server.client();
-    assert!(matches!(client.upload_bytes("big".into(), vec![0; 4096]), Err(CompanionError::TooLarge { .. })));
+    assert!(matches!(
+        client.upload_bytes("big".into(), vec![0; 4096]),
+        Err(CompanionError::TooLarge { .. })
+    ));
     client.set_pad("1".into()).unwrap();
     assert_eq!(client.set_pad("2".into()), Err(CompanionError::RateLimited));
     assert_eq!(client.get_pad().unwrap().content, "1", "reads are not rate limited");

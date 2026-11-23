@@ -1,0 +1,81 @@
+# XcodeGen spec: `make xcode` (from ios-apps/) builds the Rust core and generates Companion.xcodeproj.
+# Before the first build on a device, change the three places that say dev.cafeine to an
+# identifier of your own (here, and `appGroup` in Package/Sources/CompanionKit/Settings.swift),
+# and set DEVELOPMENT_TEAM (or pick the team in Xcode > Signing & Capabilities).
+name: Companion
+options:
+  bundleIdPrefix: dev.cafeine
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+packages:
+  CompanionKit:
+    path: Package
+targets:
+  Companion:
+    type: application
+    platform: iOS
+    sources: [App]
+    dependencies:
+      - package: CompanionKit
+      - target: CompanionShare
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cafeine.companion
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Companion
+        UILaunchScreen: {}
+        ITSAppUsesNonExemptEncryption: false
+        # The Rust core opens plain sockets: App Transport Security does not apply to it,
+        # the local network permission does.
+        NSLocalNetworkUsageDescription: Companion connects to the companion server on your network.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    entitlements:
+      path: App/Companion.entitlements
+      properties:
+        com.apple.security.application-groups: [group.dev.cafeine.companion]
+  CompanionShare:
+    type: app-extension
+    platform: iOS
+    sources: [ShareExtension]
+    dependencies:
+      - package: CompanionKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cafeine.companion.share
+    info:
+      path: ShareExtension/Info.plist
+      properties:
+        CFBundleDisplayName: Companion
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsFileWithMaxCount: 20
+              NSExtensionActivationSupportsImageWithMaxCount: 20
+              NSExtensionActivationSupportsMovieWithMaxCount: 20
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsText: true
+    entitlements:
+      path: ShareExtension/CompanionShare.entitlements
+      properties:
+        com.apple.security.application-groups: [group.dev.cafeine.companion]

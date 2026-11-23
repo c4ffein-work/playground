@@ -180,3 +180,129 @@ final class EndToEndTests: XCTestCase {
         }
     }
 }
+
+/// The app's state machine, against the same server.
+@MainActor
+final class AppModelTests: XCTestCase {
+    private var directory: URL!
+    private var settings: ServerSettings!
+    private var secret: String!
+    private var suite: String!
+
+    override func setUp() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let url = env["COMPANION_E2E_URL"], let id = env["COMPANION_E2E_ID"], let secret = env["COMPANION_E2E_SECRET"] else {
+            throw XCTSkip("no server: run `make swift-test`")
+        }
+        settings = ServerSettings(url: url, clientId: id)
+        self.secret = secret
+        suite = "companion-tests-\(UUID().uuidString)"
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    override func tearDown() async throws {
+        if let directory {
+            try? FileManager.default.removeItem(at: directory)
+            UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite)
+        }
+    }
+
+    private func makeModel(secrets: SecretStore = InMemorySecretStore()) -> AppModel {
+        AppModel(
+            store: SettingsStore(defaults: UserDefaults(suiteName: suite)!, secrets: secrets),
+            downloadDirectory: directory.appendingPathComponent("downloads"))
+    }
+
+    func testConnectSavesOnlyWhatWorks() async {
+        let secrets = InMemorySecretStore()
+        let model = makeModel(secrets: secrets)
+        XCTAssertFalse(model.isConnected)
+
+        let refused = await model.connect(settings: settings, secret: "ffff")
+        XCTAssertFalse(refused)
+        XCTAssertEqual(model.errorMessage, "invalid credentials")
+        XCTAssertFalse(model.isConnected)
+        XCTAssertNil(secrets.read("client-secret"), "a secret the server refused is not stored")
+
+        model.errorMessage = nil
+        let accepted = await model.connect(settings: settings, secret: secret)
+        XCTAssertTrue(accepted)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertTrue(model.isConnected)
+
+        // The next launch finds them.
+        let relaunched = makeModel(secrets: secrets)
+        XCTAssertTrue(relaunched.isConnected)
+        XCTAssertEqual(relaunched.settings, settings)
+    }
+
+    func testUploadOpenPresent() async throws {
+        let model = makeModel()
+        await model.connect(settings: settings, secret: secret)
+
+        let name = "model \(UUID().uuidString).txt"
+        let source = directory.appendingPathComponent("picked.txt")
+        try Data("picked on the phone".utf8).write(to: source)
+        await model.upload(fileAt: source, named: name, cleanUp: true)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.uploads, [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path), "the temporary copy is removed")
+        let file = try XCTUnwrap(model.files.first)
+        XCTAssertEqual(file.name, name)
+
+        let copied = await model.localCopy(of: file)
+        let local = try XCTUnwrap(copied)
+        XCTAssertEqual(try String(contentsOf: local, encoding: .utf8), "picked on the phone")
+        XCTAssertEqual(local.lastPathComponent, name)
+        XCTAssertEqual(model.downloads, [:])
+
+        await model.present(file)
+        XCTAssertEqual(model.preview?.fileId, file.id)
+        let presented = await model.presentedFile()
+        XCTAssertEqual(presented, file)
+        let changedAgain = await model.refreshPreview()
+        XCTAssertFalse(changedAgain, "nothing new was presented")
+
+        // Presented from another device: this one notices.
+        let other = try CompanionService(settings: settings, secret: secret)
+        let second = try await other.upload(data: Data("x".utf8), named: "other.txt")
+        try await other.present(fileId: second.id)
+        let changed = await model.refreshPreview()
+        XCTAssertTrue(changed)
+        let nowPresented = await model.presentedFile()
+        XCTAssertEqual(nowPresented?.id, second.id, "a file not in the list yet is looked up")
+    }
+
+    func testPadKeepsLocalEditsAndTakesRemoteOnes() async throws {
+        let model = makeModel()
+        await model.connect(settings: settings, secret: secret)
+        let other = try CompanionService(settings: settings, secret: secret)
+
+        try await other.setPad("from the laptop")
+        await model.pullPad()
+        XCTAssertEqual(model.padText, "from the laptop")
+        XCTAssertFalse(model.padIsDirty)
+
+        // Typing on the phone, while the laptop writes too: the phone's edit is not thrown away.
+        model.padText = "from the laptop, edited on the phone"
+        try await other.setPad("laptop again")
+        await model.pullPad()
+        XCTAssertEqual(model.padText, "from the laptop, edited on the phone")
+        XCTAssertTrue(model.padIsDirty)
+
+        await model.pushPad()
+        XCTAssertFalse(model.padIsDirty)
+        let onServer = try await other.pad()
+        XCTAssertEqual(onServer.content, "from the laptop, edited on the phone")
+
+        // Nothing to send, nothing sent: the timestamp does not move.
+        await model.pushPad()
+        let after = try await other.pad()
+        XCTAssertEqual(after.timestamp, onServer.timestamp)
+
+        try await other.setPad("final word")
+        await model.pullPad()
+        XCTAssertEqual(model.padText, "final word")
+    }
+}

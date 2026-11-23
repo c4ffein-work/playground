@@ -34,7 +34,10 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Trust {
     /// Pin + chain and hostname verification (Mozilla roots, plus `extra_ca_pem` when given).
-    PinnedWithCa { sha256: String, extra_ca_pem: Option<String> },
+    PinnedWithCa {
+        sha256: String,
+        extra_ca_pem: Option<String>,
+    },
     /// Pin only: for a self-signed certificate.
     PinnedOnly { sha256: String },
 }
@@ -119,7 +122,9 @@ pub fn sha256_hex(data: &[u8]) -> String {
 pub fn random_hex(bytes: usize) -> String {
     use ring::rand::SecureRandom;
     let mut buf = vec![0u8; bytes];
-    ring::rand::SystemRandom::new().fill(&mut buf).expect("the system has no randomness");
+    ring::rand::SystemRandom::new()
+        .fill(&mut buf)
+        .expect("the system has no randomness");
     buf.iter().fold(String::with_capacity(bytes * 2), |mut out, b| {
         write!(out, "{b:02x}").unwrap();
         out
@@ -131,7 +136,9 @@ fn provider() -> Arc<CryptoProvider> {
 }
 
 fn roots(extra_ca_pem: Option<&str>) -> Result<RootCertStore, Error> {
-    let mut store = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    let mut store = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
     if let Some(pem) = extra_ca_pem {
         let mut added = 0;
         for cert in CertificateDer::pem_slice_iter(pem.as_bytes()) {
@@ -245,7 +252,9 @@ fn is_https(url: &str) -> Result<bool, Error> {
     } else if lower.starts_with("http://") {
         Ok(false)
     } else {
-        Err(Error::InvalidUrl(format!("the URL must start with http:// or https:// (got {url:?})")))
+        Err(Error::InvalidUrl(format!(
+            "the URL must start with http:// or https:// (got {url:?})"
+        )))
     }
 }
 
@@ -264,7 +273,11 @@ pub fn agent(base_url: &str, trust: Option<&Trust>) -> Result<PinnedAgent, Error
         .https_only(https);
     let seen = SeenCertificate::default();
     match (https, trust) {
-        (false, None) => Ok(PinnedAgent { agent: builder.build(), pin: None, seen }),
+        (false, None) => Ok(PinnedAgent {
+            agent: builder.build(),
+            pin: None,
+            seen,
+        }),
         (false, Some(_)) => Err(Error::SchemeMismatch(
             "a certificate pin is set but the URL is http://: switch to https:// or remove the pin".into(),
         )),
@@ -287,7 +300,11 @@ pub fn agent(base_url: &str, trust: Option<&Trust>) -> Result<PinnedAgent, Error
                 seen: seen.clone(),
                 provider,
             })?;
-            Ok(PinnedAgent { agent: builder.tls_config(Arc::new(config)).build(), pin: Some(pin), seen })
+            Ok(PinnedAgent {
+                agent: builder.tls_config(Arc::new(config)).build(),
+                pin: Some(pin),
+                seen,
+            })
         }
     }
 }
@@ -328,7 +345,9 @@ pub fn https_host_port(url: &str) -> Result<(String, u16), Error> {
     }
     let port = match port {
         None | Some("") => 443,
-        Some(p) => p.parse().map_err(|_| Error::InvalidUrl(format!("bad port in {url:?}")))?,
+        Some(p) => p
+            .parse()
+            .map_err(|_| Error::InvalidUrl(format!("bad port in {url:?}")))?,
     };
     Ok((host.to_string(), port))
 }
@@ -349,12 +368,13 @@ pub fn fetch_fingerprint(url: &str, extra_ca_pem: Option<&str>) -> Result<Finger
         seen: seen.clone(),
         provider,
     })?;
-    let server_name = ServerName::try_from(host.clone())
-        .map_err(|e| Error::InvalidUrl(format!("bad host {host:?}: {e}")))?;
-    let mut conn =
-        ClientConnection::new(Arc::new(config), server_name).map_err(|e| Error::Tls(e.to_string()))?;
+    let server_name =
+        ServerName::try_from(host.clone()).map_err(|e| Error::InvalidUrl(format!("bad host {host:?}: {e}")))?;
+    let mut conn = ClientConnection::new(Arc::new(config), server_name).map_err(|e| Error::Tls(e.to_string()))?;
 
-    let addrs = (host.as_str(), port).to_socket_addrs().map_err(|e| Error::Connect(e.to_string()))?;
+    let addrs = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|e| Error::Connect(e.to_string()))?;
     let mut last = Error::Connect(format!("{host} resolves to no address"));
     let mut sock = None;
     for addr in addrs {
@@ -367,15 +387,19 @@ pub fn fetch_fingerprint(url: &str, extra_ca_pem: Option<&str>) -> Result<Finger
         }
     }
     let mut sock = sock.ok_or(last)?;
-    sock.set_read_timeout(Some(CONNECT_TIMEOUT)).map_err(|e| Error::Connect(e.to_string()))?;
-    sock.set_write_timeout(Some(CONNECT_TIMEOUT)).map_err(|e| Error::Connect(e.to_string()))?;
+    sock.set_read_timeout(Some(CONNECT_TIMEOUT))
+        .map_err(|e| Error::Connect(e.to_string()))?;
+    sock.set_write_timeout(Some(CONNECT_TIMEOUT))
+        .map_err(|e| Error::Connect(e.to_string()))?;
     while conn.is_handshaking() {
         conn.complete_io(&mut sock).map_err(|e| Error::Tls(e.to_string()))?;
     }
     conn.send_close_notify();
     let _ = conn.complete_io(&mut sock);
 
-    let sha256 = seen.get().ok_or_else(|| Error::Tls("the server sent no certificate".into()))?;
+    let sha256 = seen
+        .get()
+        .ok_or_else(|| Error::Tls("the server sent no certificate".into()))?;
     let chain_valid = chain_ok.lock().unwrap().unwrap_or(false);
     Ok(Fingerprint { sha256, chain_valid })
 }
@@ -390,7 +414,12 @@ pub struct ProgressReader<R, F: FnMut(u64, u64)> {
 
 impl<R: Read, F: FnMut(u64, u64)> ProgressReader<R, F> {
     pub fn new(inner: R, total: u64, report: F) -> Self {
-        Self { inner, sent: 0, total, report }
+        Self {
+            inner,
+            sent: 0,
+            total,
+            report,
+        }
     }
 }
 
@@ -442,7 +471,10 @@ mod tests {
     #[test]
     fn host_and_port() {
         assert_eq!(https_host_port("https://a.example").unwrap(), ("a.example".into(), 443));
-        assert_eq!(https_host_port("https://a.example:8443/x?y").unwrap(), ("a.example".into(), 8443));
+        assert_eq!(
+            https_host_port("https://a.example:8443/x?y").unwrap(),
+            ("a.example".into(), 8443)
+        );
         assert_eq!(https_host_port("https://[::1]:8443/").unwrap(), ("::1".into(), 8443));
         assert_eq!(https_host_port("https://[fe80::1]").unwrap(), ("fe80::1".into(), 443));
         assert!(https_host_port("http://a.example").is_err());
@@ -453,15 +485,32 @@ mod tests {
 
     #[test]
     fn scheme_and_trust_must_agree() {
-        let pin = Trust::PinnedOnly { sha256: "ab".repeat(32) };
+        let pin = Trust::PinnedOnly {
+            sha256: "ab".repeat(32),
+        };
         assert!(agent("http://a.example", None).is_ok());
-        assert!(matches!(agent("https://a.example", None), Err(Error::SchemeMismatch(_))));
-        assert!(matches!(agent("http://a.example", Some(&pin)), Err(Error::SchemeMismatch(_))));
+        assert!(matches!(
+            agent("https://a.example", None),
+            Err(Error::SchemeMismatch(_))
+        ));
+        assert!(matches!(
+            agent("http://a.example", Some(&pin)),
+            Err(Error::SchemeMismatch(_))
+        ));
         assert!(agent("https://a.example", Some(&pin)).is_ok());
         assert!(matches!(agent("ftp://a.example", None), Err(Error::InvalidUrl(_))));
         let bad = Trust::PinnedOnly { sha256: "nope".into() };
-        assert!(matches!(agent("https://a.example", Some(&bad)), Err(Error::InvalidPin(_))));
-        let bad_ca = Trust::PinnedWithCa { sha256: "ab".repeat(32), extra_ca_pem: Some("not pem".into()) };
-        assert!(matches!(agent("https://a.example", Some(&bad_ca)), Err(Error::InvalidCa(_))));
+        assert!(matches!(
+            agent("https://a.example", Some(&bad)),
+            Err(Error::InvalidPin(_))
+        ));
+        let bad_ca = Trust::PinnedWithCa {
+            sha256: "ab".repeat(32),
+            extra_ca_pem: Some("not pem".into()),
+        };
+        assert!(matches!(
+            agent("https://a.example", Some(&bad_ca)),
+            Err(Error::InvalidCa(_))
+        ));
     }
 }

@@ -48,7 +48,9 @@ fn serve() -> Server {
             let Ok(sock) = sock else { continue };
             let config = config.clone();
             std::thread::spawn(move || {
-                let Ok(conn) = ServerConnection::new(config) else { return };
+                let Ok(conn) = ServerConnection::new(config) else {
+                    return;
+                };
                 let mut tls = StreamOwned::new(conn, sock);
                 let mut request = Vec::new();
                 let mut buf = [0u8; 1024];
@@ -86,16 +88,25 @@ fn fingerprint_is_the_leaf_sha256() {
     let s = serve();
     assert_eq!(
         fetch_fingerprint(&s.url, None).unwrap(),
-        Fingerprint { sha256: s.leaf_sha256.clone(), chain_valid: false },
+        Fingerprint {
+            sha256: s.leaf_sha256.clone(),
+            chain_valid: false
+        },
         "an unknown CA: the fingerprint is read, and reported as not verifiable"
     );
     assert_eq!(
         fetch_fingerprint(&s.url, Some(&s.ca_pem)).unwrap(),
-        Fingerprint { sha256: s.leaf_sha256.clone(), chain_valid: true }
+        Fingerprint {
+            sha256: s.leaf_sha256.clone(),
+            chain_valid: true
+        }
     );
     assert_eq!(
         fetch_fingerprint(&s.url_by_ip, Some(&s.ca_pem)).unwrap(),
-        Fingerprint { sha256: s.leaf_sha256.clone(), chain_valid: false },
+        Fingerprint {
+            sha256: s.leaf_sha256.clone(),
+            chain_valid: false
+        },
         "the right CA but the wrong name is not a valid chain"
     );
 }
@@ -103,12 +114,21 @@ fn fingerprint_is_the_leaf_sha256() {
 #[test]
 fn pinned_only_accepts_the_pinned_certificate() {
     let s = serve();
-    let trust = Trust::PinnedOnly { sha256: s.leaf_sha256.clone() };
+    let trust = Trust::PinnedOnly {
+        sha256: s.leaf_sha256.clone(),
+    };
     assert_eq!(get(&s.url, &trust).unwrap(), "ok");
     // The pin identifies the certificate: the name it was reached by does not matter.
     assert_eq!(get(&s.url_by_ip, &trust).unwrap(), "ok");
     // Uppercase with colons, as openssl prints it.
-    let openssl_style = s.leaf_sha256.to_uppercase().as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join(":");
+    let openssl_style = s
+        .leaf_sha256
+        .to_uppercase()
+        .as_bytes()
+        .chunks(2)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join(":");
     assert_eq!(get(&s.url, &Trust::PinnedOnly { sha256: openssl_style }).unwrap(), "ok");
 }
 
@@ -116,8 +136,13 @@ fn pinned_only_accepts_the_pinned_certificate() {
 fn a_wrong_pin_is_refused_and_the_served_one_is_reported() {
     let s = serve();
     for trust in [
-        Trust::PinnedOnly { sha256: "ab".repeat(32) },
-        Trust::PinnedWithCa { sha256: "ab".repeat(32), extra_ca_pem: Some(s.ca_pem.clone()) },
+        Trust::PinnedOnly {
+            sha256: "ab".repeat(32),
+        },
+        Trust::PinnedWithCa {
+            sha256: "ab".repeat(32),
+            extra_ca_pem: Some(s.ca_pem.clone()),
+        },
     ] {
         let pinned = agent(&s.url, Some(&trust)).unwrap();
         assert!(pinned.agent.get(&s.url).call().is_err());
@@ -131,13 +156,22 @@ fn pinned_with_ca_also_verifies_chain_and_name() {
     let s = serve();
     let sha256 = s.leaf_sha256.clone();
 
-    let with_ca = Trust::PinnedWithCa { sha256: sha256.clone(), extra_ca_pem: Some(s.ca_pem.clone()) };
+    let with_ca = Trust::PinnedWithCa {
+        sha256: sha256.clone(),
+        extra_ca_pem: Some(s.ca_pem.clone()),
+    };
     assert_eq!(get(&s.url, &with_ca).unwrap(), "ok");
 
     let err = get(&s.url_by_ip, &with_ca).unwrap_err();
-    assert!(err.contains("not valid for name"), "right pin and CA, wrong name: {err}");
+    assert!(
+        err.contains("not valid for name"),
+        "right pin and CA, wrong name: {err}"
+    );
 
-    let public_roots_only = Trust::PinnedWithCa { sha256, extra_ca_pem: None };
+    let public_roots_only = Trust::PinnedWithCa {
+        sha256,
+        extra_ca_pem: None,
+    };
     let err = get(&s.url, &public_roots_only).unwrap_err();
     assert!(err.contains("UnknownIssuer"), "right pin, unknown CA: {err}");
 }
