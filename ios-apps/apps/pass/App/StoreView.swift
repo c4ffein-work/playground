@@ -27,9 +27,7 @@ struct StoreView: View {
                         }
                     }
                 }
-                Section {
-                    SyncRow()
-                }
+                SyncSection()
             }
             .searchable(text: $model.searchText, prompt: "Search the store")
             .textInputAutocapitalization(.never)
@@ -59,6 +57,11 @@ struct StoreView: View {
                         adding = true
                     } label: {
                         Image(systemName: "plus")
+                    }
+                    NavigationLink {
+                        ReadersView(folder: "")
+                    } label: {
+                        Image(systemName: "person.2")
                     }
                     NavigationLink {
                         SettingsView()
@@ -99,6 +102,7 @@ struct FolderRow: View {
     let node: StoreNode
     @Environment(AppModel.self) private var model
     @State private var access: Access?
+    @State private var editingReaders = false
 
     var body: some View {
         Label {
@@ -115,21 +119,35 @@ struct FolderRow: View {
         }
         .badge(node.entryCount)
         .task(id: model.entries) { access = await model.access(toFolder: node.path) }
+        .swipeActions {
+            Button("Readers") { editingReaders = true }.tint(.orange)
+        }
+        .contextMenu {
+            Button("Readers…", systemImage: "person.2") { editingReaders = true }
+        }
+        .sheet(isPresented: $editingReaders) {
+            NavigationStack {
+                ReadersView(folder: node.path)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("Done") { editingReaders = false }
+                        }
+                    }
+            }
+        }
     }
 }
 
-/// The sync button and, under it, where the device stands. Leads to the review when the owner has published something.
-struct SyncRow: View {
+/// The sync button, where the device stands, and the other devices: what each has to take,
+/// which leads to its review.
+struct SyncSection: View {
     @Environment(AppModel.self) private var model
-    @State private var reviewing = false
+    @State private var reviewing: ReviewTarget?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        Section {
             Button {
-                Task {
-                    await model.sync()
-                    reviewing = model.pendingUpdate != nil
-                }
+                Task { await model.sync() }
             } label: {
                 HStack {
                     Label("Sync", systemImage: "arrow.triangle.2.circlepath")
@@ -138,19 +156,45 @@ struct SyncRow: View {
                 }
             }
             .disabled(model.isSyncing)
-            if let message = model.syncMessage {
-                Text(message).font(.caption)
+            ForEach(model.peers, id: \.device) { peer in
+                Button {
+                    reviewing = ReviewTarget(device: peer.device)
+                } label: {
+                    LabeledContent {
+                        Text(model.standing(of: peer))
+                            .foregroundStyle(peer.toTake > 0 ? Color.accentColor : .secondary)
+                    } label: {
+                        Text(peer.device)
+                        if let ago = model.publishedAgo(peer) {
+                            Text(ago)
+                        }
+                    }
+                }
+                .disabled(!peer.received)
             }
-            if let state = model.syncState {
-                Text(describe(state)).font(.caption).foregroundStyle(.secondary)
-            }
-            if model.pendingUpdate != nil {
-                Button("Look at the owner's update…") { reviewing = true }
-                    .font(.callout)
+        } header: {
+            Text("Devices")
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                if let message = model.syncMessage {
+                    Text(message)
+                }
+                if model.syncState?.unpublished == true {
+                    Text("This device's changes are not published yet.")
+                }
+                if !model.stale.isEmpty {
+                    Text("\(model.stale.count) entries are not encrypted for the readers their folder names.")
+                }
             }
         }
-        .sheet(isPresented: $reviewing) {
-            NavigationStack { ReviewView() }
+        .sheet(item: $reviewing) { target in
+            NavigationStack { ReviewView(device: target.device) }
         }
     }
+}
+
+/// Whose update is being looked at.
+struct ReviewTarget: Identifiable {
+    let device: String
+    var id: String { device }
 }

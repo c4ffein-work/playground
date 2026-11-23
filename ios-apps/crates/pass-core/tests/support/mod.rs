@@ -1,24 +1,31 @@
 //! What the e2e tests share: a throwaway world with its own GnuPG home, its own
 //! git configuration and its own keys, the real `gpg`, `git` and `pass.py` run in it,
-//! and a real drop zone (`apps/pass/dropzone/entrypoint.sh`: OpenSSH's sshd) to sync through.
+//! a real drop zone (`apps/pass/dropzone/entrypoint.sh`: OpenSSH's sshd) to sync through,
+//! and fleets of devices made of this crate.
 
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pass_core::{DropZone, Peer, StoreConfig};
+use pass_core::{
+    generate_device_key, generate_openpgp_key, review_line_text, Choice, DropZone, FetchOutcome, GeneratedKey,
+    Identity, PassError, PassStore, Peer, ReviewLine, Side, StoreConfig, Taken,
+};
 
 /// No space in it: pass.py splits `PASSWORD_STORE_GPG_OPTS` on spaces.
 pub const PASSPHRASE: &str = "correct-horse-battery-staple";
 
 fn random_hex() -> String {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .subsec_nanos();
-    format!("{:08x}{:04x}", nanos, std::process::id() & 0xffff)
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{:08x}{:04x}{:02x}", nanos, std::process::id() & 0xffff, count & 0xff)
 }
 
 pub struct World {
@@ -38,12 +45,11 @@ pub struct Key {
 
 impl Key {
     /// This key's device, as another device is told about it.
-    pub fn peer(&self, name: &str, is_owner: bool) -> Peer {
+    pub fn peer(&self, name: &str) -> Peer {
         Peer {
             name: name.into(),
             fingerprint: self.fingerprint.clone(),
             public_key: self.public.clone(),
-            is_owner,
         }
     }
 }
@@ -195,7 +201,7 @@ impl World {
         }
     }
 
-    /// Gives gpg a public key made elsewhere (on the phone), as its owner would: imported and trusted.
+    /// Gives gpg a public key made elsewhere (on a phone), as its owner would: imported and trusted.
     pub fn import_key(&self, public_key: &str, fingerprint: &str) {
         self.gpg(&["--import"], Some(public_key.as_bytes()));
         // (Not through `gpg()`: with `--trust-model always` gpg does not make the trust database this writes to.)
@@ -261,8 +267,7 @@ impl World {
             .collect()
     }
 
-    /// A store as its owner has it on the computer: `pass init` for these keys,
-    /// `pass git init`, two entries.
+    /// A store as pass.py makes one: `pass init` for these keys, `pass git init`, two entries.
     pub fn computer_store(&self, recipients: &[&Key]) -> PathBuf {
         let store = self.path("computer-store");
         let mut args = vec!["init"];
@@ -274,9 +279,9 @@ impl World {
         store
     }
 
-    /// The configuration of a member's store in `directory`: the device `name`, whose
-    /// OpenPGP public key is `public_key`, knowing `peers`.
-    pub fn member_config(&self, directory: &str, name: &str, public_key: &str, peers: Vec<Peer>) -> StoreConfig {
+    /// The configuration of a device's store in `directory`: named `name`, whose OpenPGP
+    /// public key is `public_key`, knowing `peers`.
+    pub fn config(&self, directory: &str, name: &str, public_key: &str, peers: Vec<Peer>) -> StoreConfig {
         StoreConfig {
             directory: self.path(directory).to_string_lossy().into_owned(),
             device: name.into(),
@@ -309,7 +314,7 @@ pub struct Zone {
     pub port: u16,
     /// `SHA256:...`, as the drop zone printed it.
     pub host_key: String,
-    known_hosts: PathBuf,
+    pub known_hosts: PathBuf,
 }
 
 impl Drop for Zone {
@@ -421,194 +426,293 @@ impl Zone {
         )
     }
 
-    /// Runs a batch of OpenSSH's `sftp` as the holder of `key`.
-    pub fn sftp(&self, world: &World, key: &SshKey, batch: &[String]) -> Ran {
+    /// Publishes `file` under `name` with OpenSSH's `sftp`, the way the protocol says: uploaded beside, renamed over.
+    pub fn publish(&self, world: &World, key: &SshKey, file: &Path, name: &str) {
         let mut command = Command::new("sftp");
         command.args(["-q", "-b", "-", "-P", &self.port.to_string()]);
         command.args(self.ssh_options(key).split(' '));
         command.arg("drop@127.0.0.1");
-        world.try_run(command, Some(format!("{}\n", batch.join("\n")).as_bytes()))
-    }
-
-    /// Publishes `file` under `name` the way the protocol says: uploaded beside, renamed over.
-    pub fn publish(&self, world: &World, key: &SshKey, file: &Path, name: &str) {
-        let ran = self.sftp(
-            world,
-            key,
-            &[
-                format!("put {} {name}.part", file.display()),
-                format!("rename {name}.part {name}"),
-            ],
-        );
+        let batch = format!("put {} {name}.part\nrename {name}.part {name}\n", file.display());
+        let ran = world.try_run(command, Some(batch.as_bytes()));
         assert!(ran.ok, "sftp could not publish {name}: {}", ran.stderr);
     }
-
-    /// Reads what is published under `name` into `to`. False when there is no such file.
-    pub fn download(&self, world: &World, key: &SshKey, name: &str, to: &Path) -> bool {
-        let _ = std::fs::remove_file(to);
-        self.sftp(world, key, &[format!("get {name} {}", to.display())]).ok && to.is_file()
-    }
 }
 
-/// The owner's side of SYNC.md, done by hand with the real `git`, `gpg` and `sftp`:
-/// what `pass sync` does, and what the phone must interoperate with.
-pub struct Computer<'a> {
-    pub world: &'a World,
-    pub zone: &'a Zone,
-    pub store: PathBuf,
+/// A device made of this crate: what the phone is.
+pub struct Device {
     pub name: String,
-    pub key: Key,
-    pub ssh: SshKey,
-    /// The fingerprints of every device's OpenPGP key, the computer's included: who a published file is for.
-    pub devices: Vec<String>,
+    pub key: GeneratedKey,
+    pub store: Arc<PassStore>,
+    pub identity: Arc<Identity>,
+    pub zone: DropZone,
+    /// Its store, to look at with the real git.
+    pub dir: PathBuf,
 }
 
-impl Computer<'_> {
-    fn file(&self, name: &str) -> PathBuf {
-        self.world.path(name)
+impl Device {
+    /// Publishes, and receives the others' files: one line per other device, as `pass-device sync` prints them.
+    pub fn sync(&self) -> Vec<String> {
+        let report = self.store.sync(self.zone.clone(), self.identity.clone()).unwrap();
+        assert_eq!(report.publish_refused, None);
+        report
+            .peers
+            .into_iter()
+            .map(|peer| {
+                let stands = match peer.outcome {
+                    FetchOutcome::Refused { reason } => format!("REFUSED {reason}"),
+                    FetchOutcome::Stale { .. } => "IGNORED".to_string(),
+                    FetchOutcome::NothingPublished => "nothing published".to_string(),
+                    _ if peer.state.to_take > 0 => format!("{} to take", peer.state.to_take),
+                    _ => "nothing to take".to_string(),
+                };
+                format!("{}: {stands}", peer.state.device)
+            })
+            .collect()
     }
 
-    /// A bundle of the store's tip under `refs/pass-sync/<name>`, signed by this key and
-    /// encrypted to every device. `gpg_options` is where `--compress-algo none` goes, or nothing.
-    pub fn sealed_tip(&self, gpg_options: &[&str]) -> PathBuf {
-        let reference = format!("refs/pass-sync/{}", self.name);
-        self.world.git(&self.store, &["update-ref", &reference, "HEAD"]);
-        let bundle = self.file("out.bundle");
-        self.world.git(
-            &self.store,
-            &[
-                "bundle",
-                "create",
-                "--quiet",
-                "--version=2",
-                &bundle.to_string_lossy(),
-                &reference,
-            ],
-        );
-        self.seal(&bundle, &self.key.fingerprint, &self.devices, gpg_options)
+    /// How this device stands with `other` after a sync: what follows `other: ` in its line.
+    pub fn stands_with(&self, other: &str) -> String {
+        let prefix = format!("{other}: ");
+        self.sync()
+            .into_iter()
+            .find_map(|line| line.strip_prefix(&prefix).map(str::to_string))
+            .expect("no such device")
     }
 
-    /// `gpg --sign --encrypt` of `file`, by `signer`, for `recipients`.
-    pub fn seal(&self, file: &Path, signer: &str, recipients: &[String], gpg_options: &[&str]) -> PathBuf {
-        let sealed = self.file(&format!("sealed-{}.gpg", random_hex()));
-        let (file, output) = (
-            file.to_string_lossy().into_owned(),
-            sealed.to_string_lossy().into_owned(),
-        );
-        let mut args = vec!["--local-user", signer, "--sign", "--encrypt", "--output", &output];
-        for recipient in recipients {
-            args.extend(["--recipient", recipient]);
-        }
-        args.extend(gpg_options);
-        args.push(&file);
-        self.world.gpg(&args, None);
-        sealed
+    /// What taking the update of `other` would do: the lines of SYNC.md, sorted.
+    pub fn pending(&self, other: &str) -> Vec<String> {
+        let mut lines: Vec<String> = self.review(other).into_iter().map(review_line_text).collect();
+        lines.sort();
+        lines
     }
 
-    /// `pass sync push`: publishes the store's tip.
-    pub fn publish(&self, gpg_options: &[&str]) {
-        let sealed = self.sealed_tip(gpg_options);
-        self.put(&sealed);
+    pub fn review(&self, other: &str) -> Vec<ReviewLine> {
+        self.store
+            .pending_update(other.into(), self.identity.clone())
+            .unwrap()
+            .map(|update| update.lines)
+            .unwrap_or_default()
     }
 
-    /// Puts any file in the computer's place in the drop zone.
-    pub fn put(&self, file: &Path) {
-        self.zone
-            .publish(self.world, &self.ssh, file, &format!("{}.bundle.gpg", self.name));
-    }
-
-    /// `pass sync fetch` for one member: takes its file if it is what SYNC.md says it must
-    /// be, and returns its tip; or says why not.
-    pub fn fetch(&self, member: &str, member_key: &str) -> Result<String, String> {
-        let message = self.file("in.gpg");
-        if !self
-            .zone
-            .download(self.world, &self.ssh, &format!("{member}.bundle.gpg"), &message)
-        {
-            return Err("nothing published".into());
-        }
-        // 1. It decrypts, and carries a valid signature by the member's key.
-        let bundle = self.file("in.bundle");
-        let mut decrypt =
-            self.world
-                .gpg_command(&["--status-fd", "2", "--output", &bundle.to_string_lossy(), "--decrypt"]);
-        decrypt.arg(&message);
-        let decrypted = self.world.try_run(decrypt, None);
-        if !decrypted.ok {
-            return Err(format!("gpg does not decrypt it: {}", decrypted.stderr));
-        }
-        let signed_by_member = decrypted
-            .stderr
-            .lines()
-            .any(|line| line.starts_with("[GNUPG:] VALIDSIG ") && line.ends_with(member_key));
-        if !signed_by_member {
-            return Err(format!("not signed by {member}: {}", decrypted.stderr));
-        }
-        // 2. One reference, the member's.
-        let reference = format!("refs/pass-sync/{member}");
-        let heads = self
-            .world
-            .git(&self.store, &["bundle", "list-heads", &bundle.to_string_lossy()]);
-        let [head] = heads.lines().collect::<Vec<_>>()[..] else {
-            return Err(format!("not one reference: {heads}"));
+    pub fn try_take(&self, other: &str, mine: &[&str], theirs: &[&str]) -> Result<Taken, PassError> {
+        let choice = |keep: Side| {
+            move |name: &&str| Choice {
+                name: name.to_string(),
+                keep,
+            }
         };
-        let Some((tip, name)) = head.split_once(' ') else {
-            return Err(format!("a malformed reference: {head}"));
-        };
-        if name != reference {
-            return Err(format!("the wrong reference: {name}"));
-        }
-        // 3. Complete: git itself checks it, and that it asks for nothing it does not hold.
-        let verified = self
-            .world
-            .try_git(&self.store, &["bundle", "verify", &bundle.to_string_lossy()]);
-        if !verified.ok || verified.stderr.contains("requires") {
-            return Err(format!("git bundle verify: {}", verified.stderr));
-        }
-        self.world.git(
-            &self.store,
-            &[
-                "fetch",
-                "--quiet",
-                &bundle.to_string_lossy(),
-                &format!("+{reference}:{reference}"),
-            ],
-        );
-        self.world.git(&self.store, &["fsck", "--strict", "--no-dangling"]);
-        Ok(tip.to_string())
+        let choices = mine
+            .iter()
+            .map(choice(Side::Mine))
+            .chain(theirs.iter().map(choice(Side::Theirs)))
+            .collect();
+        self.store
+            .take_update(other.into(), None, choices, self.identity.clone())
     }
 
-    /// `pass sync merge`: takes the member's commits when SYNC.md allows it (all signed by
-    /// the member or the owner, nothing but entries touched, a fast-forward), then publishes.
-    pub fn merge(&self, member: &str, member_key: &str) -> Result<(), String> {
-        let reference = format!("refs/pass-sync/{member}");
-        let range = format!("HEAD..{reference}");
-        let signatures = self.world.git(&self.store, &["log", "--format=%G? %GF %s", &range]);
-        for line in signatures.lines() {
-            let signed = [member_key, self.key.fingerprint.as_str()]
-                .iter()
-                .any(|key| line.starts_with(&format!("G {key} ")));
-            if !signed {
-                return Err(format!("a commit not signed by {member} or the owner: {line}"));
+    /// Takes the update of `other` with these choices, then publishes.
+    pub fn take(&self, other: &str, mine: &[&str], theirs: &[&str]) -> Taken {
+        let taken = self.try_take(other, mine, theirs).unwrap();
+        self.sync();
+        taken
+    }
+
+    pub fn insert(&self, name: &str, content: &str) {
+        self.store
+            .insert(name.into(), content.into(), true, self.identity.clone())
+            .unwrap();
+    }
+
+    pub fn show(&self, name: &str) -> Result<String, PassError> {
+        self.store
+            .content(name.into(), self.identity.clone())
+            .map(|content| content.trim_end_matches('\n').to_string())
+    }
+
+    pub fn rm(&self, name: &str) {
+        self.store.remove(name.into(), self.identity.clone()).unwrap();
+    }
+
+    pub fn mv(&self, from: &str, to: &str) {
+        self.store
+            .rename(from.into(), to.into(), false, self.identity.clone())
+            .unwrap();
+    }
+
+    pub fn ls(&self) -> Vec<String> {
+        self.store.list().unwrap()
+    }
+
+    pub fn set_readers(&self, folder: &str, readers: &[&str]) {
+        let readers = readers.iter().map(|name| name.to_string()).collect();
+        self.store
+            .set_readers(folder.into(), readers, self.identity.clone())
+            .unwrap();
+    }
+
+    /// The devices that should read what is in `folder`, sorted.
+    pub fn readers(&self, folder: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .store
+            .folder_access(folder.into())
+            .unwrap()
+            .readers
+            .into_iter()
+            .map(|reader| reader.device.unwrap_or(format!("?{}", reader.id)))
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+/// Devices of this crate that know each other, and their drop zone.
+pub struct Fleet {
+    pub devices: Vec<Device>,
+    pub zone: Zone,
+    pub world: World,
+}
+
+impl Fleet {
+    /// `names` devices of this crate; `extra_ssh` are more SSH public keys the drop zone lets in,
+    /// and `extra_peers` more devices everyone knows (a computer played by gpg).
+    pub fn with(world: World, names: &[&str], extra_ssh: &[&str], extra_peers: &[Peer]) -> Self {
+        let keys: Vec<(GeneratedKey, pass_core::DeviceKey)> = names
+            .iter()
+            .map(|name| {
+                (
+                    generate_openpgp_key(name.to_string(), String::new()).unwrap(),
+                    generate_device_key(name.to_string()).unwrap(),
+                )
+            })
+            .collect();
+        let mut authorized: Vec<&str> = keys.iter().map(|(_, ssh)| ssh.public_key.as_str()).collect();
+        authorized.extend(extra_ssh);
+        let zone = world.zone(&authorized);
+        let devices = names
+            .iter()
+            .zip(&keys)
+            .map(|(name, (key, ssh))| {
+                let mut peers: Vec<Peer> = names
+                    .iter()
+                    .zip(&keys)
+                    .filter(|(other, _)| other != &name)
+                    .map(|(other, (key, _))| Peer {
+                        name: other.to_string(),
+                        fingerprint: key.fingerprint.clone(),
+                        public_key: key.public_key.clone(),
+                    })
+                    .collect();
+                peers.extend(extra_peers.iter().cloned());
+                let directory = format!("{name}-store");
+                Device {
+                    name: name.to_string(),
+                    store: PassStore::open(world.config(&directory, name, &key.public_key, peers)).unwrap(),
+                    identity: Identity::unlock(key.secret_key.clone(), String::new()).unwrap(),
+                    zone: zone.for_device(&ssh.private_key),
+                    dir: world.path(&directory),
+                    key: key.clone(),
+                }
+            })
+            .collect();
+        Self { devices, zone, world }
+    }
+
+    pub fn new(names: &[&str]) -> Self {
+        Self::with(World::new(), names, &[], &[])
+    }
+
+    pub fn device(&self, name: &str) -> &Device {
+        self.devices
+            .iter()
+            .find(|device| device.name == name)
+            .expect("no such device")
+    }
+
+    /// A fleet whose devices all hold the same store, made by the first: root readers everyone
+    /// (or `readers`), and these entries.
+    pub fn started(names: &[&str], readers: Option<&[&str]>, entries: &[(&str, &str)]) -> Self {
+        let fleet = Self::new(names);
+        let first = &fleet.devices[0];
+        let readers = readers.unwrap_or(names).iter().map(|name| name.to_string()).collect();
+        first.store.create(readers, first.identity.clone()).unwrap();
+        for (name, content) in entries {
+            first.insert(name, content);
+        }
+        fleet.settle(&|_, _, _| panic!("no choice is expected here"));
+        fleet
+    }
+
+    /// Everybody syncs and takes what there is, until nothing moves. `resolve` answers where a
+    /// choice is needed: (device, other, name) → mine or theirs.
+    pub fn settle(&self, resolve: &dyn Fn(&str, &str, &str) -> Side) {
+        self.settle_among(resolve, &|_, _| true);
+    }
+
+    /// The same, where `takes(device, other)` says who takes from whom.
+    pub fn settle_among(&self, resolve: &dyn Fn(&str, &str, &str) -> Side, takes: &dyn Fn(&str, &str) -> bool) {
+        let mut quiet = 0;
+        for _ in 0..16 {
+            let mut moved = false;
+            for device in &self.devices {
+                for line in device.sync() {
+                    let (other, stands) = line.split_once(": ").unwrap();
+                    assert!(!stands.starts_with("REFUSED"), "{}: {line}", device.name);
+                    if !stands.ends_with(" to take") || stands.starts_with("nothing") || !takes(&device.name, other) {
+                        continue;
+                    }
+                    let (mut mine, mut theirs) = (Vec::new(), Vec::new());
+                    for line in device.pending(other) {
+                        if let Some(name) = line.strip_prefix("conflict ") {
+                            match resolve(&device.name, other, name) {
+                                Side::Mine => mine.push(name.to_string()),
+                                Side::Theirs => theirs.push(name.to_string()),
+                            }
+                        }
+                    }
+                    fn borrow(names: &[String]) -> Vec<&str> {
+                        names.iter().map(String::as_str).collect()
+                    }
+                    device.take(other, &borrow(&mine), &borrow(&theirs));
+                    moved = true;
+                }
+            }
+            // One quiet round is not enough: the first to sync had not seen what the last then published.
+            quiet = if moved { 0 } else { quiet + 1 };
+            if quiet == 2 {
+                return;
             }
         }
-        let touched = self.world.git(
-            &self.store,
-            &["diff", "--name-only", "--no-renames", "HEAD", &reference],
-        );
-        if let Some(other) = touched
-            .lines()
-            .find(|path| !path.ends_with(".gpg") || path.split('/').any(|part| part.starts_with('.')))
-        {
-            return Err(format!("it touches something that is not an entry: {other}"));
+        panic!("the devices never stop having something to take from each other");
+    }
+
+    /// All devices hold these entries, read them where they are readers and not elsewhere, and
+    /// have nothing stale and nothing left to take.
+    pub fn check(&self, contents: &[(&str, &str)]) {
+        let mut names: Vec<&str> = contents.iter().map(|(name, _)| *name).collect();
+        names.sort();
+        for device in &self.devices {
+            assert_eq!(device.ls(), names, "what {} lists", device.name);
+            assert_eq!(
+                device.store.stale().unwrap(),
+                Vec::<String>::new(),
+                "stale on {}",
+                device.name
+            );
+            for (name, content) in contents {
+                let folder = name.rsplit_once('/').map(|(folder, _)| folder).unwrap_or("");
+                let shown = device.show(name);
+                if device.readers(folder).contains(&device.name) {
+                    assert_eq!(shown.as_deref(), Ok(*content), "{name} on {}", device.name);
+                } else {
+                    assert_eq!(shown, Err(PassError::NotForThisKey), "{name} on {}", device.name);
+                }
+            }
+            for line in device.sync() {
+                assert!(line.ends_with(": nothing to take"), "{} still has: {line}", device.name);
+            }
+            // git's own opinion of the repository: sound, and the directory is what the last commit says.
+            self.world.git(&device.dir, &["fsck", "--strict", "--no-dangling"]);
+            assert_eq!(self.world.git(&device.dir, &["status", "--porcelain"]), "");
         }
-        let merged = self
-            .world
-            .try_git(&self.store, &["merge", "--quiet", "--ff-only", &reference]);
-        if !merged.ok {
-            return Err(format!("not a fast-forward: {}", merged.stderr));
-        }
-        self.publish(&["--compress-algo", "none"]);
-        Ok(())
     }
 }

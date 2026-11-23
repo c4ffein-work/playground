@@ -294,6 +294,54 @@ pub(crate) fn files(repo: &gix::Repository, commit: ObjectId) -> Result<BTreeMap
     Ok(out)
 }
 
+/// What a path of a tree is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathKind {
+    /// A regular file.
+    File,
+    /// A symbolic link, or a submodule: nothing a store holds.
+    Other,
+}
+
+/// Every path of a commit that is not a directory, with what it is.
+pub(crate) fn paths(repo: &gix::Repository, commit: ObjectId) -> Result<Vec<(String, PathKind, ObjectId)>, PassError> {
+    fn walk(
+        repo: &gix::Repository,
+        tree: ObjectId,
+        prefix: &str,
+        out: &mut Vec<(String, PathKind, ObjectId)>,
+    ) -> Result<(), PassError> {
+        let tree = repo.find_tree(tree).map_err(|e| git_error("cannot read a tree", e))?;
+        for entry in tree.iter() {
+            let entry = entry.map_err(|e| git_error("cannot read a tree", e))?;
+            let path = format!("{prefix}{}", entry.filename().to_str_lossy());
+            match entry.mode().kind() {
+                EntryKind::Tree => walk(repo, entry.object_id(), &format!("{path}/"), out)?,
+                EntryKind::Blob | EntryKind::BlobExecutable => out.push((path, PathKind::File, entry.object_id())),
+                EntryKind::Link | EntryKind::Commit => out.push((path, PathKind::Other, entry.object_id())),
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(repo, tree_of(repo, commit)?, "", &mut out)?;
+    Ok(out)
+}
+
+/// A tree holding exactly these files, each already in the repository.
+pub(crate) fn tree_of_files(repo: &gix::Repository, files: &BTreeMap<String, ObjectId>) -> Result<ObjectId, PassError> {
+    let failed = |e: &dyn std::fmt::Display| git_error("cannot build a tree", e);
+    let mut editor = repo
+        .edit_tree(ObjectId::empty_tree(repo.object_hash()))
+        .map_err(|e| failed(&e))?;
+    for (path, blob) in files {
+        editor
+            .upsert(path.as_str(), EntryKind::Blob, *blob)
+            .map_err(|e| failed(&e))?;
+    }
+    Ok(editor.write().map_err(|e| failed(&e))?.detach())
+}
+
 /// The files of a commit, or none for no commit.
 pub(crate) fn files_at(
     repo: &gix::Repository,

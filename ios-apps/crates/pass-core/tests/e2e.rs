@@ -5,8 +5,10 @@
 //! what `apps/pass/dropzone/entrypoint.sh` needs. Each test makes its own GnuPG home,
 //! keys, repositories and drop zone, and uses nothing of the machine's.
 //!
-//! The store on "the computer" is made and read by gpg, git and pass.py; the store on
-//! "the phone" by this crate. They only ever meet in the drop zone, as `apps/pass/SYNC.md` says.
+//! The sync tests are the situations of `apps/pass/scenarios/README.md` (their numbers are
+//! in the comments), played by devices of this crate; `scenarios/run.py` plays the same ones
+//! with `pass.py` mixed in. What only a device gone wrong would publish is made here with
+//! `git` and `gpg`.
 
 mod support;
 
@@ -14,19 +16,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use pass_core::{
-    generate_device_key, generate_openpgp_key, inspect_key, public_key_of, ChangeKind, Choice, DeviceKey, EntryVersion,
-    FetchOutcome, GeneratedKey, Identity, PassError, PassStore, PendingUpdate, Side, SignatureStatus, SyncReport,
+    generate_device_key, generate_openpgp_key, inspect_key, public_key_of, Access, EntryVersion, FetchOutcome,
+    Identity, PassError, PassStore, ReviewLine, Side, SignatureStatus, TakeKind,
 };
-use pass_core::{Access, Reader};
-use support::{Computer, Key, KeyKind, World, Zone, PASSPHRASE};
+use support::{Fleet, Key, KeyKind, World, PASSPHRASE};
 
 fn unlock(key: &Key) -> Arc<Identity> {
     Identity::unlock(key.secret.clone(), PASSPHRASE.into()).unwrap()
 }
 
-/// A member's view of a directory that pass.py made: `me` is the device, `owner` the computer.
-fn open(world: &World, store: &Path, me: &Key, owner: &Key) -> Arc<PassStore> {
-    let mut config = world.member_config("unused", "phone", &me.public, vec![owner.peer("pc", true)]);
+/// A device's view of a directory that pass.py made: `me` is the device (`phone`), `other` another one (`pc`).
+fn open(world: &World, store: &Path, me: &Key, other: &Key) -> Arc<PassStore> {
+    let mut config = world.config("unused", "phone", &me.public, vec![other.peer("pc")]);
     config.directory = store.to_string_lossy().into_owned();
     PassStore::open(config).unwrap()
 }
@@ -56,13 +57,19 @@ fn reads_a_store_made_by_gpg_and_pass() {
             ["Email/work", "bank", "bare", "web/generated", "web/été à la plage"]
         );
         assert_eq!(phone.search("WEB gen".into()).unwrap(), ["web/generated"]);
+        let ids = |folder: &str| -> Vec<String> {
+            let access = phone.folder_access(folder.into()).unwrap();
+            access.readers.into_iter().map(|reader| reader.id).collect()
+        };
+        assert_eq!(ids("web/new"), std::slice::from_ref(&key.fingerprint));
+        let root = phone.folder_readers("/".into()).unwrap().unwrap();
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].device.as_deref(), Some("phone"));
         assert_eq!(
-            phone.recipients("web/new".into()).unwrap(),
-            std::slice::from_ref(&key.fingerprint)
+            phone.folder_readers("web".into()).unwrap(),
+            None,
+            "it has those of the folder above"
         );
-        let files = phone.recipient_files().unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!((files[0].path.as_str(), files[0].unknown.len()), (".gpg-id", 0));
 
         let identity = unlock(&key);
         let bank = phone.show("bank".into(), identity.clone()).unwrap();
@@ -277,10 +284,14 @@ fn each_directory_has_its_recipients() {
 
     let identity = unlock(&alice);
     let phone = open(&world, &store, &alice, &pc);
-    assert_eq!(
-        phone.recipients("team/deep/er".into()).unwrap(),
-        [alice.fingerprint.clone(), "pc@example.org".to_string()]
-    );
+    let ids: Vec<String> = phone
+        .folder_access("team/deep/er".into())
+        .unwrap()
+        .readers
+        .into_iter()
+        .map(|reader| reader.id)
+        .collect();
+    assert_eq!(ids, [alice.fingerprint.clone(), "pc@example.org".to_string()]);
 
     // Who can read what, folder by folder: the root is the phone's alone, `team` is shared.
     let devices = |access: &Access| access.readers.iter().map(|r| r.device.clone()).collect::<Vec<_>>();
@@ -289,7 +300,7 @@ fn each_directory_has_its_recipients() {
         (root.gpg_id.as_str(), devices(&root)),
         (".gpg-id", vec![Some("phone".to_string())])
     );
-    assert!(root.listed && root.readable && root.matches && root.encrypted_to.is_empty());
+    assert!(root.listed && root.readable && !root.stale && root.encrypted_to.is_empty());
     let team = phone.folder_access("team/deep".into()).unwrap();
     assert_eq!(team.gpg_id, "team/.gpg-id");
     assert_eq!(devices(&team), [Some("phone".to_string()), Some("pc".to_string())]);
@@ -299,10 +310,10 @@ fn each_directory_has_its_recipients() {
     );
     let wifi = phone.entry_access("team/wifi".into()).unwrap();
     assert_eq!(wifi.encrypted_to, ["pc", "phone"]);
-    assert!(wifi.readable && wifi.matches && wifi.listed);
+    assert!(wifi.readable && !wifi.stale && wifi.listed);
     let bank = phone.entry_access("bank".into()).unwrap();
     assert_eq!(
-        (bank.encrypted_to.clone(), bank.readable, bank.matches),
+        (bank.encrypted_to.clone(), bank.readable, !bank.stale),
         (vec!["phone".to_string()], true, true)
     );
     assert!(phone.unreadable().unwrap().is_empty());
@@ -310,7 +321,7 @@ fn each_directory_has_its_recipients() {
     let other = open(&world, &store, &pc, &alice);
     assert_eq!(other.unreadable().unwrap(), ["Email/work", "bank"]);
     let bank = other.entry_access("bank".into()).unwrap();
-    assert!(!bank.readable && !bank.listed && bank.matches);
+    assert!(!bank.readable && !bank.listed && !bank.stale);
     assert!(other.entry_access("team/wifi".into()).unwrap().readable);
     assert!(matches!(
         other.entry_access("nope".into()),
@@ -320,7 +331,7 @@ fn each_directory_has_its_recipients() {
     std::fs::write(store.join("team/.gpg-id"), format!("{}\n", alice.fingerprint)).unwrap();
     let stale = phone.entry_access("team/wifi".into()).unwrap();
     assert_eq!(
-        (devices(&stale), stale.matches),
+        (devices(&stale), !stale.stale),
         (vec![Some("phone".to_string())], false)
     );
     assert_eq!(
@@ -371,10 +382,6 @@ fn each_directory_has_its_recipients() {
         &["init", "-p", "family", &alice.fingerprint, &carol.fingerprint],
         None,
     );
-    assert_eq!(
-        phone.recipient_files().unwrap()[1].unknown,
-        std::slice::from_ref(&carol.fingerprint)
-    );
     let family = phone.folder_access("family".into()).unwrap();
     assert_eq!(
         devices(&family),
@@ -384,7 +391,7 @@ fn each_directory_has_its_recipients() {
     assert_eq!(
         phone.insert("family/x".into(), "x".into(), false, identity.clone()),
         Err(PassError::UnknownRecipient {
-            id: carol.fingerprint.clone()
+            id: format!("family/.gpg-id: {}", carol.fingerprint)
         })
     );
     assert!(!store.join("family/x.gpg").exists());
@@ -444,23 +451,24 @@ fn keys_and_passphrases() {
         Err(PassError::InvalidKey { .. })
     ));
 
-    // What the configuration refuses: a key that is not the one with the fingerprint, no owner, two owners.
-    let config = |peers| world.member_config("unused", "phone", &alice.public, peers);
-    let mut wrong_key = pc.peer("pc", true);
+    // What the configuration refuses: a key that is not the one with the fingerprint, a name
+    // used twice or that is no device name, the same key under two names.
+    let config = |peers| world.config("unused", "phone", &alice.public, peers);
+    let mut wrong_key = pc.peer("pc");
     wrong_key.public_key = alice.public.clone();
     for bad in [
         vec![wrong_key],
-        vec![],
-        vec![pc.peer("pc", false)],
-        vec![pc.peer("pc", true), alice.peer("laptop", true)],
-        vec![pc.peer("phone", true)],
-        vec![pc.peer("My PC", true)],
+        vec![pc.peer("phone")],
+        vec![pc.peer("My PC")],
+        vec![pc.peer("pc"), pc.peer("laptop")],
+        vec![alice.peer("pc")],
     ] {
         assert!(matches!(
             PassStore::open(config(bad)),
             Err(PassError::InvalidConfig { .. })
         ));
     }
+    assert!(PassStore::open(config(vec![])).is_ok(), "a device alone is a device");
 }
 
 /// A key made on the phone: gpg takes its public half, encrypts to it and verifies what it signs.
@@ -513,7 +521,7 @@ fn a_key_made_on_the_phone_is_one_gpg_knows_how_to_use() {
         Some(b"for the phone\n"),
     );
     let pc = world.make_key(KeyKind::Curve25519, "pc@example.org");
-    let mut config = world.member_config("unused", "phone", &made.public_key, vec![pc.peer("pc", true)]);
+    let mut config = world.config("unused", "phone", &made.public_key, vec![pc.peer("pc")]);
     config.directory = store.to_string_lossy().into_owned();
     let phone = PassStore::open(config).unwrap();
     assert_eq!(phone.content("from-gpg".into(), identity).unwrap(), "for the phone\n");
@@ -521,1037 +529,1179 @@ fn a_key_made_on_the_phone_is_one_gpg_knows_how_to_use() {
 
 // MARK: the sync, through a real drop zone
 
-/// A computer and a phone that have been introduced to each other, and a drop zone between them.
-struct Scene {
-    world: World,
-    zone: Zone,
-    /// The computer's OpenPGP key, made by gpg.
-    pc: Key,
-    /// The phone's, made on the phone.
-    phone_key: GeneratedKey,
-    phone_ssh: DeviceKey,
+fn no_choice(device: &str, other: &str, name: &str) -> Side {
+    panic!("{device} needs a choice for {name} to take from {other}: none was expected")
 }
 
-impl Scene {
-    fn new() -> (Self, support::SshKey) {
-        let world = World::new();
-        let pc = world.make_key(KeyKind::Curve25519, "pc@example.org");
-        let phone_key = generate_openpgp_key("phone".into(), PASSPHRASE.into()).unwrap();
-        world.import_key(&phone_key.public_key, &phone_key.fingerprint);
-        let phone_ssh = generate_device_key("phone".into()).unwrap();
-        let pc_ssh = world.ssh_key("pc");
-        let zone = world.zone(&[&pc_ssh.public, &phone_ssh.public_key]);
-        (
-            Self {
-                world,
-                zone,
-                pc,
-                phone_key,
-                phone_ssh,
-            },
-            pc_ssh,
-        )
-    }
-
-    /// The computer: a store made by pass.py that both devices can read.
-    fn computer(&self, ssh: support::SshKey) -> Computer<'_> {
-        let store = self.world.path("computer-store");
-        self.world.pass(
-            &store,
-            &["init", &self.pc.fingerprint, &self.phone_key.fingerprint],
-            None,
-        );
-        self.world.pass(&store, &["git", "init"], None);
-        self.world
-            .pass(&store, &["insert", "-m", "bank"], Some(b"hunter2\nlogin: alice\n"));
-        self.world
-            .pass(&store, &["insert", "-m", "Email/work"], Some(b"s3cret\n"));
-        self.world
-            .pass(&store, &["insert", "-m", "wifi"], Some(b"home-network\n"));
-        Computer {
-            world: &self.world,
-            zone: &self.zone,
-            store,
-            name: "pc".into(),
-            key: self.pc.clone(),
-            ssh,
-            devices: vec![self.pc.fingerprint.clone(), self.phone_key.fingerprint.clone()],
-        }
-    }
-
-    fn phone_in(&self, directory: &str) -> Phone<'_> {
-        let config = self.world.member_config(
-            directory,
-            "phone",
-            &self.phone_key.public_key,
-            vec![self.pc.peer("pc", true)],
-        );
-        Phone {
-            scene: self,
-            directory: self.world.path(directory),
-            store: PassStore::open(config).unwrap(),
-            identity: Identity::unlock(self.phone_key.secret_key.clone(), PASSPHRASE.into()).unwrap(),
-        }
-    }
-
-    fn phone(&self) -> Phone<'_> {
-        self.phone_in("phone-store")
+fn content(version: EntryVersion) -> String {
+    match version {
+        EntryVersion::Content { text } => text,
+        EntryVersion::Absent => "(absent)".into(),
+        EntryVersion::Unreadable { .. } => "(unreadable)".into(),
     }
 }
 
-struct Phone<'a> {
-    scene: &'a Scene,
-    directory: std::path::PathBuf,
-    store: Arc<PassStore>,
-    identity: Arc<Identity>,
-}
-
-impl Phone<'_> {
-    fn sync(&self) -> SyncReport {
-        self.store
-            .sync(
-                self.scene.zone.for_device(&self.scene.phone_ssh.private_key),
-                self.identity.clone(),
-            )
-            .unwrap()
-    }
-
-    /// Syncs, and returns the update that came, which there must be.
-    fn receive(&self) -> PendingUpdate {
-        match self.sync().fetch {
-            FetchOutcome::Received { update: Some(update) } => update,
-            other => panic!("expected an update, got {other:?}"),
-        }
-    }
-
-    /// Syncs, expecting the owner's file to be refused, and returns why. Nothing must have changed.
-    fn refused(&self) -> String {
-        let before = (self.store.list().unwrap(), self.store.pending_update().unwrap());
-        let reason = match self.sync().fetch {
-            FetchOutcome::Refused { reason } => reason,
-            other => panic!("expected a refusal, got {other:?}"),
-        };
-        assert_eq!(
-            (self.store.list().unwrap(), self.store.pending_update().unwrap()),
-            before
-        );
-        reason
-    }
-
-    fn accept(&self, update: &PendingUpdate, choices: &[(&str, Side)]) -> Result<Vec<String>, PassError> {
-        let choices = choices
-            .iter()
-            .map(|(name, keep)| Choice {
-                name: name.to_string(),
-                keep: *keep,
-            })
-            .collect();
-        self.store
-            .accept_update(update.commit.clone(), choices, self.identity.clone())
-    }
-
-    /// Receives the owner's first file and takes it: a phone that is set up.
-    fn set_up(&self) {
-        let update = self.receive();
-        self.accept(&update, &[]).unwrap();
-        self.sync();
-    }
-
-    fn insert(&self, name: &str, content: &str) {
-        self.store
-            .insert(name.into(), content.into(), false, self.identity.clone())
-            .unwrap();
-    }
-
-    fn edit(&self, name: &str, content: &str) {
-        assert!(self
-            .store
-            .edit(name.into(), content.into(), self.identity.clone())
-            .unwrap());
-    }
-
-    fn password(&self, name: &str) -> String {
-        self.store.show(name.into(), self.identity.clone()).unwrap().password
-    }
-
-    fn text(&self, version: EntryVersion) -> String {
-        match version {
-            EntryVersion::Content { text } => text,
-            EntryVersion::Absent => "(absent)".into(),
-            EntryVersion::Unreadable { .. } => "(unreadable)".into(),
-        }
-    }
-
-    /// git's own opinion of the phone's repository: sound, and the directory is what the last commit says.
-    fn check_repository(&self) {
-        let world = &self.scene.world;
-        world.git(&self.directory, &["fsck", "--strict", "--no-dangling"]);
-        assert_eq!(world.git(&self.directory, &["status", "--porcelain"]), "");
-    }
-}
-
-fn kinds(update: &PendingUpdate) -> Vec<(String, ChangeKind)> {
-    update
-        .entries
-        .iter()
-        .map(|entry| (entry.name.clone(), entry.kind.clone()))
-        .collect()
-}
-
+/// Scenarios 01, 02, 03: adopting a store, moving forward both ways, then a merge of two additions.
 #[test]
-#[ignore = "needs root, OpenSSH, gpg, git and pass.py"]
-fn first_setup_then_changes_go_both_ways() {
-    let (scene, pc_ssh) = Scene::new();
-    let computer = scene.computer(pc_ssh);
-    let phone = scene.phone();
-    let world = &scene.world;
+#[ignore = "needs root, OpenSSH, gpg and git"]
+fn a_store_is_adopted_then_changes_go_both_ways() {
+    let fleet = Fleet::new(&["a", "b"]);
+    let (a, b) = (fleet.device("a"), fleet.device("b"));
+    let world = &fleet.world;
+    // Nobody has a store: nothing is published, and that is no error.
+    assert_eq!(a.sync(), ["b: nothing published"]);
+    assert_eq!(std::fs::read_dir(fleet.zone.files()).unwrap().count(), 0);
 
-    // Nothing published yet: nothing to take, and nothing of the phone to publish.
-    let report = phone.sync();
-    assert_eq!(
-        (report.published, report.fetch),
-        (false, FetchOutcome::NothingPublished)
-    );
-    assert!(!report.state.has_store);
+    a.store
+        .create(vec!["a".into(), "b".into()], a.identity.clone())
+        .unwrap();
+    a.insert("one", "first");
+    assert_eq!(a.sync(), ["b: nothing published"]);
 
-    // The owner publishes, as gpg does by default (compressed). The phone receives, and takes nothing.
-    computer.publish(&[]);
-    let update = phone.receive();
-    assert_eq!(update.commit, world.git(&computer.store, &["rev-parse", "HEAD"]));
-    assert_eq!(update.outstanding, 0);
-    assert_eq!(update.commit_count as usize, world.log(&computer.store, "HEAD").len());
-    assert_eq!(update.commits[0].subject, "Add given password for wifi to store.");
-    assert_eq!(update.commits[0].author, "Computer <computer@example.org>");
-    assert_eq!(update.commits[0].signature, SignatureStatus::Unsigned);
+    // 01. b receives, and takes nothing by itself.
+    assert_eq!(b.sync(), ["a: 2 to take"]);
+    let update = b.store.pending_update("a".into(), b.identity.clone()).unwrap().unwrap();
+    assert_eq!((update.device.as_str(), update.kind), ("a", TakeKind::Adopt));
+    assert_eq!(update.commit, world.git(&a.dir, &["rev-parse", "HEAD"]));
+    assert_eq!(update.commit_count, 2);
+    assert_eq!(update.commits[0].subject, "Add given password for one to store.");
+    assert_eq!(update.commits[0].author, "a <a@pass-sync.invalid>");
     assert_eq!(
-        kinds(&update),
-        [
-            ("Email/work", ChangeKind::Added),
-            ("bank", ChangeKind::Added),
-            ("wifi", ChangeKind::Added)
-        ]
-        .map(|(name, kind)| (name.to_string(), kind))
+        update.commits[0].signature,
+        SignatureStatus::Valid { device: "a".into() }
     );
-    assert_eq!(update.entries[0].readers_after, ["pc", "phone"]);
-    assert!(update.entries.iter().all(|entry| !entry.conflict));
-    assert_eq!(update.recipient_changes.len(), 1);
-    assert_eq!(update.recipient_changes[0].path, ".gpg-id");
-    assert!(update.recipient_changes[0].before.is_empty());
     assert_eq!(
-        update.recipient_changes[0].after,
+        update.lines,
         [
-            Reader {
-                id: scene.pc.fingerprint.clone(),
-                device: Some("pc".into())
+            ReviewLine::Added { name: "one".into() },
+            ReviewLine::Readers {
+                folder: "/".into(),
+                devices: vec!["a".into(), "b".into()],
+                inherited: false
             },
-            Reader {
-                id: scene.phone_key.fingerprint.clone(),
-                device: Some("phone".into())
-            }
         ]
     );
-    assert_eq!(update.other_files, [".gitattributes"]);
+    assert_eq!(update.reencrypts, 0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    assert!(
-        (now - update.published_at).abs() < 300,
-        "the time of the owner's signature"
-    );
-    assert!(
-        phone.store.list().unwrap().is_empty(),
-        "nothing is applied before it is accepted"
-    );
-    assert!(!phone.store.sync_state().unwrap().has_store);
-    assert!(phone.store.sync_state().unwrap().update_waiting);
+    assert!((now - update.published_at).abs() < 300, "the time a signed its file");
+    assert!(b.ls().is_empty(), "nothing is applied before it is taken");
+    assert!(!b.store.sync_state().unwrap().has_store);
     // What it would bring can be read first.
-    let versions = phone
+    let versions = b
         .store
-        .update_versions("bank".into(), phone.identity.clone())
+        .update_versions("a".into(), "one".into(), b.identity.clone())
         .unwrap();
     assert_eq!(
-        (versions.before, versions.mine),
+        (versions.base, versions.mine),
         (EntryVersion::Absent, EntryVersion::Absent)
     );
-    assert_eq!(phone.text(versions.theirs), "hunter2\nlogin: alice\n");
-    // The same file again changes nothing; the update is still there after a restart of the app.
-    assert_eq!(phone.sync().fetch, FetchOutcome::Unchanged);
-    assert_eq!(scene.phone().store.pending_update().unwrap(), Some(update.clone()));
-
-    // Accepted: the store is the owner's.
-    assert!(matches!(
-        phone
-            .store
-            .accept_update("0".repeat(40), vec![], phone.identity.clone()),
+    assert_eq!(content(versions.theirs), "first\n");
+    // Only the update that was shown is taken.
+    assert_eq!(
+        b.store
+            .take_update("a".into(), Some("0".repeat(40)), vec![], b.identity.clone()),
         Err(PassError::StaleUpdate)
-    ));
-    assert_eq!(phone.accept(&update, &[]).unwrap(), ["Email/work", "bank", "wifi"]);
-    assert_eq!(phone.store.list().unwrap(), ["Email/work", "bank", "wifi"]);
-    assert_eq!(phone.password("bank"), "hunter2");
-    assert_eq!(phone.store.pending_update().unwrap(), None);
-    assert_eq!(world.log(&phone.directory, "HEAD"), world.log(&computer.store, "HEAD"));
-    phone.check_repository();
-    let state = phone.store.sync_state().unwrap();
-    assert!(state.has_store && state.unpublished && !state.update_waiting);
-    assert_eq!(state.outstanding, 0);
-
-    // "After any accepted update, it publishes its tip": what the computer finds is the owner's own tip.
-    let report = phone.sync();
-    assert_eq!((report.published, report.fetch), (true, FetchOutcome::Unchanged));
-    assert_eq!(
-        computer.fetch("phone", &scene.phone_key.fingerprint).unwrap(),
-        update.commit
     );
-    assert!(!phone.sync().published, "nothing new: nothing sent");
-
-    // The phone changes the store, and publishes.
-    phone.insert("phone/first", "from-phone\nlogin: me");
-    phone.edit("bank", "hunter3\nlogin: alice\n");
-    phone.store.remove("wifi".into(), phone.identity.clone()).unwrap();
-    assert_eq!(phone.store.sync_state().unwrap().outstanding, 3);
-    assert!(phone.sync().published);
-    phone.check_repository();
-
-    // The computer: what the phone published passes gpg (signature) and `git bundle verify`, holds
-    // the one reference, and its commits are signed by the phone and touch only entries.
-    let tip = computer.fetch("phone", &scene.phone_key.fingerprint).unwrap();
-    assert_eq!(tip, world.git(&phone.directory, &["rev-parse", "HEAD"]));
-    assert_eq!(
-        world.log(&computer.store, "HEAD..refs/pass-sync/phone"),
-        [
-            "Remove wifi from store.",
-            "Edit password for bank using pass-ios.",
-            "Add given password for phone/first to store.",
-        ]
-    );
-    assert_eq!(
-        world.git(
-            &computer.store,
-            &["log", "-1", "--format=%an <%ae>", "refs/pass-sync/phone"]
-        ),
-        "phone <phone@pass-sync.invalid>"
-    );
-    // The review, decrypted by pass's own diff driver.
-    let review = world.git(
-        &computer.store,
-        &[
-            "log",
-            "-p",
-            "--format=%s",
-            "HEAD..refs/pass-sync/phone",
-            "--",
-            "bank.gpg",
-        ],
-    );
-    assert!(review.contains("-hunter2") && review.contains("+hunter3"), "{review}");
-    computer.merge("phone", &scene.phone_key.fingerprint).unwrap();
-    assert_eq!(
-        world.pass(&computer.store, &["show", "phone/first"], None),
-        "from-phone\nlogin: me\n\n"
-    );
-    assert_eq!(
-        world.pass(&computer.store, &["show", "bank"], None),
-        "hunter3\nlogin: alice\n\n"
-    );
-    assert!(!computer.store.join("wifi.gpg").exists());
-
-    // The owner has republished the phone's own tip: received, nothing to take, nothing outstanding.
-    let report = phone.sync();
-    assert_eq!(report.fetch, FetchOutcome::Received { update: None });
-    assert_eq!((report.state.outstanding, report.state.unpublished), (0, false));
-
-    // And the owner goes on: the phone moves forward when the user says so.
-    world.pass(&computer.store, &["insert", "-m", "later"], Some(b"x\n"));
-    world.pass(&computer.store, &["mv", "bank", "money/bank"], None);
-    computer.publish(&["--compress-algo", "none"]);
-    let update = phone.receive();
-    assert_eq!(
-        kinds(&update),
-        [
-            ("later".to_string(), ChangeKind::Added),
-            ("money/bank".to_string(), ChangeKind::Renamed { from: "bank".into() }),
-        ]
-    );
-    assert!(update.recipient_changes.is_empty() && update.other_files.is_empty());
-    assert_eq!(phone.password("bank"), "hunter3", "not before it is accepted");
-    assert_eq!(phone.accept(&update, &[]).unwrap(), ["bank", "later", "money/bank"]);
-    assert_eq!(
-        phone.store.list().unwrap(),
-        ["Email/work", "later", "money/bank", "phone/first"]
-    );
-    assert_eq!(world.log(&phone.directory, "HEAD"), world.log(&computer.store, "HEAD"));
-    phone.check_repository();
-}
-
-#[test]
-#[ignore = "needs root, OpenSSH, gpg, git and pass.py"]
-fn different_entries_changed_on_both_sides_merge_by_themselves() {
-    let (scene, pc_ssh) = Scene::new();
-    let computer = scene.computer(pc_ssh);
-    let phone = scene.phone();
-    let world = &scene.world;
-    computer.publish(&[]);
-    phone.set_up();
-
-    phone.insert("phone/new", "from-phone");
-    phone.edit("bank", "changed-on-phone\n");
-    world.pass(&computer.store, &["insert", "-m", "pc/new"], Some(b"from-pc\n"));
-    world.pass(
-        &computer.store,
-        &["insert", "-m", "-f", "wifi"],
-        Some(b"changed-on-pc\n"),
-    );
-    world.pass(&computer.store, &["rm", "-f", "Email/work"], None);
-    // The same change made on both sides is no conflict either.
-    phone.insert("agreed", "same");
-    let same = world.path("phone-store/agreed.gpg");
-    std::fs::copy(&same, computer.store.join("agreed.gpg")).unwrap();
-    world.git(&computer.store, &["add", "agreed.gpg"]);
-    world.git(
-        &computer.store,
-        &["commit", "--quiet", "-m", "Add given password for agreed to store."],
-    );
-
-    // The computer cannot take the phone's commits yet: not a fast-forward. It publishes instead.
-    assert!(phone.sync().published);
-    computer.fetch("phone", &scene.phone_key.fingerprint).unwrap();
-    let refused = computer.merge("phone", &scene.phone_key.fingerprint).unwrap_err();
-    assert!(refused.contains("not a fast-forward"), "{refused}");
-    computer.publish(&["--compress-algo", "none"]);
-
-    let update = phone.receive();
-    assert_eq!(update.outstanding, 3);
-    assert_eq!(
-        kinds(&update),
-        [
-            ("Email/work".to_string(), ChangeKind::Removed),
-            ("agreed".to_string(), ChangeKind::Added),
-            ("pc/new".to_string(), ChangeKind::Added),
-            ("wifi".to_string(), ChangeKind::Changed),
-        ]
-    );
-    assert!(update.entries.iter().all(|entry| !entry.conflict));
-    let wifi = phone
+    let taken = b
         .store
-        .update_versions("wifi".into(), phone.identity.clone())
+        .take_update("a".into(), Some(update.commit.clone()), vec![], b.identity.clone())
         .unwrap();
-    assert_eq!(phone.text(wifi.before), "home-network\n");
-    assert_eq!(phone.text(wifi.mine), "home-network\n");
-    assert_eq!(phone.text(wifi.theirs), "changed-on-pc\n");
-    assert_eq!(phone.password("wifi"), "home-network", "not before it is accepted");
+    assert_eq!((taken.kind, taken.changed), (TakeKind::Adopt, vec!["one".to_string()]));
+    assert_eq!(b.show("one").unwrap(), "first");
+    assert_eq!(world.log(&b.dir, "HEAD"), world.log(&a.dir, "HEAD"));
+    assert_eq!(b.sync(), ["a: nothing to take"]);
+    // One file per device in the drop zone, and nothing half-written.
+    let mut files: Vec<String> = std::fs::read_dir(fleet.zone.files())
+        .unwrap()
+        .map(|file| file.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["a.bundle.gpg", "b.bundle.gpg"]);
 
-    // Accepted, with nothing to choose: a merge commit, signed, on the phone's line.
-    assert_eq!(phone.accept(&update, &[]).unwrap(), ["Email/work", "pc/new", "wifi"]);
-    assert_eq!(
-        phone.store.list().unwrap(),
-        ["agreed", "bank", "pc/new", "phone/new", "wifi"]
-    );
-    assert_eq!(phone.password("bank"), "changed-on-phone");
-    assert_eq!(phone.password("wifi"), "changed-on-pc");
-    assert_eq!(phone.password("pc/new"), "from-pc");
-    phone.check_repository();
-    let merge = world.git(&phone.directory, &["log", "-1", "--format=%s|%P|%G?"]);
+    // 02. One adds, the other takes; and back: moving forward, no merge.
+    a.insert("two", "from-a");
+    a.sync();
+    assert_eq!(b.stands_with("a"), "1 to take");
+    assert_eq!(b.pending("a"), ["added two"]);
+    assert_eq!(b.take("a", &[], &[]).kind, TakeKind::Forward);
+    b.insert("three", "from-b");
+    b.sync();
+    assert_eq!(a.stands_with("b"), "1 to take");
+    assert_eq!(a.take("b", &[], &[]).kind, TakeKind::Forward);
+    assert_eq!(world.git(&a.dir, &["rev-list", "--merges", "--count", "HEAD"]), "0");
+
+    // 03. Each adds a different entry: a merge on the first to take, signed, its parents mine then theirs.
+    a.insert("a-only", "A");
+    b.insert("b-only", "B");
+    a.sync();
+    b.sync();
+    let mine_before = world.git(&a.dir, &["rev-parse", "HEAD"]);
+    assert_eq!(a.stands_with("b"), "1 to take");
+    assert_eq!(a.pending("b"), ["added b-only"]);
+    assert_eq!(a.take("b", &[], &[]).kind, TakeKind::Merge);
+    world.import_key(&a.key.public_key, &a.key.fingerprint);
+    let merge = world.git(&a.dir, &["log", "-1", "--format=%s|%P|%G?"]);
     let parts: Vec<&str> = merge.split('|').collect();
-    assert_eq!(parts[0], "Merge the changes of pc into those of phone.");
-    assert_eq!(parts[1].split(' ').count(), 2, "two parents");
-    assert_eq!(parts[1].split(' ').nth(1), Some(update.commit.as_str()));
-    assert_eq!(phone.store.sync_state().unwrap().outstanding, 4);
-    assert_eq!(phone.store.pending_update().unwrap(), None);
-
-    // Published: now it is a fast-forward for the computer, which takes it and republishes.
-    assert!(phone.sync().published);
-    computer.fetch("phone", &scene.phone_key.fingerprint).unwrap();
-    computer.merge("phone", &scene.phone_key.fingerprint).unwrap();
+    assert_eq!(parts[0], "Merge the changes of b into those of a.");
     assert_eq!(
-        world.pass(&computer.store, &["show", "phone/new"], None),
-        "from-phone\n\n"
+        parts[1],
+        format!("{mine_before} {}", world.git(&b.dir, &["rev-parse", "HEAD"]))
     );
-    assert_eq!(
-        world.pass(&computer.store, &["show", "bank"], None),
-        "changed-on-phone\n\n"
-    );
-    assert_eq!(
-        world.pass(&computer.store, &["show", "wifi"], None),
-        "changed-on-pc\n\n"
-    );
-    let report = phone.sync();
-    assert_eq!(report.fetch, FetchOutcome::Received { update: None });
-    assert_eq!(report.state.outstanding, 0);
-    assert_eq!(world.log(&phone.directory, "HEAD"), world.log(&computer.store, "HEAD"));
+    assert_eq!(parts[2], "G", "signed like its other commits");
+    // The other one then only has to move forward onto it.
+    assert_eq!(b.stands_with("a"), "2 to take");
+    assert_eq!(b.take("a", &[], &[]).kind, TakeKind::Forward);
+    fleet.settle(&no_choice);
+    fleet.check(&[
+        ("one", "first"),
+        ("two", "from-a"),
+        ("three", "from-b"),
+        ("a-only", "A"),
+        ("b-only", "B"),
+    ]);
 }
 
+/// Scenarios 04, 05, 06, 09, 11, 12: what both sides did differently is a choice, mine or theirs, whole.
 #[test]
-#[ignore = "needs root, OpenSSH, gpg, git and pass.py"]
-fn the_same_entry_changed_on_both_sides_needs_a_choice() {
-    for keep in [Side::Mine, Side::Theirs] {
-        let (scene, pc_ssh) = Scene::new();
-        let computer = scene.computer(pc_ssh);
-        let phone = scene.phone();
-        let world = &scene.world;
-        computer.publish(&[]);
-        phone.set_up();
-
-        // Changed on both; changed here and removed there; removed here and changed there.
-        phone.edit("bank", "phone-version\n");
-        world.pass(&computer.store, &["insert", "-m", "-f", "bank"], Some(b"pc-version\n"));
-        phone.edit("wifi", "phone-wifi\n");
-        world.pass(&computer.store, &["rm", "-f", "wifi"], None);
-        phone.store.remove("Email/work".into(), phone.identity.clone()).unwrap();
-        world.pass(
-            &computer.store,
-            &["insert", "-m", "-f", "Email/work"],
-            Some(b"pc-work\n"),
-        );
-        // And one that only the phone touched: no choice there.
-        phone.insert("untouched", "mine");
-        computer.publish(&[]);
-
-        let update = phone.receive();
-        let conflicts: Vec<&str> = update
-            .entries
-            .iter()
-            .filter(|entry| entry.conflict)
-            .map(|entry| entry.name.as_str())
-            .collect();
-        assert_eq!(conflicts, ["Email/work", "bank", "wifi"]);
-        // Both versions can be seen before choosing.
-        let bank = phone
-            .store
-            .update_versions("bank".into(), phone.identity.clone())
-            .unwrap();
-        assert_eq!(phone.text(bank.before), "hunter2\nlogin: alice\n");
-        assert_eq!(phone.text(bank.mine), "phone-version\n");
-        assert_eq!(phone.text(bank.theirs), "pc-version\n");
-        let wifi = phone
-            .store
-            .update_versions("wifi".into(), phone.identity.clone())
-            .unwrap();
-        assert_eq!(
-            (phone.text(wifi.mine), wifi.theirs),
-            ("phone-wifi\n".to_string(), EntryVersion::Absent)
-        );
-        let work = phone
-            .store
-            .update_versions("Email/work".into(), phone.identity.clone())
-            .unwrap();
-        assert_eq!(
-            (work.mine, phone.text(work.theirs)),
-            (EntryVersion::Absent, "pc-work\n".to_string())
-        );
-
-        // No choice, or not all of them: refused, by name, and nothing moves.
-        assert_eq!(
-            phone.accept(&update, &[]),
-            Err(PassError::ChoiceRequired {
-                names: vec!["Email/work".into(), "bank".into(), "wifi".into()]
-            })
-        );
-        assert_eq!(
-            phone.accept(&update, &[("bank", keep)]),
-            Err(PassError::ChoiceRequired {
-                names: vec!["Email/work".into(), "wifi".into()]
-            })
-        );
-        assert_eq!(phone.password("bank"), "phone-version");
-        assert_eq!(phone.store.pending_update().unwrap(), Some(update.clone()));
-
-        phone
-            .accept(&update, &[("bank", keep), ("wifi", keep), ("Email/work", keep)])
-            .unwrap();
-        match keep {
-            Side::Mine => {
-                assert_eq!(phone.store.list().unwrap(), ["bank", "untouched", "wifi"]);
-                assert_eq!(phone.password("bank"), "phone-version");
-                assert_eq!(phone.password("wifi"), "phone-wifi");
+#[ignore = "needs root, OpenSSH, gpg and git"]
+fn what_both_changed_differently_needs_a_choice() {
+    use support::Device;
+    struct Case {
+        what: &'static str,
+        act: fn(&Device, &Device),
+        /// What a is shown of b's update.
+        shown: &'static [&'static str],
+        choice: &'static str,
+        mine: &'static [(&'static str, &'static str)],
+        theirs: &'static [(&'static str, &'static str)],
+    }
+    let cases = [
+        Case {
+            what: "04, 05: two contents",
+            act: |a, b| {
+                a.insert("seed", "A");
+                b.insert("seed", "B");
+            },
+            shown: &["changed seed", "conflict seed"],
+            choice: "seed",
+            mine: &[("seed", "A")],
+            theirs: &[("seed", "B")],
+        },
+        Case {
+            what: "06: removed here, changed there",
+            act: |a, b| {
+                a.rm("seed");
+                b.insert("seed", "B");
+            },
+            shown: &["changed seed", "conflict seed"],
+            choice: "seed",
+            mine: &[],
+            theirs: &[("seed", "B")],
+        },
+        Case {
+            what: "06: changed here, removed there",
+            act: |a, b| {
+                a.insert("seed", "A");
+                b.rm("seed");
+            },
+            shown: &["conflict seed", "removed seed"],
+            choice: "seed",
+            mine: &[("seed", "A")],
+            theirs: &[],
+        },
+        Case {
+            what: "09: two names",
+            act: |a, b| {
+                a.mv("seed", "pa");
+                b.mv("seed", "pb");
+            },
+            shown: &["conflict pa", "moved seed -> pb"],
+            choice: "pa",
+            mine: &[("pa", "s")],
+            theirs: &[("pb", "s")],
+        },
+        Case {
+            what: "11: two new entries of one name",
+            act: |a, b| {
+                a.insert("new", "A");
+                b.insert("new", "B");
+            },
+            shown: &["added new", "conflict new"],
+            choice: "new",
+            mine: &[("seed", "s"), ("new", "A")],
+            theirs: &[("seed", "s"), ("new", "B")],
+        },
+        Case {
+            what: "12: moved onto a name the other side added",
+            act: |a, b| {
+                a.mv("seed", "y");
+                b.insert("y", "B");
+            },
+            shown: &["added y", "conflict y"],
+            choice: "y",
+            mine: &[("y", "s")],
+            // Their state of both entries involved: the seed back where they have it, and their y.
+            theirs: &[("seed", "s"), ("y", "B")],
+        },
+    ];
+    for case in &cases {
+        for keep in [Side::Mine, Side::Theirs] {
+            let fleet = Fleet::started(&["a", "b"], None, &[("seed", "s")]);
+            let (a, b) = (fleet.device("a"), fleet.device("b"));
+            (case.act)(a, b);
+            a.sync();
+            b.sync();
+            assert_ne!(a.stands_with("b"), "nothing to take", "{}", case.what);
+            assert_eq!(a.pending("b"), case.shown, "{}", case.what);
+            // Both versions can be seen before choosing, each side followed through its moves.
+            let versions = a
+                .store
+                .update_versions("b".into(), case.choice.into(), a.identity.clone())
+                .unwrap();
+            let of = |name: &str, side: &[(&str, &str)]| {
+                side.iter()
+                    .find(|(entry, _)| *entry == name || case.what.starts_with("09"))
+                    .map(|(_, text)| format!("{text}\n"))
+                    .unwrap_or("(absent)".into())
+            };
+            if !case.what.starts_with("12") {
+                assert_eq!(content(versions.mine), of(case.choice, case.mine), "{}", case.what);
+                assert_eq!(content(versions.theirs), of(case.choice, case.theirs), "{}", case.what);
             }
-            Side::Theirs => {
-                assert_eq!(phone.store.list().unwrap(), ["Email/work", "bank", "untouched"]);
-                assert_eq!(phone.password("bank"), "pc-version");
-                assert_eq!(phone.password("Email/work"), "pc-work");
-            }
+            // Without the choice nothing is taken.
+            let before = (a.ls(), a.store.sync_state().unwrap());
+            assert_eq!(
+                a.try_take("b", &[], &[]),
+                Err(PassError::ChoiceRequired {
+                    names: vec![case.choice.to_string()]
+                }),
+                "{}",
+                case.what
+            );
+            assert_eq!((a.ls(), a.store.sync_state().unwrap()), before, "{}", case.what);
+            let (mine, theirs): (&[&str], &[&str]) = match keep {
+                Side::Mine => (&[case.choice], &[]),
+                Side::Theirs => (&[], &[case.choice]),
+            };
+            assert_eq!(a.take("b", mine, theirs).kind, TakeKind::Merge);
+            // And the choice is the same everywhere once the other has taken it back.
+            fleet.settle(&no_choice);
+            fleet.check(if keep == Side::Mine { case.mine } else { case.theirs });
         }
-        assert_eq!(phone.password("untouched"), "mine");
-        phone.check_repository();
-
-        // Either way the result is the phone's line with the owner's merged in: the computer can take it.
-        phone.sync();
-        computer.fetch("phone", &scene.phone_key.fingerprint).unwrap();
-        computer.merge("phone", &scene.phone_key.fingerprint).unwrap();
-        assert_eq!(
-            world.pass(&computer.store, &["show", "bank"], None),
-            if keep == Side::Mine {
-                "phone-version\n\n"
-            } else {
-                "pc-version\n\n"
-            }
-        );
-        assert_eq!(computer.store.join("wifi.gpg").exists(), keep == Side::Mine);
-        assert_eq!(computer.store.join("Email/work.gpg").exists(), keep == Side::Theirs);
-        assert_eq!(phone.sync().state.outstanding, 0);
     }
 }
 
+/// Scenarios 07, 08, 10: what the two sides did fits together, and nobody is asked anything.
 #[test]
-#[ignore = "needs root, OpenSSH, gpg, git and pass.py"]
-fn a_change_of_recipients_is_shown_before_it_is_taken() {
-    let (scene, pc_ssh) = Scene::new();
-    let computer = scene.computer(pc_ssh);
-    let phone = scene.phone();
-    let world = &scene.world;
-    computer.publish(&[]);
-    phone.set_up();
-    phone.insert("mine", "written before the change");
+#[ignore = "needs root, OpenSSH, gpg and git"]
+fn what_fits_together_needs_none() {
+    // 07. One moves an entry, the other changes its content: the new content under the new name.
+    let fleet = Fleet::started(&["a", "b"], None, &[("seed", "s")]);
+    let (a, b) = (fleet.device("a"), fleet.device("b"));
+    a.mv("seed", "moved");
+    b.insert("seed", "new");
+    a.sync();
+    b.sync();
+    assert_eq!(b.pending("a"), ["moved seed -> moved"]);
+    assert_eq!(a.stands_with("b"), "1 to take");
+    assert_eq!(a.pending("b"), ["changed seed"]);
+    fleet.settle(&no_choice);
+    fleet.check(&[("moved", "new")]);
 
-    // The owner gives someone else access to everything, and makes a directory the phone cannot read.
-    let carol = world.make_key(KeyKind::Curve25519, "carol@example.org");
-    let (pc, phone_fpr) = (&scene.pc.fingerprint, &scene.phone_key.fingerprint);
-    world.pass(&computer.store, &["init", pc, phone_fpr, &carol.fingerprint], None);
-    world.pass(&computer.store, &["init", "-p", "private", pc], None);
-    world.pass(
-        &computer.store,
-        &["insert", "-m", "private/diary"],
-        Some(b"not for the phone\n"),
-    );
-    world.pass(&computer.store, &["insert", "-m", ".extensions/note"], Some(b"x\n"));
-    std::fs::write(computer.store.join(".extensions/hook.bash"), "echo hi\n").unwrap();
-    world.git(&computer.store, &["add", ".extensions/hook.bash"]);
-    world.git(&computer.store, &["commit", "--quiet", "-m", "An extension."]);
-    computer.publish(&[]);
-
-    let update = phone.receive();
-    // Directory by directory...
-    let changes: Vec<(&str, usize, usize)> = update
-        .recipient_changes
-        .iter()
-        .map(|change| (change.path.as_str(), change.before.len(), change.after.len()))
-        .collect();
-    assert_eq!(changes, [(".gpg-id", 2, 3), ("private/.gpg-id", 0, 1)]);
-    // Before and after, by device name; and a key that is no device's is told as such.
-    let names = |readers: &[Reader]| readers.iter().map(|r| r.device.clone()).collect::<Vec<_>>();
-    assert_eq!(
-        names(&update.recipient_changes[0].before),
-        [Some("pc".to_string()), Some("phone".to_string())]
-    );
-    assert_eq!(
-        names(&update.recipient_changes[0].after),
-        [Some("pc".to_string()), Some("phone".to_string()), None]
-    );
-    assert_eq!(update.recipient_changes[0].after[2].id, carol.fingerprint);
-    assert_eq!(names(&update.recipient_changes[1].after), [Some("pc".to_string())]);
-    // ...and entry by entry: who could read it, who can now. A key that is no device's has no name.
-    let bank = update.entries.iter().find(|entry| entry.name == "bank").unwrap();
-    assert_eq!(bank.kind, ChangeKind::Changed);
-    assert_eq!(bank.readers_before, ["pc", "phone"]);
-    assert_eq!(bank.readers_after.len(), 3);
-    assert_eq!(&bank.readers_after[1..], ["pc", "phone"]);
-    assert!(bank.readers_after[0].starts_with("key "), "{:?}", bank.readers_after);
-    let diary = update
-        .entries
-        .iter()
-        .find(|entry| entry.name == "private/diary")
+    // 08. One moves a folder of three, the other adds an entry in the old folder and changes one of the three.
+    let fleet = Fleet::started(&["a", "b"], None, &[("old/x", "1"), ("old/y", "2"), ("old/z", "3")]);
+    let (a, b) = (fleet.device("a"), fleet.device("b"));
+    a.store
+        .rename_folder("old/".into(), "new/".into(), a.identity.clone())
         .unwrap();
+    b.insert("old/w", "W");
+    b.insert("old/y", "Y");
+    a.sync();
+    b.sync();
     assert_eq!(
-        (&diary.kind, &diary.readers_after[..]),
-        (&ChangeKind::Added, &["pc".to_string()][..])
+        b.pending("a"),
+        ["moved old/x -> new/x", "moved old/y -> new/y", "moved old/z -> new/z"]
     );
-    // What is not an entry is told apart: the owner's to change, and here to be seen.
-    assert_eq!(update.other_files, [".extensions/hook.bash", ".extensions/note.gpg"]);
-    // An entry the phone cannot read is said to be so, not shown empty.
-    let versions = phone
-        .store
-        .update_versions("private/diary".into(), phone.identity.clone())
-        .unwrap();
-    assert!(matches!(versions.theirs, EntryVersion::Unreadable { .. }));
-    assert_eq!(
-        phone.store.recipients("new".into()).unwrap().len(),
-        2,
-        "still the old ones"
-    );
+    fleet.settle(&no_choice);
+    fleet.check(&[("new/x", "1"), ("new/y", "Y"), ("new/z", "3"), ("old/w", "W")]);
 
-    // Accepted (a merge: the phone had a commit of its own). From then on it writes for the new readers,
-    // which it cannot: carol is no device, and it says so rather than leave her out.
-    phone.accept(&update, &[]).unwrap();
-    assert_eq!(phone.store.recipients("new".into()).unwrap().len(), 3);
+    // 10. Both make the same change, typed on each: two encryptions of one content.
+    let fleet = Fleet::started(&["a", "b"], None, &[("seed", "s")]);
+    let (a, b) = (fleet.device("a"), fleet.device("b"));
+    a.insert("seed", "same");
+    b.insert("seed", "same");
+    b.insert("also", "typed twice");
+    a.insert("also", "typed twice");
+    a.sync();
+    b.sync();
+    assert_ne!(
+        std::fs::read(a.dir.join("seed.gpg")).unwrap(),
+        std::fs::read(b.dir.join("seed.gpg")).unwrap()
+    );
+    assert_eq!(a.stands_with("b"), "2 to take");
+    assert_eq!(a.pending("b"), ["added also", "changed seed"], "told, with no conflict");
+    fleet.settle(&no_choice);
+    fleet.check(&[("seed", "same"), ("also", "typed twice")]);
+}
+
+/// Scenarios 13, 14, 15, 18, 20, 21: folders with their own readers.
+#[test]
+#[ignore = "needs root, OpenSSH, gpg and git"]
+fn each_folder_is_read_by_those_it_names() {
+    // The root read by a alone, shared/ by a and b.
+    let fleet = Fleet::new(&["a", "b", "c"]);
+    let (a, b, c) = (fleet.device("a"), fleet.device("b"), fleet.device("c"));
+    a.store.create(vec!["a".into()], a.identity.clone()).unwrap();
+    a.insert("private", "p");
+    a.insert("shared/s1", "1");
+    a.set_readers("shared/", &["a", "b"]);
     assert_eq!(
-        phone.store.recipient_files().unwrap()[0].unknown,
-        std::slice::from_ref(&carol.fingerprint)
+        fleet.world.log(&a.dir, "HEAD")[..2],
+        ["Reencrypt for the readers of shared/.", "Set GPG id to a, b (shared)."]
     );
     assert_eq!(
-        phone
-            .store
-            .insert("new".into(), "x".into(), false, phone.identity.clone()),
-        Err(PassError::UnknownRecipient {
-            id: carol.fingerprint.clone()
-        })
+        std::fs::read_to_string(a.dir.join("shared/.gpg-id")).unwrap(),
+        format!("{}\n{}\n", a.key.fingerprint, b.key.fingerprint),
+        "full fingerprints"
     );
+    fleet.settle(&no_choice);
+
+    // 13. b reads shared/, lists the rest and cannot read it; c reads nothing, and knows it without a key.
+    assert_eq!(b.readers("shared/"), ["a", "b"]);
+    assert_eq!(b.readers("/"), ["a"]);
+    assert_eq!(b.store.unreadable().unwrap(), ["private"]);
+    assert_eq!(c.store.unreadable().unwrap(), ["private", "shared/s1"]);
+    let access: Access = b.store.entry_access("shared/s1".into()).unwrap();
+    assert_eq!(access.encrypted_to, ["a", "b"]);
+    assert!(access.readable && access.listed && !access.stale);
+    let access = b.store.entry_access("private".into()).unwrap();
+    assert!(!access.readable && !access.listed && !access.stale);
+    fleet.check(&[("private", "p"), ("shared/s1", "1")]);
+
+    // 14. b writes where it does not read: for the readers of that folder, which it is not.
+    b.insert("written-blind", "x");
+    assert_eq!(b.show("written-blind"), Err(PassError::NotForThisKey));
+    fleet.settle(&no_choice);
+    assert_eq!(a.show("written-blind").unwrap(), "x");
+
+    // 15. A grant: a adds c to the readers of shared/ and encrypts again.
+    assert_eq!(c.show("shared/s1"), Err(PassError::NotForThisKey));
+    a.set_readers("shared/", &["a", "b", "c"]);
+    a.sync();
+    assert_ne!(c.stands_with("a"), "nothing to take");
+    // (c could not read the entry before: to it the new file is a change, not a re-encryption.)
+    assert_eq!(c.pending("a"), ["changed shared/s1", "readers shared/: a b c"]);
+    assert_eq!(b.stands_with("a"), "2 to take");
+    assert_eq!(
+        b.pending("a"),
+        ["readers shared/: a b c"],
+        "b reads both: the same entry"
+    );
+    fleet.settle(&no_choice);
+    assert_eq!(c.show("shared/s1").unwrap(), "1");
+
+    // 21. b changes an entry of shared/ while a changes its readers: b's content, a's readers.
+    b.insert("shared/s1", "B");
+    a.set_readers("shared/", &["a", "b"]);
+    fleet.settle(&no_choice);
+    assert_eq!(
+        a.store.entry_access("shared/s1".into()).unwrap().encrypted_to,
+        ["a", "b"]
+    );
+    assert_eq!(
+        c.show("shared/s1"),
+        Err(PassError::NotForThisKey),
+        "18: c no longer reads what is there now"
+    );
+    fleet.check(&[("private", "p"), ("shared/s1", "B"), ("written-blind", "x")]);
+
+    // 20. An entry moved to a folder with other readers is encrypted for them.
+    a.mv("private", "shared/was-private");
+    fleet.settle(&no_choice);
+    assert_eq!(b.show("shared/was-private").unwrap(), "p");
+    // Removing a folder's own readers gives it those of the folder above.
+    a.set_readers("shared/", &[]);
+    a.sync();
+    assert_eq!(b.stands_with("a"), "2 to take");
+    assert!(b.pending("a").contains(&"readers shared/: inherited".to_string()));
+    fleet.settle(&no_choice);
+    assert_eq!(b.readers("shared/"), ["a"]);
+    assert_eq!(b.store.folder_readers("shared/".into()).unwrap(), None);
+    fleet.check(&[("shared/was-private", "p"), ("shared/s1", "B"), ("written-blind", "x")]);
+    // The root always names its readers.
     assert!(matches!(
-        phone.store.show("private/diary".into(), phone.identity.clone()),
-        Err(PassError::NotForThisKey)
+        a.store.set_readers("/".into(), vec![], a.identity.clone()),
+        Err(PassError::InvalidConfig { .. })
     ));
-    assert!(
-        phone.directory.join(".extensions/hook.bash").is_file(),
-        "non-entries are the owner's, as they are"
-    );
-    // It can still remove or rename what it cannot read, and the computer still takes its line.
-    phone
-        .store
-        .remove("private/diary".into(), phone.identity.clone())
+    assert!(matches!(
+        a.store
+            .set_readers("x/".into(), vec!["nobody".into()], a.identity.clone()),
+        Err(PassError::UnknownDevice { .. })
+    ));
+}
+
+/// Scenarios 16, 17: naming oneself where one does not read is asking, not getting.
+#[test]
+#[ignore = "needs root, OpenSSH, gpg and git"]
+fn asking_to_read_is_not_reading() {
+    let fleet = Fleet::new(&["a", "b"]);
+    let (a, b) = (fleet.device("a"), fleet.device("b"));
+    a.store
+        .create(vec!["a".into(), "b".into()], a.identity.clone())
         .unwrap();
-    phone.sync();
-    computer.fetch("phone", &scene.phone_key.fingerprint).unwrap();
-    computer.merge("phone", &scene.phone_key.fingerprint).unwrap();
+    a.insert("open", "o");
+    a.insert("work/w1", "1");
+    a.insert("work/w2", "2");
+    a.set_readers("work/", &["a"]);
+    fleet.settle(&no_choice);
+    assert_eq!(b.show("work/w1"), Err(PassError::NotForThisKey));
+
+    b.set_readers("work/", &["a", "b"]);
     assert_eq!(
-        world.pass(&computer.store, &["show", "mine"], None),
-        "written before the change\n\n"
+        b.show("work/w1"),
+        Err(PassError::NotForThisKey),
+        "having asked changes nothing"
     );
+    assert_eq!(b.store.stale().unwrap(), ["work/w1", "work/w2"]);
+    assert!(b.store.entry_access("work/w1".into()).unwrap().stale);
+    a.sync();
+    b.sync();
+    // 17. Left alone, it stays a request.
+    assert_eq!(a.stands_with("b"), "1 to take");
+    b.sync();
+    assert_eq!(b.show("work/w1"), Err(PassError::NotForThisKey));
+    assert_eq!(a.readers("work/"), ["a"]);
+
+    // 16. a is shown it as what it is: the readers, and the entries that taking it would encrypt again.
+    assert_eq!(a.pending("b"), ["readers work/: a b", "stale work/w1", "stale work/w2"]);
+    let update = a.store.pending_update("b".into(), a.identity.clone()).unwrap().unwrap();
+    assert_eq!((update.kind, update.reencrypts), (TakeKind::Forward, 2));
+    let taken = a.take("b", &[], &[]);
+    assert_eq!(taken.reencrypted, ["work/w1", "work/w2"]);
+    assert_eq!(
+        fleet.world.log(&a.dir, "HEAD")[0],
+        "Reencrypt for the readers of work/."
+    );
+    assert_eq!(b.stands_with("a"), "1 to take");
+    b.take("a", &[], &[]);
+    assert_eq!(b.show("work/w1").unwrap(), "1");
+    fleet.settle(&no_choice);
+    fleet.check(&[("open", "o"), ("work/w1", "1"), ("work/w2", "2")]);
 }
 
+/// Scenario 19: the readers of one folder changed differently on both sides.
 #[test]
-#[ignore = "needs root, OpenSSH, gpg, git and pass.py"]
-fn outstanding_changes_can_be_dropped() {
-    let (scene, pc_ssh) = Scene::new();
-    let computer = scene.computer(pc_ssh);
-    let phone = scene.phone();
-    let world = &scene.world;
-    computer.publish(&[]);
-    phone.set_up();
-    assert_eq!(phone.store.discard_outstanding().unwrap(), 0);
-
-    phone.insert("regret", "oops");
-    phone.edit("bank", "oops\n");
-    phone.sync();
-    // An update is waiting meanwhile: dropping does not take it, it goes back to what was accepted.
-    world.pass(&computer.store, &["insert", "-m", "later"], Some(b"x\n"));
-    computer.publish(&[]);
-    let update = phone.receive();
-    assert_eq!(update.outstanding, 2);
-
-    assert_eq!(phone.store.discard_outstanding().unwrap(), 2);
-    assert_eq!(phone.store.list().unwrap(), ["Email/work", "bank", "wifi"]);
-    assert_eq!(phone.password("bank"), "hunter2");
-    phone.check_repository();
-    let waiting = phone.store.pending_update().unwrap().unwrap();
-    assert_eq!(
-        (waiting.commit.as_str(), waiting.outstanding),
-        (update.commit.as_str(), 0)
-    );
-    // Published: the computer sees the phone back on the owner's history, with nothing to take.
-    assert!(phone.sync().published);
-    let tip = computer.fetch("phone", &scene.phone_key.fingerprint).unwrap();
-    assert_eq!(tip, world.git(&computer.store, &["rev-parse", "HEAD~1"]));
-    phone.accept(&waiting, &[]).unwrap();
-    assert_eq!(world.log(&phone.directory, "HEAD"), world.log(&computer.store, "HEAD"));
+#[ignore = "needs root, OpenSSH, gpg and git"]
+fn two_sets_of_readers_for_one_folder_need_a_choice() {
+    for (keep, expected) in [(Side::Mine, vec!["a", "b"]), (Side::Theirs, vec!["a", "c"])] {
+        let fleet = Fleet::new(&["a", "b", "c"]);
+        let (a, b) = (fleet.device("a"), fleet.device("b"));
+        a.store
+            .create(vec!["a".into(), "b".into(), "c".into()], a.identity.clone())
+            .unwrap();
+        a.insert("shared/s1", "1");
+        a.set_readers("shared/", &["a", "b", "c"]);
+        fleet.settle(&no_choice);
+        a.set_readers("shared/", &["a", "b"]);
+        b.set_readers("shared/", &["a", "c"]);
+        b.insert("shared/s2", "2");
+        a.sync();
+        b.sync();
+        assert_ne!(a.stands_with("b"), "nothing to take");
+        let shown = a.pending("b");
+        assert!(shown.contains(&"conflict shared/".to_string()), "{shown:?}");
+        assert!(shown.contains(&"readers shared/: a c".to_string()), "{shown:?}");
+        assert!(shown.contains(&"added shared/s2".to_string()), "{shown:?}");
+        assert_eq!(
+            a.try_take("b", &[], &[]),
+            Err(PassError::ChoiceRequired {
+                names: vec!["shared/".into()]
+            })
+        );
+        assert_eq!(a.readers("shared/"), ["a", "b"], "nothing was taken");
+        match keep {
+            Side::Mine => a.take("b", &["shared/"], &[]),
+            Side::Theirs => a.take("b", &[], &["shared/"]),
+        };
+        fleet.settle(&no_choice);
+        for device in &fleet.devices {
+            assert_eq!(device.readers("shared/"), expected, "on {}", device.name);
+        }
+        // The chosen set, and the entries encrypted for it: nothing stale, read by those and only those.
+        fleet.check(&[("shared/s1", "1"), ("shared/s2", "2")]);
+    }
 }
 
-/// Everything a drop zone could serve under the owner's name that is not the owner's file.
+/// Scenarios 22, 23, 28, 29: three devices.
 #[test]
-#[ignore = "needs root, OpenSSH, gpg, git and pass.py"]
-fn what_is_not_the_owners_file_is_refused() {
-    let (scene, pc_ssh) = Scene::new();
-    let computer = scene.computer(pc_ssh);
-    let world = &scene.world;
-    let mallory = world.make_key(KeyKind::Curve25519, "mallory@example.org");
-    // A third device, known to the phone as a member: its key is a device's, but not the owner's.
-    let tablet = world.make_key(KeyKind::Curve25519, "tablet@example.org");
-    let config = world.member_config(
-        "phone-store",
-        "phone",
-        &scene.phone_key.public_key,
-        vec![scene.pc.peer("pc", true), tablet.peer("tablet", false)],
-    );
-    let phone = Phone {
-        scene: &scene,
-        directory: world.path("phone-store"),
-        store: PassStore::open(config).unwrap(),
-        identity: Identity::unlock(scene.phone_key.secret_key.clone(), PASSPHRASE.into()).unwrap(),
-    };
-    let everyone = computer.devices.clone();
-    let store = &computer.store;
-    let bundle_of = |name: &str, refs: &[&str]| {
-        let file = world.path(name);
-        let mut args = vec!["bundle", "create", "--quiet", "--version=2"];
-        let path = file.to_string_lossy().into_owned();
-        args.push(&path);
-        args.extend(refs);
-        world.git(store, &args);
-        file
-    };
-    world.git(store, &["update-ref", "refs/pass-sync/pc", "HEAD"]);
-    world.git(store, &["update-ref", "refs/pass-sync/phone", "HEAD"]);
-    let good_bundle = bundle_of("good.bundle", &["refs/pass-sync/pc"]);
-    let none = ["--compress-algo", "none"];
+#[ignore = "needs root, OpenSSH, gpg and git"]
+fn three_devices() {
+    // 22. Each adds an entry; taken in a ring, then once more.
+    let fleet = Fleet::started(&["a", "b", "c"], None, &[("seed", "s")]);
+    let (a, b, c) = (fleet.device("a"), fleet.device("b"), fleet.device("c"));
+    a.insert("from-a", "A");
+    b.insert("from-b", "B");
+    c.insert("from-c", "C");
+    for device in &fleet.devices {
+        device.sync();
+    }
+    for _ in 0..2 {
+        for (device, from) in [(b, "a"), (c, "b"), (a, "c")] {
+            device.sync();
+            device.take(from, &[], &[]);
+        }
+    }
+    fleet.settle(&no_choice);
+    let all = [("seed", "s"), ("from-a", "A"), ("from-b", "B"), ("from-c", "C")];
+    fleet.check(&all);
 
-    // Signed by a key that is nobody's; by a device that is not the owner; not signed at all.
-    computer.put(&computer.seal(&good_bundle, &mallory.fingerprint, &everyone, &none));
-    assert!(phone
-        .refused()
-        .contains("not signed by the key of the device it is named after"));
-    computer.put(&computer.seal(&good_bundle, &tablet.fingerprint, &everyone, &none));
-    assert!(phone
-        .refused()
-        .contains("not signed by the key of the device it is named after"));
-    let unsigned = world.path("unsigned.gpg");
-    world.gpg(
-        &[
-            "--encrypt",
-            "--recipient",
-            &scene.phone_key.fingerprint,
-            "--output",
-            &unsigned.to_string_lossy(),
-            &good_bundle.to_string_lossy(),
-        ],
-        None,
-    );
-    computer.put(&unsigned);
-    assert!(phone.refused().contains("not signed"));
-    // Signed by the owner, but for someone else; or the bundle in clear; or anything.
-    computer.put(&computer.seal(
-        &good_bundle,
-        &scene.pc.fingerprint,
-        std::slice::from_ref(&scene.pc.fingerprint),
-        &none,
+    // 23. A relay: c only ever takes from b, never from a. What a does reaches c through b.
+    a.insert("relayed", "R");
+    a.mv("from-a", "moved-by-a");
+    let relay = |device: &str, other: &str| device != "c" || other == "b";
+    fleet.settle_among(&no_choice, &relay);
+    assert_eq!(c.show("relayed").unwrap(), "R");
+    assert!(c.ls().contains(&"moved-by-a".to_string()));
+    // c holds everything of a without ever having taken its file: there is nothing left to take from it either.
+    assert_eq!(c.stands_with("a"), "nothing to take");
+
+    // 28. a drops its changes and goes back to b's tip, after c already took them.
+    a.insert("x", "1");
+    a.sync();
+    c.sync();
+    c.take("a", &[], &[]);
+    assert_eq!(a.store.drop_to("b".into()).unwrap(), 1);
+    assert!(!a.ls().contains(&"x".to_string()));
+    assert_eq!(a.store.drop_to("b".into()).unwrap(), 0);
+    assert!(matches!(
+        a.store.drop_to("nobody".into()),
+        Err(PassError::UnknownDevice { .. })
     ));
-    assert!(phone.refused().contains("not encrypted to this device's key"));
+    // c still has them, and a gets them back from c like any other change.
+    fleet.settle(&no_choice);
+    assert_eq!(a.show("x").unwrap(), "1");
+
+    // 29. Two devices grant the same request on their own: two re-encryptions of the same entries.
+    let fleet = Fleet::new(&["a", "b", "c"]);
+    let (a, b, c) = (fleet.device("a"), fleet.device("b"), fleet.device("c"));
+    a.store
+        .create(vec!["a".into(), "b".into(), "c".into()], a.identity.clone())
+        .unwrap();
+    a.insert("shared/s1", "1");
+    a.set_readers("shared/", &["a", "b"]);
+    fleet.settle(&no_choice);
+    c.set_readers("shared/", &["a", "b", "c"]);
+    c.sync();
+    for device in [a, b] {
+        assert_eq!(device.stands_with("c"), "1 to take");
+    }
+    for device in [a, b] {
+        assert_eq!(device.try_take("c", &[], &[]).unwrap().reencrypted, ["shared/s1"]);
+    }
+    a.sync();
+    b.sync();
+    assert_ne!(
+        std::fs::read(a.dir.join("shared/s1.gpg")).unwrap(),
+        std::fs::read(b.dir.join("shared/s1.gpg")).unwrap()
+    );
+    assert_eq!(a.stands_with("b"), "1 to take");
+    assert_eq!(
+        a.pending("b"),
+        Vec::<String>::new(),
+        "the same entry, encrypted twice: nothing to tell, no conflict"
+    );
+    fleet.settle(&no_choice);
+    fleet.check(&[("shared/s1", "1")]);
+}
+
+/// A computer played with `git`, `gpg` and `sftp`: what publishes the files this crate must refuse, and one it must take.
+struct Computer<'a> {
+    fleet: &'a Fleet,
+    key: Key,
+    ssh: support::SshKey,
+    /// Its repository: a clone of a's store.
+    repo: std::path::PathBuf,
+}
+
+impl Computer<'_> {
+    fn world(&self) -> &World {
+        &self.fleet.world
+    }
+
+    fn git(&self, args: &[&str]) -> String {
+        self.world().git(&self.repo, args)
+    }
+
+    /// A commit holding whatever is in the directory now.
+    fn commit(&self, message: &str) {
+        self.git(&["add", "--all", "--force"]);
+        self.git(&["commit", "--quiet", "--allow-empty", "-m", message]);
+    }
+
+    /// A bundle of these references (its tip under its own name, when none is given).
+    fn bundle(&self, references: &[&str]) -> std::path::PathBuf {
+        self.git(&["update-ref", "refs/pass-sync/pc", "HEAD"]);
+        let file = self.world().path("pc.bundle");
+        let path = file.to_string_lossy().into_owned();
+        let mut args = vec!["bundle", "create", "--quiet", "--version=2", path.as_str()];
+        args.extend(if references.is_empty() {
+            &["refs/pass-sync/pc"][..]
+        } else {
+            references
+        });
+        self.git(&args);
+        file
+    }
+
+    /// `gpg --sign --encrypt` of a file, by `signer`, to `recipients` (fingerprints).
+    fn seal(&self, file: &Path, signer: &str, recipients: &[&str], options: &[&str]) -> std::path::PathBuf {
+        let sealed = self.world().path("pc.sealed");
+        let (file, output) = (
+            file.to_string_lossy().into_owned(),
+            sealed.to_string_lossy().into_owned(),
+        );
+        let mut args = vec!["--local-user", signer, "--sign", "--encrypt", "--output", &output];
+        for recipient in recipients {
+            args.extend(["--recipient", recipient]);
+        }
+        args.extend(options);
+        args.push(&file);
+        self.world().gpg(&args, None);
+        sealed
+    }
+
+    fn everyone(&self) -> Vec<&str> {
+        let mut everyone: Vec<&str> = self
+            .fleet
+            .devices
+            .iter()
+            .map(|device| device.key.fingerprint.as_str())
+            .collect();
+        everyone.push(&self.key.fingerprint);
+        everyone
+    }
+
+    /// Puts a file in the computer's place in the drop zone.
+    fn put(&self, file: &Path) {
+        self.fleet.zone.publish(self.world(), &self.ssh, file, "pc.bundle.gpg");
+    }
+
+    /// Publishes its tip as the protocol says, with these gpg options.
+    fn publish(&self, options: &[&str]) {
+        let bundle = self.bundle(&[]);
+        self.put(&self.seal(&bundle, &self.key.fingerprint, &self.everyone(), options));
+    }
+
+    /// Back to the last good commit, then `change`, committed and published: a tip gone wrong.
+    fn publish_wrong(&self, good: &str, change: impl FnOnce(&Path)) {
+        self.git(&["reset", "--quiet", "--hard", good]);
+        self.git(&["clean", "--quiet", "-fdx"]);
+        change(&self.repo);
+        self.commit("Something a synced store does not hold.");
+        self.publish(&["--digest-algo", "SHA512", "--compress-algo", "none"]);
+    }
+}
+
+/// Scenarios 24, 25, 26, 27, and everything else a drop zone could serve under a device's name
+/// that is not that device's file, or not a store that syncs.
+#[test]
+#[ignore = "needs root, OpenSSH, gpg and git"]
+fn what_is_not_a_devices_store_is_refused() {
+    let world = World::new();
+    let pc = world.make_key(KeyKind::Curve25519, "pc@example.org");
+    let tablet = world.make_key(KeyKind::Curve25519, "tablet@example.org");
+    let mallory = world.make_key(KeyKind::Curve25519, "mallory@example.org");
+    let ssh = world.ssh_key("pc");
+    let public = ssh.public.clone();
+    let fleet = Fleet::with(world, &["a"], &[&public], &[pc.peer("pc"), tablet.peer("tablet")]);
+    let a = fleet.device("a");
+    let world = &fleet.world;
+    world.import_key(&a.key.public_key, &a.key.fingerprint);
+    a.store
+        .create(vec!["a".into(), "pc".into()], a.identity.clone())
+        .unwrap();
+    a.insert("seed", "s");
+    a.sync();
+
+    // The computer adopts a's store (a clone of it stands for that) and adds an entry, as pass would.
+    let repo = world.path("pc-repo");
+    let mut clone = world.command("git");
+    clone.args(["clone", "--quiet"]).arg(&a.dir).arg(&repo);
+    world.run(clone, None);
+    let computer = Computer {
+        fleet: &fleet,
+        key: pc.clone(),
+        ssh,
+        repo,
+    };
+    let encrypt_to = |recipients: &[&str], file: &Path, text: &str| {
+        let output = file.to_string_lossy().into_owned();
+        let mut args = vec!["--encrypt", "--output", output.as_str()];
+        for recipient in recipients {
+            args.extend(["--recipient", recipient]);
+        }
+        world.gpg(&args, Some(text.as_bytes()));
+    };
+    let readers = [a.key.fingerprint.as_str(), pc.fingerprint.as_str()];
+    encrypt_to(&readers, &computer.repo.join("from-pc.gpg"), "typed on the computer\n");
+    computer.commit("Add given password for from-pc to store.");
+    let good = computer.git(&["rev-parse", "HEAD"]);
+
+    /// What a says of the computer's file, which it must refuse; and nothing of a's may have changed.
+    fn refused(a: &support::Device) -> String {
+        let before = (a.ls(), a.store.sync_state().unwrap().peers[0].clone());
+        let stands = a.stands_with("pc");
+        assert!(stands.starts_with("REFUSED "), "not refused: {stands}");
+        assert_eq!((a.ls(), a.store.sync_state().unwrap().peers[0].clone()), before);
+        assert_eq!(a.store.pending_update("pc".into(), a.identity.clone()).unwrap(), None);
+        stands
+    }
+    let none = ["--digest-algo", "SHA512", "--compress-algo", "none"];
+    let everyone = computer.everyone();
+    let good_bundle = computer.bundle(&[]);
+
+    // 27. Signed by a key that is nobody's; by another device's key; not signed; signed with SHA-1.
+    for (signer, options) in [
+        (&mallory.fingerprint, &none[..]),
+        (&tablet.fingerprint, &none[..]),
+        (
+            &pc.fingerprint,
+            &["--digest-algo", "SHA1", "--compress-algo", "none"][..],
+        ),
+    ] {
+        computer.put(&computer.seal(&good_bundle, signer, &everyone, options));
+        assert!(refused(a).contains("not signed by the key of the device it is named after"));
+    }
+    let unsigned = world.path("unsigned.gpg");
+    let bundle_bytes = std::fs::read(&good_bundle).unwrap();
+    {
+        let output = unsigned.to_string_lossy().into_owned();
+        let mut encrypt = world.gpg_command(&["--encrypt", "--recipient", &a.key.fingerprint, "--output", &output]);
+        encrypt.arg(&good_bundle);
+        world.run(encrypt, None);
+    }
+    computer.put(&unsigned);
+    assert!(refused(a).contains("it is not signed"));
+    // Rightly signed, but for someone else; or the bundle in clear; or anything.
+    computer.put(&computer.seal(&good_bundle, &pc.fingerprint, &[&pc.fingerprint], &none));
+    assert!(refused(a).contains("not encrypted to this device's key"));
     computer.put(&good_bundle);
-    assert!(phone.refused().contains("refused"));
+    refused(a);
     std::fs::write(world.path("junk"), b"<html>503</html>").unwrap();
     computer.put(&world.path("junk"));
-    assert!(phone.refused().contains("refused"));
+    refused(a);
 
-    // Rightly signed by the owner, but not the bundle the protocol says.
-    let seal = |file: &Path| computer.seal(file, &scene.pc.fingerprint, &everyone, &none);
-    computer.put(&seal(&bundle_of(
-        "two.bundle",
-        &["refs/pass-sync/pc", "refs/heads/main"],
-    )));
-    assert!(phone.refused().contains("it holds 2 references, not exactly one"));
-    computer.put(&seal(&bundle_of("other.bundle", &["refs/pass-sync/phone"])));
-    assert!(phone
-        .refused()
-        .contains("its reference is refs/pass-sync/phone, not refs/pass-sync/pc"));
-    computer.put(&seal(&bundle_of("branch.bundle", &["main"])));
-    assert!(phone.refused().contains("its reference is refs/heads/main"));
-    computer.put(&seal(&bundle_of("partial.bundle", &["refs/pass-sync/pc", "^HEAD~1"])));
-    assert!(phone.refused().contains("it is not a whole history"));
+    // 27. Rightly signed, but not the bundle the protocol says.
+    let seal = |file: &Path| computer.seal(file, &pc.fingerprint, &everyone, &none);
+    computer.put(&seal(&computer.bundle(&["refs/pass-sync/pc", "refs/heads/main"])));
+    assert!(refused(a).contains("it holds 2 references, not exactly one"));
+    computer.put(&seal(&computer.bundle(&["main"])));
+    assert!(refused(a).contains("its reference is refs/heads/main, not refs/pass-sync/pc"));
+    computer.put(&seal(&computer.bundle(&["refs/pass-sync/pc", "^HEAD~1"])));
+    assert!(refused(a).contains("it is not a whole history"));
+    std::fs::write(world.path("short.bundle"), &bundle_bytes[..bundle_bytes.len() * 2 / 3]).unwrap();
+    computer.put(&seal(&world.path("short.bundle")));
+    assert!(refused(a).contains("its pack is damaged or cut short"));
     std::fs::write(world.path("not-a-bundle"), b"hello").unwrap();
     computer.put(&seal(&world.path("not-a-bundle")));
-    assert!(phone.refused().contains("it is not a git bundle"));
-    // A bundle cut short before it was signed: the signature is good, the pack is not.
-    let whole = std::fs::read(&good_bundle).unwrap();
-    std::fs::write(world.path("short.bundle"), &whole[..whole.len() * 2 / 3]).unwrap();
-    computer.put(&seal(&world.path("short.bundle")));
-    assert!(phone.refused().contains("its pack is damaged or cut short"));
-    // A bundle whose pack lacks an object its history needs (a shallow copy of the store).
-    let shallow = world.path("shallow");
-    let mut clone = world.command("git");
-    clone
-        .args(["clone", "--quiet", "--depth", "1", "--no-local"])
-        .arg(store)
-        .arg(&shallow);
-    world.run(clone, None);
-    world.git(&shallow, &["update-ref", "refs/pass-sync/pc", "HEAD"]);
-    let incomplete = world.path("incomplete.bundle");
-    world.git(
-        &shallow,
-        &[
-            "bundle",
-            "create",
-            "--quiet",
-            "--version=2",
-            &incomplete.to_string_lossy(),
-            "refs/pass-sync/pc",
-        ],
-    );
-    computer.put(&seal(&incomplete));
-    assert!(
-        phone.refused().contains("it is not complete"),
-        "a history with a hole in it"
-    );
-
-    // The right file, cut short on the way; and with one byte changed.
-    let good = computer.sealed_tip(&none);
-    let sealed = std::fs::read(&good).unwrap();
+    assert!(refused(a).contains("it is not a git bundle"));
+    // The right file, cut short on the way; with one bit changed.
+    let sealed = std::fs::read(seal(&good_bundle)).unwrap();
     std::fs::write(world.path("cut.gpg"), &sealed[..sealed.len() / 2]).unwrap();
     computer.put(&world.path("cut.gpg"));
-    assert!(phone.refused().contains("refused"));
+    refused(a);
     let mut flipped = sealed.clone();
     let middle = flipped.len() / 2;
     flipped[middle] ^= 0x01;
     std::fs::write(world.path("flipped.gpg"), &flipped).unwrap();
     computer.put(&world.path("flipped.gpg"));
-    assert!(phone.refused().contains("refused"));
-    // Small on the wire, huge once decompressed: anyone can make one for this device's public key.
+    refused(a);
+    // Small on the wire, huge once decompressed: anyone can make one for a device's public key.
     let bomb = world.path("bomb");
-    let zeros = std::fs::File::create(&bomb).unwrap();
-    zeros.set_len(256 * 1024 * 1024 + 4096).unwrap();
-    drop(zeros);
+    std::fs::File::create(&bomb)
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 4096)
+        .unwrap();
     let sealed_bomb = computer.seal(&bomb, &mallory.fingerprint, &everyone, &["--compress-algo", "zlib"]);
     assert!(std::fs::metadata(&sealed_bomb).unwrap().len() < 1024 * 1024);
     computer.put(&sealed_bomb);
-    assert!(phone.refused().contains("over 256 MiB"));
-    // Far too big: refused by its size, before it is read.
-    let huge = scene.zone.files().join("pc.bundle.gpg");
-    let grown = std::fs::File::options().write(true).open(&huge).unwrap();
-    grown.set_len(256 * 1024 * 1024 + 1).unwrap();
-    drop(grown);
+    assert!(refused(a).contains("over 256 MiB"));
+    // Far too big as it is: refused by its size, before it is read.
+    let in_zone = fleet.zone.files().join("pc.bundle.gpg");
+    std::fs::File::options()
+        .write(true)
+        .open(&in_zone)
+        .unwrap()
+        .set_len(256 * 1024 * 1024 + 1)
+        .unwrap();
     let started = std::time::Instant::now();
-    assert!(phone.refused().contains("over 256 MiB"));
+    assert!(refused(a).contains("over 256 MiB"));
     assert!(
         started.elapsed() < std::time::Duration::from_secs(20),
         "it was not downloaded"
     );
 
-    // After all of that the phone has taken nothing, and the right file still works.
-    assert!(!phone.store.sync_state().unwrap().has_store);
-    computer.put(&good);
-    let first = phone.receive();
-    phone.accept(&first, &[]).unwrap();
+    // 26. A tip holding what a synced store does not: refused whole, naming the paths.
+    type Wrong = Box<dyn Fn(&Path)>;
+    let wrongs: [(&str, Wrong); 6] = [
+        (
+            ".extensions/x.bash",
+            Box::new(|repo| {
+                std::fs::create_dir_all(repo.join(".extensions")).unwrap();
+                std::fs::write(repo.join(".extensions/x.bash"), "#!/bin/sh\n").unwrap();
+            }),
+        ),
+        (
+            "link.gpg",
+            Box::new(|repo| {
+                std::os::unix::fs::symlink("/etc/passwd", repo.join("link.gpg")).unwrap();
+            }),
+        ),
+        (
+            "README",
+            Box::new(|repo| std::fs::write(repo.join("README"), "not an entry\n").unwrap()),
+        ),
+        (
+            ".gpg-id.sig",
+            Box::new(|repo| std::fs::write(repo.join(".gpg-id.sig"), "a signature\n").unwrap()),
+        ),
+        (
+            "hidden/.x/y.gpg",
+            Box::new(|repo| {
+                std::fs::create_dir_all(repo.join("hidden/.x")).unwrap();
+                std::fs::copy(repo.join("seed.gpg"), repo.join("hidden/.x/y.gpg")).unwrap();
+            }),
+        ),
+        (
+            ".gitattributes is not the one line",
+            Box::new(|repo| {
+                std::fs::write(repo.join(".gitattributes"), "*.gpg diff=gpg filter=evil\n").unwrap();
+            }),
+        ),
+    ];
+    for (named, wrong) in &wrongs {
+        computer.publish_wrong(&good, wrong);
+        let why = refused(a);
+        assert!(why.contains(named), "{named}: {why}");
+    }
+    // 24. A `.gpg-id` that names a key that is no device's; or nobody; or two devices at once.
+    for (content, named) in [
+        (
+            format!("{}\n{}\n", pc.fingerprint, mallory.fingerprint),
+            mallory.fingerprint.as_str(),
+        ),
+        ("# nobody\n".to_string(), "names nobody"),
+        ("example.org\n".to_string(), "example.org"),
+    ] {
+        computer.publish_wrong(&good, |repo| std::fs::write(repo.join(".gpg-id"), &content).unwrap());
+        let why = refused(a);
+        assert!(why.contains(named), "{named}: {why}");
+    }
+    computer.publish_wrong(&good, |repo| {
+        std::fs::create_dir_all(repo.join("team")).unwrap();
+        std::fs::write(repo.join("team/.gpg-id"), "mallory@example.org\n").unwrap();
+    });
+    assert!(refused(a).contains("team/.gpg-id: mallory@example.org"));
+    // 25. An entry encrypted to a key that is no device's.
+    computer.publish_wrong(&good, |repo| {
+        encrypt_to(&[&pc.fingerprint, &mallory.fingerprint], &repo.join("leak.gpg"), "x\n");
+    });
+    assert!(refused(a).contains("leak is encrypted to a key that is no device's"));
+    computer.publish_wrong(&good, |repo| {
+        std::fs::write(repo.join("plain.gpg"), "not encrypted\n").unwrap()
+    });
+    assert!(refused(a).contains("plain is not an encrypted file"));
 
-    // An old file served again: valid, but behind what was already received. Told, and ignored.
-    world.pass(store, &["insert", "-m", "newer"], Some(b"x\n"));
-    computer.publish(&none);
-    let newer = phone.receive();
-    computer.put(&good);
-    assert!(matches!(phone.sync().fetch, FetchOutcome::Stale { published_at } if published_at > 0));
+    // After all of that a has taken nothing, and the right file still works: as gpg and git write
+    // it by default (compressed, a pack with deltas), and with a readers file that names by key id and by text.
+    assert_eq!(a.ls(), ["seed"]);
+    computer.git(&["reset", "--quiet", "--hard", &good]);
+    computer.git(&["clean", "--quiet", "-fdx"]);
+    std::fs::create_dir_all(computer.repo.join("team")).unwrap();
+    let key_id = &a.key.fingerprint[24..];
+    std::fs::write(
+        computer.repo.join("team/.gpg-id"),
+        format!("0x{key_id}\npc@example.org # the computer\n"),
+    )
+    .unwrap();
+    encrypt_to(&readers, &computer.repo.join("team/wifi.gpg"), "shared\n");
+    computer.commit("A folder for the team.");
+    computer.publish(&["--digest-algo", "SHA512"]);
+    assert_eq!(a.stands_with("pc"), "2 to take");
     assert_eq!(
-        phone.store.pending_update().unwrap(),
-        Some(newer.clone()),
-        "the newer one is still the one waiting"
+        a.pending("pc"),
+        ["added from-pc", "added team/wifi", "readers team/: a pc"]
     );
-    phone.accept(&newer, &[]).unwrap();
-    computer.put(&good);
-    assert!(matches!(phone.sync().fetch, FetchOutcome::Stale { .. }));
-    assert_eq!(phone.store.list().unwrap(), ["Email/work", "bank", "newer", "wifi"]);
+    let update = a
+        .store
+        .pending_update("pc".into(), a.identity.clone())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        update.commits[0].signature,
+        SignatureStatus::Unsigned,
+        "shown, not required"
+    );
+    assert_eq!(a.take("pc", &[], &[]).kind, TakeKind::Forward);
+    assert_eq!(a.show("from-pc").unwrap(), "typed on the computer");
+    assert_eq!(a.readers("team/"), ["a", "pc"]);
+
+    // 27. An old file served again: valid, but behind what was already received. Told, and ignored.
+    let newer = world.path("newer.gpg");
+    std::fs::copy(&in_zone, &newer).unwrap();
+    computer.git(&["reset", "--quiet", "--hard", &good]);
+    computer.publish(&none);
+    assert_eq!(a.stands_with("pc"), "IGNORED");
+    assert_eq!(a.stands_with("pc"), "IGNORED");
+    computer.put(&newer);
+    assert_eq!(a.stands_with("pc"), "nothing to take");
     // The drop zone lost the file.
-    std::fs::remove_file(&huge).unwrap();
-    assert_eq!(phone.sync().fetch, FetchOutcome::NothingPublished);
-    assert_eq!(phone.store.list().unwrap().len(), 4);
+    std::fs::remove_file(&in_zone).unwrap();
+    assert_eq!(a.stands_with("pc"), "nothing published");
+
+    // What a publishes, the real tools take: gpg checks the signature, git the bundle.
+    a.insert("from-a", "typed on the phone");
+    a.sync();
+    let message = world.path("a.message");
+    std::fs::copy(fleet.zone.files().join("a.bundle.gpg"), &message).unwrap();
+    let bundle = world.path("a.bundle");
+    let mut decrypt = world.gpg_command(&["--status-fd", "2", "--output", &bundle.to_string_lossy(), "--decrypt"]);
+    decrypt.arg(&message);
+    let decrypted = world.run(decrypt, None);
+    let signed_by_a = decrypted
+        .stderr
+        .lines()
+        .any(|line| line.starts_with("[GNUPG:] VALIDSIG ") && line.ends_with(&a.key.fingerprint));
+    assert!(signed_by_a, "{}", decrypted.stderr);
+    let bundle_path = bundle.to_string_lossy().into_owned();
+    let heads = computer.git(&["bundle", "list-heads", &bundle_path]);
+    assert_eq!(
+        heads,
+        format!("{} refs/pass-sync/a", world.git(&a.dir, &["rev-parse", "HEAD"]))
+    );
+    let verified = world.try_git(&computer.repo, &["bundle", "verify", &bundle_path]);
+    assert!(
+        verified.ok && !verified.stderr.contains("requires"),
+        "{}",
+        verified.stderr
+    );
+    computer.git(&["fetch", "--quiet", &bundle_path, "+refs/pass-sync/a:refs/pass-sync/a"]);
+    computer.git(&["fsck", "--strict", "--no-dangling"]);
+    computer.git(&["merge", "--quiet", "--ff-only", "refs/pass-sync/a"]);
+    assert_eq!(
+        world.gpg_decrypt(&computer.repo.join("from-a.gpg")),
+        "typed on the phone\n"
+    );
+    assert_eq!(
+        computer.git(&["log", "-1", "--format=%G? %GF %s"]),
+        format!("G {} Add given password for from-a to store.", a.key.fingerprint)
+    );
+
+    // 26, the other way round: a store of this device that holds what a synced store does not is not published,
+    // and says why; what the others published is received all the same.
+    std::fs::write(a.dir.join("README"), "not an entry\n").unwrap();
+    world.git(&a.dir, &["add", "README"]);
+    world.git(
+        &a.dir,
+        &[
+            "-c",
+            "user.name=x",
+            "-c",
+            "user.email=x@x",
+            "commit",
+            "--quiet",
+            "-m",
+            "A note.",
+        ],
+    );
+    computer.commit("Something more.");
+    computer.publish(&none);
+    let published_before = std::fs::read(fleet.zone.files().join("a.bundle.gpg")).unwrap();
+    let report = a.store.sync(a.zone.clone(), a.identity.clone()).unwrap();
+    assert!(!report.published);
+    assert!(
+        report
+            .publish_refused
+            .as_deref()
+            .is_some_and(|why| why.contains("README")),
+        "{:?}",
+        report.publish_refused
+    );
+    assert_eq!(report.peers[0].outcome, FetchOutcome::Received);
+    assert_eq!(
+        std::fs::read(fleet.zone.files().join("a.bundle.gpg")).unwrap(),
+        published_before
+    );
 }
 
 #[test]
 #[ignore = "needs root and OpenSSH"]
 fn the_drop_zone_is_the_pinned_one_and_knows_this_device() {
-    let (scene, _pc_ssh) = Scene::new();
-    let phone = scene.phone();
-    let zone = scene.zone.for_device(&scene.phone_ssh.private_key);
+    let fleet = Fleet::new(&["a", "b"]);
+    let a = fleet.device("a");
     assert_eq!(
-        pass_core::fetch_host_key(scene.zone.url()).unwrap().fingerprint,
-        scene.zone.host_key
+        pass_core::fetch_host_key(fleet.zone.url()).unwrap().fingerprint,
+        fleet.zone.host_key
     );
     assert_eq!(
-        pass_core::fetch_host_key(scene.zone.url()).unwrap().algorithm,
+        pass_core::fetch_host_key(fleet.zone.url()).unwrap().algorithm,
         "ssh-ed25519"
     );
+    let sync = |zone: pass_core::DropZone| a.store.sync(zone, a.identity.clone());
 
     // Another host key than the pinned one: nothing is sent, not even this device's public key.
     let other = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let mut wrong_host = zone.clone();
+    let mut wrong_host = a.zone.clone();
     wrong_host.host_key = other.into();
     assert_eq!(
-        phone.store.sync(wrong_host, phone.identity.clone()).err(),
+        sync(wrong_host).err(),
         Some(PassError::HostKeyMismatch {
             pinned: other.into(),
-            served: scene.zone.host_key.clone()
+            served: fleet.zone.host_key.clone()
         })
     );
     // An SSH key the drop zone was not given.
-    let mut stranger = zone.clone();
+    let mut stranger = a.zone.clone();
     stranger.private_key = generate_device_key("stranger".into()).unwrap().private_key;
-    assert_eq!(
-        phone.store.sync(stranger, phone.identity.clone()).err(),
-        Some(PassError::Unauthorized)
-    );
-    // Nobody listening; not a drop zone URL.
-    let mut closed = zone.clone();
+    assert_eq!(sync(stranger).err(), Some(PassError::Unauthorized));
+    // Nobody listening; not a drop zone URL; another device's key to unlock with.
+    let mut closed = a.zone.clone();
     closed.url = format!("sftp://drop@127.0.0.1:{}", support::free_port());
-    assert!(matches!(
-        phone.store.sync(closed, phone.identity.clone()),
-        Err(PassError::Network { .. })
-    ));
-    let mut not_sftp = zone.clone();
+    assert!(matches!(sync(closed), Err(PassError::Network { .. })));
+    let mut not_sftp = a.zone.clone();
     not_sftp.url = "https://example.org/store.git".into();
+    assert!(matches!(sync(not_sftp), Err(PassError::InvalidConfig { .. })));
     assert!(matches!(
-        phone.store.sync(not_sftp, phone.identity.clone()),
-        Err(PassError::InvalidConfig { .. })
+        a.store.sync(a.zone.clone(), fleet.device("b").identity.clone()),
+        Err(PassError::InvalidKey { .. })
     ));
-    // The right one works, and leaves nothing half-written behind in the zone.
-    assert_eq!(
-        phone.store.sync(zone, phone.identity.clone()).unwrap().fetch,
-        FetchOutcome::NothingPublished
-    );
-    assert_eq!(std::fs::read_dir(scene.zone.files()).unwrap().count(), 0);
+    // The right one works, and leaves nothing behind in the zone when there is nothing to publish.
+    assert_eq!(a.sync(), ["b: nothing published"]);
+    assert_eq!(std::fs::read_dir(fleet.zone.files()).unwrap().count(), 0);
 }
 
-/// The computer's side done by the real thing: `pass sync`, pass.py's own command.
+/// The other implementation on the other side: `pass sync`, pass.py's own command, as device `b`.
 #[test]
 #[ignore = "needs root, OpenSSH, gpg, git and a pass.py that has `sync`"]
-fn with_pass_sync_on_the_computer() {
-    let (scene, pc_ssh) = Scene::new();
-    let world = &scene.world;
-    let store = world.path("computer-store");
-    let (pc, phone_fpr) = (&scene.pc.fingerprint, &scene.phone_key.fingerprint);
+fn with_pass_py_as_the_other_device() {
+    let world = World::new();
+    // The computer's key has no passphrase: pass.py asks gpg, and gpg would ask a terminal.
+    let mut generate = world.command("gpg");
+    generate.args([
+        "--batch",
+        "--quiet",
+        "--passphrase",
+        "",
+        "--quick-generate-key",
+        "b <b@example.org>",
+        "ed25519",
+        "sign",
+        "never",
+    ]);
+    world.run(generate, None);
+    let listing = world
+        .gpg(&["--with-colons", "--list-keys", "b@example.org"], None)
+        .text();
+    let fingerprint = listing
+        .lines()
+        .find_map(|line| line.strip_prefix("fpr:"))
+        .map(|rest| rest.trim_matches(':').to_string())
+        .unwrap();
+    let mut subkey = world.command("gpg");
+    subkey.args([
+        "--batch",
+        "--quiet",
+        "--passphrase",
+        "",
+        "--quick-add-key",
+        &fingerprint,
+        "cv25519",
+        "encr",
+        "never",
+    ]);
+    world.run(subkey, None);
+    let pc = Key {
+        public: world.gpg(&["--armor", "--export", &fingerprint], None).text(),
+        secret: String::new(),
+        email: "b@example.org".into(),
+        fingerprint,
+    };
+    let ssh = world.ssh_key("b");
+    let public = ssh.public.clone();
+    let fleet = Fleet::with(world, &["a"], &[&public], &[pc.peer("b")]);
+    let (a, world) = (fleet.device("a"), &fleet.world);
+    world.import_key(&a.key.public_key, &a.key.fingerprint);
+    let store = world.path("b-store");
     let pass = |args: &[&str], stdin: Option<&[u8]>| world.pass(&store, args, stdin);
-    pass(&["init", pc, phone_fpr], None);
-    pass(&["git", "init"], None);
-    pass(&["insert", "-m", "bank"], Some(b"hunter2\nlogin: alice\n"));
-    pass(&["insert", "-m", "wifi"], Some(b"home-network\n"));
-    // `pass sync` calls gpg without `PASSWORD_STORE_GPG_OPTS`, so it cannot be handed the passphrase
-    // the way the rest of pass.py is here: the agent is given it once instead, as a session would have.
-    world.gpg(&["--local-user", pc, "--output", "/dev/null", "--sign"], Some(b"x"));
-    world.gpg_decrypt(&store.join("bank.gpg"));
-    pass(&["sync", "setup", "pc", &scene.zone.url(), pc], None);
+    pass(&["sync", "setup", "b", &fleet.zone.url(), &pc.fingerprint], None);
     world.git(
         &store,
-        &["config", "pass-sync.sftp-options", &scene.zone.ssh_options(&pc_ssh)],
+        &["config", "pass-sync.sftp-options", &fleet.zone.ssh_options(&ssh)],
     );
-    pass(&["sync", "peer", "phone", phone_fpr], None);
-    pass(&["sync", "push"], None);
+    pass(&["sync", "peer", "a", &a.key.fingerprint], None);
 
-    // The phone takes what pass.py published, changes things, publishes.
-    let phone = scene.phone();
-    let update = phone.receive();
-    assert_eq!(update.commit, world.git(&store, &["rev-parse", "HEAD"]));
-    phone.accept(&update, &[]).unwrap();
-    assert_eq!(phone.password("bank"), "hunter2");
-    phone.insert("from-phone", "typed on the phone");
-    phone.edit("bank", "hunter3\nlogin: alice\n");
-    assert!(phone.sync().published);
-
-    // pass.py sees them, names their signer, shows them decrypted, and takes them.
+    // The phone makes the store; pass.py adopts it.
+    a.store
+        .create(vec!["a".into(), "b".into()], a.identity.clone())
+        .unwrap();
+    a.insert("seed", "s");
+    a.insert("bank", "hunter2");
+    a.sync();
     let fetched = pass(&["sync", "fetch"], None);
-    assert!(fetched.contains("phone: 2 commit(s) to take"), "{fetched}");
-    let log = pass(&["sync", "log", "phone"], None);
-    assert!(
-        log.contains("signed by phone") && log.contains("Edit password for bank using pass-ios."),
-        "{log}"
-    );
-    let diff = pass(&["sync", "diff", "phone"], None);
-    assert!(diff.contains("hunter3"), "{diff}");
-    pass(&["sync", "merge", "phone"], None);
-    assert_eq!(pass(&["show", "from-phone"], None), "typed on the phone\n\n");
-    assert_eq!(pass(&["show", "bank"], None), "hunter3\nlogin: alice\n\n");
-    // It has published the merged tip: the phone has nothing outstanding anymore.
-    let report = phone.sync();
-    assert_eq!(report.fetch, FetchOutcome::Received { update: None });
-    assert_eq!(report.state.outstanding, 0);
+    assert!(fetched.contains("a: ") && fetched.contains("to take"), "{fetched}");
+    let shown = pass(&["sync", "log", "a"], None);
+    for line in ["added bank", "added seed", "readers /: a b"] {
+        assert!(shown.lines().any(|shown| shown == line), "{line} is not in:\n{shown}");
+    }
+    pass(&["sync", "merge", "a"], None);
+    assert_eq!(pass(&["show", "bank"], None).trim_end(), "hunter2");
+    assert_eq!(a.stands_with("b"), "nothing to take");
 
-    // Both change different entries: pass.py refuses to merge until the phone has merged its tip.
-    pass(&["insert", "-m", "from-pc"], Some(b"typed on the computer\n"));
-    phone.insert("second", "again");
-    phone.sync();
-    pass(&["sync", "fetch"], None);
-    let refused = world.try_run(world.pass_command(&store, &["sync", "merge", "phone"]), None);
-    assert!(!refused.ok, "pass sync merge took a history that is not a fast-forward");
+    // Each changes the store; the phone merges, pass.py moves forward onto the merge.
+    pass(&["insert", "-m", "-f", "from-b"], Some(b"typed on the computer\n"));
+    pass(&["mv", "-f", "seed", "moved-by-b"], None);
     pass(&["sync", "push"], None);
-    let update = phone.receive();
-    assert_eq!(update.outstanding, 1);
-    phone.accept(&update, &[]).unwrap();
-    assert_eq!(phone.password("from-pc"), "typed on the computer");
-    phone.sync();
+    a.insert("from-a", "typed on the phone");
+    a.insert("seed", "changed on the phone");
+    assert_ne!(a.stands_with("b"), "nothing to take");
+    assert_eq!(a.pending("b"), ["added from-b", "moved seed -> moved-by-b"]);
+    assert_eq!(a.take("b", &[], &[]).kind, TakeKind::Merge);
+    assert_eq!(
+        a.show("moved-by-b").unwrap(),
+        "changed on the phone",
+        "moved there, changed here"
+    );
     pass(&["sync", "fetch"], None);
-    pass(&["sync", "merge", "phone"], None);
-    assert_eq!(pass(&["show", "second"], None), "again\n\n");
-    assert_eq!(phone.sync().state.outstanding, 0);
-    assert_eq!(world.log(&phone.directory, "HEAD"), world.log(&store, "HEAD"));
+    pass(&["sync", "merge", "a"], None);
+    assert_eq!(pass(&["show", "from-a"], None).trim_end(), "typed on the phone");
+    assert_eq!(pass(&["show", "moved-by-b"], None).trim_end(), "changed on the phone");
+
+    // Both change the same entry: each says so, in the same words, and the choice made on one holds on both.
+    pass(&["insert", "-m", "-f", "bank"], Some(b"from-b\n"));
+    pass(&["sync", "push"], None);
+    a.insert("bank", "from-a");
+    a.sync();
+    assert_eq!(a.pending("b"), ["changed bank", "conflict bank"]);
+    pass(&["sync", "fetch"], None);
+    let shown = pass(&["sync", "log", "a"], None);
+    for line in ["changed bank", "conflict bank"] {
+        assert!(shown.lines().any(|shown| shown == line), "{line} is not in:\n{shown}");
+    }
+    let refused = world.try_run(world.pass_command(&store, &["sync", "merge", "a"]), None);
+    assert!(!refused.ok, "pass sync merge took a conflict without a choice");
+    assert!(matches!(
+        a.try_take("b", &[], &[]),
+        Err(PassError::ChoiceRequired { .. })
+    ));
+    a.take("b", &[], &["bank"]);
+    pass(&["sync", "fetch"], None);
+    pass(&["sync", "merge", "a"], None);
+    assert_eq!(pass(&["show", "bank"], None).trim_end(), "from-b");
+    assert_eq!(a.show("bank").unwrap(), "from-b");
+    assert_eq!(a.stands_with("b"), "nothing to take");
+    assert_eq!(world.log(&a.dir, "HEAD"), world.log(&store, "HEAD"));
+    assert_eq!(a.store.stale().unwrap(), Vec::<String>::new());
 }

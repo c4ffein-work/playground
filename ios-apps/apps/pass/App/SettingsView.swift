@@ -3,7 +3,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// The setup, in the order it is needed (this device's key, the drop zone, the other devices),
-/// and the settings afterwards. Who can read what is not here: that is set on the computer.
+/// and the settings afterwards. Who reads what is not here: that is on each folder of the store.
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
 
@@ -81,7 +81,7 @@ private struct KeySection: View {
                     .textSelection(.enabled)
                 LabeledContent("Unlocked by", value: model.canUnlockWithBiometrics ? "Face ID" : "its passphrase, each time")
                 if let publicKey = model.ownPublicKey {
-                    ShareLink("Send the public key to the computer", item: publicKey)
+                    ShareLink("Send the public key to the other devices", item: publicKey)
                 }
             } else {
                 Toggle("Import a key made elsewhere", isOn: $importing)
@@ -110,9 +110,9 @@ private struct KeySection: View {
             Text("OpenPGP key")
         } footer: {
             if model.keyInfo != nil {
-                Text("On the computer: gpg --import the public key, compare the fingerprint above with what gpg shows, then pass sync peer \(model.settings.deviceName) <fingerprint>, and pass init with this key added where the phone should read.")
+                Text("On a computer: gpg --import the public key, compare the fingerprint above with what gpg shows, then pass sync peer \(model.settings.deviceName) <fingerprint>. Being a device is not reading: a folder is read by the devices it names.")
             } else {
-                Text("A key made here is this device's alone: the computer only ever gets its public half. With Face ID, the passphrase is kept in this device's keychain; without, it is typed at each unlock and kept nowhere.")
+                Text("A key made here is this device's alone: the others only ever get its public half. With Face ID, the passphrase is kept in this device's keychain; without, it is typed at each unlock and kept nowhere.")
             }
         }
         .fileImporter(isPresented: $pickingFile, allowedContentTypes: [.data, .text]) { result in
@@ -220,24 +220,18 @@ private struct DropZoneSection: View {
     }
 }
 
-/// The other devices: the computer that owns the store, and any other member.
+/// The other devices: equals, each known by a name and its public key.
 private struct PeersSection: View {
     @Environment(AppModel.self) private var model
 
     @State private var name = ""
     @State private var publicKey = ""
-    @State private var isOwner = true
 
     var body: some View {
         Section {
             ForEach(model.settings.peers) { peer in
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text(peer.name).font(.headline)
-                        if peer.isOwner {
-                            Text("owner").font(.caption).padding(.horizontal, 6).background(.tint.opacity(0.2), in: Capsule())
-                        }
-                    }
+                    Text(peer.name).font(.headline)
                     Text(groupedFingerprint(peer.fingerprint))
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
@@ -252,19 +246,17 @@ private struct PeersSection: View {
             TextEditor(text: $publicKey)
                 .font(.caption.monospaced())
                 .frame(minHeight: 60)
-            Toggle("It is the owner: the computer where the store is managed", isOn: $isOwner)
             Button("Add this device") {
-                if model.addPeer(name: name, publicKey: publicKey, isOwner: isOwner) {
+                if model.addPeer(name: name, publicKey: publicKey) {
                     name = ""
                     publicKey = ""
-                    isOwner = false
                 }
             }
             .disabled(name.isEmpty || publicKey.isEmpty)
         } header: {
             Text("Devices")
         } footer: {
-            Text("Each by its public key (gpg --export --armor <id>). Compare the fingerprint shown here with the one that device shows of itself: it is all that says a published file is really from it. Nothing received can add a device or change a key.")
+            Text("Each by its public key (gpg --export --armor <id>), under the name it gave itself. Compare the fingerprint shown here with the one that device shows of itself: it is all that says a published file is really from it. Nothing received can add a device or change a key. Every device must know every other: a store that names a key this one does not know is refused.")
         }
     }
 }

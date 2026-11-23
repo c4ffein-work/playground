@@ -79,14 +79,14 @@ public func storeTree(_ names: [String], locked: Set<String> = []) -> [StoreNode
 
 /// One line saying where the device stands, for under the sync button.
 public func describe(_ state: SyncState) -> String {
+    let waiting = state.peers.filter { $0.toTake > 0 }
     guard state.hasStore else {
-        return state.updateWaiting ? "The owner's store has arrived: look at it to take it." : "No store yet: sync to receive the owner's."
+        guard let first = waiting.first else { return "No store yet: sync to receive one, or make one here." }
+        return "A store has arrived from \(first.device): look at it to take it."
     }
-    var parts: [String] = []
-    if state.updateWaiting { parts.append("an update from the owner is waiting") }
-    if state.outstanding > 0 { parts.append("\(state.outstanding) change(s) of this device not taken by the owner yet") }
+    var parts = waiting.map { "\($0.toTake) to take from \($0.device)" }
     if state.unpublished { parts.append("not published yet") }
-    guard let first = parts.first else { return "In step with the owner." }
+    guard let first = parts.first else { return "Nothing to take." }
     return first.prefix(1).uppercased() + first.dropFirst() + parts.dropFirst().map { ", " + $0 }.joined() + "."
 }
 
@@ -101,20 +101,48 @@ public func warnings(for access: Access) -> [String] {
     if access.readers.contains(where: { $0.device == nil }) {
         warnings.append("One of its readers is a key this device does not know: it cannot write here.")
     }
-    if !access.matches {
+    if access.stale {
         warnings.append(
-            "The file is encrypted to \(access.encryptedTo.joined(separator: ", ")), not to the readers its folder lists: it was not encrypted again after they changed.")
+            "The file is encrypted to \(access.encryptedTo.joined(separator: ", ")), not to the readers its folder names: a device that reads it has yet to encrypt it again.")
     }
     return warnings
 }
 
-/// What an update does to an entry, in a word.
-public func describe(_ kind: ChangeKind) -> String {
+/// How one peer stands after a visit to the drop zone: `pc: 2 to take`.
+public func describe(_ sync: PeerSync) -> String {
+    let name = sync.state.device
+    switch sync.outcome {
+    case .nothingPublished: return "\(name): nothing published"
+    case .stale: return "\(name): an older file than the one already received was served, ignored"
+    case .refused(let reason): return "\(name): refused, \(reason)"
+    case .unchanged, .received:
+        return sync.state.toTake == 0 ? "\(name): nothing to take" : "\(name): \(sync.state.toTake) to take"
+    }
+}
+
+/// What a visit to the drop zone did, in a few sentences.
+public func describe(_ report: SyncReport) -> String {
+    var parts: [String] = []
+    if report.published { parts.append("Published.") }
+    if let refused = report.publishRefused { parts.append("Not published: \(refused).") }
+    parts += report.peers.map { describe($0) + "." }
+    return parts.joined(separator: " ")
+}
+
+/// How to take an update, in a word for a button.
+public func describe(_ kind: TakeKind) -> String {
     switch kind {
-    case .added: return "added"
-    case .changed: return "changed"
-    case .removed: return "removed"
-    case .renamed(let from): return "renamed from \(from)"
+    case .adopt: return "Take this store"
+    case .forward: return "Take"
+    case .merge: return "Merge"
+    }
+}
+
+/// The names an update needs a choice for: an entry, or a folder (`work/`) for its readers.
+public func conflicts(in update: PendingUpdate) -> [String] {
+    update.lines.compactMap {
+        if case .conflict(let name) = $0 { return name }
+        return nil
     }
 }
 
@@ -197,6 +225,40 @@ public final class PassService: Sendable {
         try await offMain { try store.rename(from: name, to: newName, overwrite: false, identity: identity) }
     }
 
+    public func removeFolder(_ folder: String, identity: Identity) async throws {
+        let store = store
+        try await offMain { try store.removeFolder(folder: folder, identity: identity) }
+    }
+
+    public func renameFolder(_ folder: String, to newName: String, identity: Identity) async throws {
+        let store = store
+        try await offMain { try store.renameFolder(from: folder, to: newName, identity: identity) }
+    }
+
+    /// Makes the store, here, read by these devices.
+    public func create(readers: [String], identity: Identity) async throws {
+        let store = store
+        try await offMain { try store.create(readers: readers, identity: identity) }
+    }
+
+    /// The readers a folder names itself: `nil` when it has those of the folder above.
+    public func ownReaders(ofFolder folder: String) async throws -> [Reader]? {
+        let store = store
+        return try await offMain { try store.folderReaders(folder: folder) }
+    }
+
+    /// Names the readers of a folder (none: those of the folder above), and encrypts again what this device reads there.
+    public func setReaders(ofFolder folder: String, to readers: [String], identity: Identity) async throws {
+        let store = store
+        try await offMain { try store.setReaders(folder: folder, readers: readers, identity: identity) }
+    }
+
+    /// The entries not encrypted to exactly the readers their folder names.
+    public func stale() async throws -> [String] {
+        let store = store
+        return try await offMain { try store.stale() }
+    }
+
     /// The same, at once: it reads a few references of the local repository, nothing more.
     public func currentState() throws -> SyncState {
         try store.syncState()
@@ -208,36 +270,38 @@ public final class PassService: Sendable {
         return try await offMain { try store.syncState() }
     }
 
-    /// One visit to the drop zone: publishes this device's tip when it changed, and receives the owner's file.
+    /// One visit to the drop zone: publishes this device's tip when it changed, and receives every peer's file.
     public func sync(_ zone: DropZone, identity: Identity) async throws -> SyncReport {
         let store = store
         return try await offMain { try store.sync(zone: zone, identity: identity) }
     }
 
-    /// What the owner published that has not been taken, described.
-    public func pendingUpdate() async throws -> PendingUpdate? {
+    /// What a peer published that has not been taken, described. Needs the key: two encryptions
+    /// of one content are the same entry, which only reading them tells.
+    public func pendingUpdate(from device: String, identity: Identity) async throws -> PendingUpdate? {
         let store = store
-        return try await offMain { try store.pendingUpdate() }
+        return try await offMain { try store.pendingUpdate(device: device, identity: identity) }
     }
 
-    /// An entry of the pending update, decrypted: before, here, and in the update.
-    public func versions(of name: String, identity: Identity) async throws -> EntryVersions {
+    /// What a name of the pending update is on each side, decrypted: before, here, and in the update.
+    public func versions(of name: String, from device: String, identity: Identity) async throws -> EntryVersions {
         let store = store
-        return try await offMain { try store.updateVersions(name: name, identity: identity) }
+        return try await offMain { try store.updateVersions(device: device, name: name, identity: identity) }
     }
 
-    /// Takes the update that was shown, and no other. Returns the entries that changed.
-    public func accept(_ update: PendingUpdate, choices: [Choice], identity: Identity) async throws -> [String] {
+    /// Takes the update that was shown, and no other.
+    public func take(_ update: PendingUpdate, choices: [Choice], identity: Identity) async throws -> Taken {
         let store = store
         return try await offMain {
-            try store.acceptUpdate(commit: update.commit, choices: choices, identity: identity)
+            try store.takeUpdate(device: update.device, commit: update.commit, choices: choices, identity: identity)
         }
     }
 
-    /// Gives up this device's commits the owner has not taken. Returns how many were dropped.
-    public func discardOutstanding() async throws -> UInt32 {
+    /// Gives up what this device has that a peer's tip does not, and stands where that peer does.
+    /// Returns how many commits were dropped.
+    public func drop(to device: String) async throws -> UInt32 {
         let store = store
-        return try await offMain { try store.discardOutstanding() }
+        return try await offMain { try store.dropTo(device: device) }
     }
 }
 

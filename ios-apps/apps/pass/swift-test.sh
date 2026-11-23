@@ -1,6 +1,6 @@
 #!/bin/sh
 # Runs the tests of the pass Swift package for real: Swift -> UniFFI -> Rust -> a drop zone
-# (dropzone/entrypoint.sh: OpenSSH), on a store made, managed and published by pass.py
+# (dropzone/entrypoint.sh: OpenSSH), with another device that is pass.py: a store made and published by it
 # (`pass sync`). Then has pass.py look at what the Swift side published, and take it.
 #   PASS_PY   path to a pass.py that has `sync` (default: ../clones/pass/pass.py)
 # Needs root and an account named `drop` (what the drop zone needs), sshd, sftp, gpg, git, python3.
@@ -52,7 +52,7 @@ gpg --batch --armor --export "$pc" >"$fixtures/pc-public.asc"
 ssh-keygen -q -t ed25519 -N '' -C pc -f "$work/pc.ssh"
 ssh-keygen -q -t ed25519 -N '' -C phone -f "$fixtures/phone.ssh"
 
-# Two drop zones: one will hold the owner's store as it was, the other as it is two changes later.
+# Two drop zones: one will hold the computer's store as it was, the other as it is two changes later.
 start_zone() { # start_zone <name>: sets port_<name> and hostkey_<name>
     port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
     DROPZONE_DATA="$zones/$1" DROPZONE_PORT="$port" DROPZONE_KEY_PC="$(cat "$work/pc.ssh.pub")" \
@@ -96,7 +96,7 @@ export PASS_E2E_EARLIER_URL="sftp://drop@127.0.0.1:$port_earlier" PASS_E2E_EARLI
 export PASS_E2E_LATER_URL="sftp://drop@127.0.0.1:$port_later" PASS_E2E_LATER_HOST_KEY="$hostkey_later"
 (cd "$package" && "$root/scripts/swift.sh" test)
 
-# What the Swift tests published in the second drop zone, as the owner would deal with it:
+# What the Swift tests published in the second drop zone, as the other device deals with it:
 # with pass.py's own `pass sync`, which refuses anything SYNC.md does not allow.
 fetched=$(pass sync fetch) || fail "pass sync fetch"
 case $fetched in
@@ -111,6 +111,6 @@ esac
 pass sync merge phone >/dev/null || fail "pass sync merge refused what the phone published"
 [ "$(pass show swift/added | head -n 1)" = from-swift ] || fail "pass does not show swift/added after the merge"
 [ "$(pass show bank | head -n 1)" = phone-version ] || fail "the version chosen on the phone is not the one merged"
-[ "$(pass show later | head -n 1)" = from-pc ] || fail "the owner's own change did not survive the merge"
+[ "$(pass show later | head -n 1)" = from-pc ] || fail "the computer's own change did not survive the merge"
 [ "$(pass show home/wifi | head -n 1)" = home-network ] || fail "the rename made on the phone is not there"
 echo "swift-test.sh: pass.py took what the Swift tests published: signed, merged, and gpg and pass read it"

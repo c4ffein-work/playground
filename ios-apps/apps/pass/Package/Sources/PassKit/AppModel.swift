@@ -11,9 +11,10 @@ public protocol SecretPasteboard: Sendable {
 public enum SetupStage: Equatable, Sendable {
     /// No OpenPGP key: make one here, or import one.
     case needsKey
-    /// The sync is not fully described: the drop zone, its pinned host key, this device's SSH key, the owner.
+    /// The sync is not fully described: this device's name, the drop zone, its pinned host key, this device's SSH key.
     case needsDropZone
-    /// Everything is there but the store itself: sync, look at what the owner published, accept it.
+    /// Everything is there but the store itself: sync, look at what another device published and
+    /// take it; or make the store here.
     case needsStore
     case ready
 }
@@ -28,7 +29,7 @@ public final class AppModel {
     public private(set) var settings: PassSettings
     /// This device's OpenPGP key, described. `nil` when there is none.
     public private(set) var keyInfo: KeyInfo?
-    /// Its public half, armored: what the owner imports on the computer.
+    /// Its public half, armored: what every other device is given.
     public private(set) var ownPublicKey: String?
     /// The public half of this device's SSH key: what the drop zone is given.
     public private(set) var deviceKey: DeviceKey?
@@ -45,10 +46,16 @@ public final class AppModel {
     public private(set) var isSyncing = false
     /// What the last sync did, in a sentence.
     public private(set) var syncMessage: String?
-    /// What the owner published that has not been taken: to be looked at, then accepted or left.
-    public private(set) var pendingUpdate: PendingUpdate?
-    /// For the entries both sides changed: which version to keep, once chosen.
+    /// How each peer answered at the last visit to the drop zone, by name: a refusal stays told.
+    public private(set) var outcomes: [String: FetchOutcome] = [:]
+    /// What one peer published that has not been taken, as last looked at (`openReview(of:)`): to be
+    /// taken as shown, or left.
+    public private(set) var review: PendingUpdate?
+    /// For what both sides did differently: which side to keep, whole, once chosen. By the
+    /// name the review gives the conflict: an entry, or a folder (`work/`) for its readers.
     public private(set) var choices: [String: Side] = [:]
+    /// The entries not encrypted to exactly the readers their folder names.
+    public private(set) var stale: [String] = []
 
     /// The last failure, for an alert. Set to `nil` to dismiss.
     public var errorMessage: String?
@@ -109,12 +116,15 @@ public final class AppModel {
     }
 
     /// (Re)opens the store with the current settings and keys. `nil` while the settings do not
-    /// make a valid set of devices (no owner yet, a bad name...): `configurationProblem` says why.
+    /// make a valid set of devices (a bad name, one key under two names...): `configurationProblem` says why.
     private func openStore() {
         service = nil
         configurationProblem = nil
         syncState = nil
-        guard let ownPublicKey, settings.owner != nil else { return }
+        review = nil
+        choices = [:]
+        outcomes = [:]
+        guard let ownPublicKey else { return }
         do {
             let opened = try PassService(config: settings.storeConfig(directory: storeDirectory, ownPublicKey: ownPublicKey))
             service = opened
@@ -124,8 +134,8 @@ public final class AppModel {
         }
     }
 
-    /// Why the devices as they are set up cannot be used (two owners, a key that is not the one
-    /// with the fingerprint...). `nil` when they can.
+    /// Why the devices as they are set up cannot be used (a name used twice, a key that is not
+    /// the one with the fingerprint...). `nil` when they can.
     public private(set) var configurationProblem: String?
 
     /// Keeps a key that was just checked: the key in the keychain (still protected by its
@@ -147,11 +157,12 @@ public final class AppModel {
     }
 
     /// Makes this device's OpenPGP key, here: its private half never exists anywhere else.
-    /// The public half (`ownPublicKey`) is then for the owner to import and add as a recipient.
+    /// The public half (`ownPublicKey`) is then for the other devices, which name this one by it.
     @discardableResult
     public func makeKey(passphrase: String, policy: PassphrasePolicy) async -> Bool {
         do {
-            let name = "pass on \(settings.deviceName)"
+            // The device's name, so that a `.gpg-id` line written by hand on a computer finds it.
+            let name = settings.deviceName
             let made = try await offMain { try generateOpenpgpKey(userId: name, passphrase: passphrase) }
             try await keep(secretKey: made.secretKey, passphrase: passphrase, policy: policy)
             return true
@@ -195,18 +206,14 @@ public final class AppModel {
     /// Adds another device, from its armored public key. Its fingerprint is taken from the key:
     /// it is to be compared by eye with what that device shows of itself before relying on it.
     @discardableResult
-    public func addPeer(name: String, publicKey: String, isOwner: Bool) -> Bool {
+    public func addPeer(name: String, publicKey: String) -> Bool {
         do {
             guard PassSettings.isDeviceName(name) else {
                 errorMessage = "A device name is lowercase letters, digits and hyphens, 32 at most."
                 return false
             }
-            guard name != settings.deviceName, !settings.peers.contains(where: { $0.name == name }) else {
+            guard !settings.deviceNames.contains(name) else {
                 errorMessage = "There is already a device named \(name)."
-                return false
-            }
-            guard !isOwner || settings.owner == nil else {
-                errorMessage = "There is already an owner: \(settings.owner?.name ?? ""). Remove it first."
                 return false
             }
             let info = try inspectKey(key: publicKey)
@@ -214,9 +221,13 @@ public final class AppModel {
                 errorMessage = "This is a secret key: a device is added by its public key."
                 return false
             }
+            guard info.fingerprint != keyInfo?.fingerprint,
+                  !settings.peers.contains(where: { $0.fingerprint == info.fingerprint }) else {
+                errorMessage = "This key is already a device's."
+                return false
+            }
             var changed = settings
-            changed.peers.append(PeerSettings(
-                name: name, fingerprint: info.fingerprint, publicKey: publicKey, isOwner: isOwner))
+            changed.peers.append(PeerSettings(name: name, fingerprint: info.fingerprint, publicKey: publicKey))
             save(changed)
             return true
         } catch {
@@ -258,9 +269,8 @@ public final class AppModel {
         settings = PassSettings()
         entries = []
         locked = []
+        stale = []
         syncMessage = nil
-        pendingUpdate = nil
-        choices = [:]
         loadKeys()
         openStore()
     }
@@ -339,25 +349,33 @@ public final class AppModel {
         }
     }
 
-    /// Reads the list of entries, what is locked, the sync state and the waiting update again. Needs no key.
+    /// Reads the list of entries, what is locked or stale, and the sync state again. Needs no
+    /// key; with the key, the review that is open is read again too.
     public func refresh() async {
         guard let service else {
             entries = []
             locked = []
+            stale = []
             return
         }
         do {
             entries = try await service.entries()
             locked = Set(try await service.unreadable())
+            stale = try await service.stale()
             syncState = try await service.syncState()
-            let update = try await service.pendingUpdate()
-            if update != pendingUpdate {
-                // Another update than the one the choices were made for.
-                choices = [:]
-                pendingUpdate = update
+            if let device = review?.device, let identity {
+                setReview(try await service.pendingUpdate(from: device, identity: identity))
             }
         } catch {
             fail(error)
+        }
+    }
+
+    private func setReview(_ update: PendingUpdate?) {
+        if update != review {
+            // Another update than the one the choices were made for.
+            choices = [:]
+            review = update
         }
     }
 
@@ -369,6 +387,34 @@ public final class AppModel {
     /// Who can read what is put in a folder (`""` for the top of the store).
     public func access(toFolder folder: String) async -> Access? {
         try? await service?.access(toFolder: folder)
+    }
+
+    /// The devices a folder names as its readers itself; `nil` when it names none and has those
+    /// of the folder above. For the readers editor.
+    public func ownReaders(ofFolder folder: String) async -> [String]? {
+        guard let readers = try? await service?.ownReaders(ofFolder: folder) else { return nil }
+        return readers.compactMap(\.device)
+    }
+
+    /// Names the readers of a folder among `settings.deviceNames`; none gives it those of the
+    /// folder above again. What this device reads there is encrypted again for them; what it
+    /// does not read stays `stale` until a device that reads it takes the change: naming
+    /// oneself is asking, not getting.
+    @discardableResult
+    public func setReaders(ofFolder folder: String, to readers: [String]) async -> Bool {
+        let done: Void? = await withIdentity {
+            try await $0.setReaders(ofFolder: folder, to: readers.sorted(), identity: $1)
+        }
+        if done != nil { await changed() }
+        return done != nil
+    }
+
+    /// Makes the store here, read by these devices, when no other device has one to take.
+    @discardableResult
+    public func createStore(readers: [String]) async -> Bool {
+        let done: Void? = await withIdentity { try await $0.create(readers: readers.sorted(), identity: $1) }
+        if done != nil { await changed() }
+        return done != nil
     }
 
     /// Runs something that needs the unlocked key, and reports its failure.
@@ -454,6 +500,20 @@ public final class AppModel {
         return done != nil
     }
 
+    @discardableResult
+    public func deleteFolder(_ folder: String) async -> Bool {
+        let done: Void? = await withIdentity { try await $0.removeFolder(folder, identity: $1) }
+        if done != nil { await changed() }
+        return done != nil
+    }
+
+    @discardableResult
+    public func renameFolder(_ folder: String, to newName: String) async -> Bool {
+        let done: Void? = await withIdentity { try await $0.renameFolder(folder, to: newName, identity: $1) }
+        if done != nil { await changed() }
+        return done != nil
+    }
+
     /// Puts a secret on the clipboard: for this device only, and for `clipboardExpiry` seconds.
     public func copy(_ text: String) {
         userDidInteract()
@@ -467,10 +527,13 @@ public final class AppModel {
 
     // MARK: Sync
 
-    /// How long ago the owner signed the last file received: "published 3 days ago".
-    public var ownerPublishedAgo: String? {
-        guard let state = syncState, state.ownerPublishedAt > 0 else { return nil }
-        let seconds = max(0, Int(now().timeIntervalSince1970) - Int(state.ownerPublishedAt))
+    /// The other devices, as they stand: what was received from each, and how much of it is to take.
+    public var peers: [PeerState] { syncState?.peers ?? [] }
+
+    /// How long ago a peer signed the last file received from it: "published 3 days ago".
+    public func publishedAgo(_ peer: PeerState) -> String? {
+        guard peer.received, peer.publishedAt > 0 else { return nil }
+        let seconds = max(0, Int(now().timeIntervalSince1970) - Int(peer.publishedAt))
         switch seconds {
         case ..<120: return "published just now"
         case ..<7200: return "published \(seconds / 60) minutes ago"
@@ -479,22 +542,20 @@ public final class AppModel {
         }
     }
 
-    private func describe(_ report: SyncReport) -> String {
-        var parts: [String] = []
-        if report.published { parts.append("Published this device's changes.") }
-        switch report.fetch {
-        case .nothingPublished: parts.append("The owner has published nothing yet.")
-        case .unchanged: parts.append("Nothing new from the owner.")
-        case .received(let update):
-            parts.append(update == nil ? "The owner has everything of this device." : "An update from the owner is waiting.")
-        case .stale: parts.append("The drop zone served an older file than the one already received: ignored.")
-        case .refused(let reason): parts.append(reason.prefix(1).uppercased() + reason.dropFirst() + ".")
+    /// Where a peer stands, in a few words: `2 to take`, or why its file was refused.
+    public func standing(of peer: PeerState) -> String {
+        switch outcomes[peer.device] {
+        case .refused(let reason): return "refused: \(reason)"
+        case .stale: return "an older file was served: ignored"
+        default: break
         }
-        return parts.joined(separator: " ")
+        if !peer.received { return "nothing received" }
+        return peer.toTake == 0 ? "nothing to take" : "\(peer.toTake) to take"
     }
 
     /// One visit to the drop zone: publishes this device's tip when it changed, and receives what
-    /// the owner published. Nothing received is applied: it becomes `pendingUpdate`, to be looked at.
+    /// every peer published. Nothing received is applied: each peer then has so much "to take",
+    /// to be looked at (`openReview(of:)`) and taken or left.
     /// Needs the key: the files are encrypted to it and signed with it.
     public func sync() async {
         await sync(quietly: false)
@@ -513,7 +574,9 @@ public final class AppModel {
         isSyncing = true
         defer { isSyncing = false }
         do {
-            syncMessage = describe(try await service.sync(dropZone, identity: identity))
+            let report = try await service.sync(dropZone, identity: identity)
+            outcomes = Dictionary(uniqueKeysWithValues: report.peers.map { ($0.state.device, $0.outcome) })
+            syncMessage = describe(report)
         } catch {
             if quietly {
                 syncMessage = "Not published yet: \(message(for: error))"
@@ -524,47 +587,78 @@ public final class AppModel {
         await refresh()
     }
 
-    /// The entries of the waiting update that both sides changed and that have no choice yet.
-    public var undecided: [String] {
-        (pendingUpdate?.entries ?? []).filter { $0.conflict && choices[$0.name] == nil }.map(\.name)
+    /// Looks at what a peer published that has not been taken: it becomes `review`. `nil` when
+    /// there is nothing to take from it. Needs the key.
+    @discardableResult
+    public func openReview(of device: String) async -> PendingUpdate? {
+        let update = await withIdentity { try await $0.pendingUpdate(from: device, identity: $1) }
+        guard let update else {
+            review = nil
+            choices = [:]
+            return nil
+        }
+        setReview(update)
+        return review
     }
 
-    /// Keeps this device's version or the owner's, for an entry both changed.
+    /// Leaves the review: nothing is taken, and it is still there to take later.
+    public func closeReview() {
+        review = nil
+        choices = [:]
+    }
+
+    /// The review, in the words of SYNC.md, one line per thing it does: `added bank`, `moved a -> b`,
+    /// `readers work/: pc phone`, `stale work/w1`, `conflict bank`.
+    public var reviewLines: [String] {
+        (review?.lines ?? []).map { reviewLineText(line: $0) }
+    }
+
+    /// What the review needs a choice for and has none yet.
+    public var undecided: [String] {
+        review.map { conflicts(in: $0).filter { choices[$0] == nil } } ?? []
+    }
+
+    /// Keeps this device's side or the peer's, whole, for one conflict of the review.
     public func choose(_ side: Side, for name: String) {
         choices[name] = side
     }
 
-    /// An entry of the waiting update, decrypted: before the owner's changes, here, and in the update.
+    /// What a name of the review is on each side, decrypted: where both started, here, and in the update.
     public func versions(of name: String) async -> EntryVersions? {
-        await withIdentity { try await $0.versions(of: name, identity: $1) }
+        guard let device = review?.device else { return nil }
+        return await withIdentity { try await $0.versions(of: name, from: device, identity: $1) }
     }
 
-    /// Takes the update that `pendingUpdate` shows: exactly that one. With changes of this device
-    /// outstanding it is a merge, which needs every choice made; then the result is published.
+    /// Takes what `review` shows: exactly that. A merge needs every choice made. What taking it
+    /// asks this device to encrypt again is encrypted again, and the result is published.
     @discardableResult
-    public func acceptUpdate() async -> Bool {
-        guard let update = pendingUpdate else { return false }
+    public func take() async -> Bool {
+        guard let update = review else { return false }
         guard undecided.isEmpty else {
-            errorMessage = "Choose a version for: \(undecided.joined(separator: ", "))."
+            errorMessage = "Choose a side for: \(undecided.joined(separator: ", "))."
             return false
         }
-        let kept = choices.map { Choice(name: $0.key, keep: $0.value) }
-        let taken = await withIdentity { try await $0.accept(update, choices: kept, identity: $1) }
-        guard taken != nil else {
+        let kept = choices.sorted { $0.key < $1.key }.map { Choice(name: $0.key, keep: $0.value) }
+        let taken = await withIdentity { try await $0.take(update, choices: kept, identity: $1) }
+        guard let taken else {
             await refresh()
             return false
         }
+        review = nil
         choices = [:]
         await changed()
+        if !taken.reencrypted.isEmpty {
+            syncMessage = "Encrypted \(taken.reencrypted.count) entries again for their readers. " + (syncMessage ?? "")
+        }
         return true
     }
 
-    /// Gives up this device's changes that the owner has not taken, and goes back to the owner's
-    /// history as it was last accepted. Then publishes where it now stands.
-    public func discardOutstanding() async {
+    /// Gives up what this device has that a peer's tip does not, and stands where that peer
+    /// does. Then publishes where it now stands.
+    public func drop(to device: String) async {
         guard let service else { return }
         do {
-            let dropped = try await service.discardOutstanding()
+            let dropped = try await service.drop(to: device)
             await changed()
             syncMessage = "Dropped \(dropped) change(s) of this device."
         } catch {
