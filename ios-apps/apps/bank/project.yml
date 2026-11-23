@@ -1,0 +1,55 @@
+# XcodeGen spec: `make xcode APP=bank` (from ios-apps/) builds the Rust core and generates Bank.xcodeproj.
+# Before the first build on a device, change dev.cafeine to an identifier of your own,
+# and set DEVELOPMENT_TEAM (or pick the team in Xcode > Signing & Capabilities).
+name: Bank
+options:
+  bundleIdPrefix: dev.cafeine
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+packages:
+  BankKit:
+    path: Package
+targets:
+  Bank:
+    type: application
+    platform: iOS
+    sources: [App]
+    dependencies:
+      - package: BankKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cafeine.bank
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Bank
+        UILaunchScreen: {}
+        ITSAppUsesNonExemptEncryption: false
+        # The Rust core opens plain sockets: App Transport Security does not apply to it.
+        # Its own rule is stricter: https only, to pinned certificates only.
+        NSCameraUsageDescription: Bank takes a photo of a receipt to attach it to a transaction.
+        # The photo picker runs out of process and needs no permission: this is for the day it is not enough.
+        NSPhotoLibraryUsageDescription: Bank attaches a photo of a receipt from your library to a transaction.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+    entitlements:
+      path: App/Bank.entitlements
+      properties:
+        # Every file of the app (the downloaded attachments, the settings) is encrypted while the phone is locked.
+        com.apple.developer.default-data-protection: NSFileProtectionComplete
