@@ -3,67 +3,49 @@ import XCTest
 @testable import PassKit
 
 final class SettingsTests: XCTestCase {
-    func testSSHNeedsAPinnedHostKeyAndADeviceKey() {
+    func testTheSyncNeedsADropZoneItsPinnedKeyAndAnOwner() {
         var settings = PassSettings()
-        XCTAssertFalse(settings.isRemoteComplete)
-        settings.url = " git@relay.example:store.git\n"
-        XCTAssertFalse(settings.isRemoteComplete, "no SSH before the host key is pinned")
-        settings.sshHostKey = "SHA256:abc"
-        XCTAssertTrue(settings.isRemoteComplete)
-        XCTAssertNil(settings.remote(sshPrivateKey: nil, httpsToken: "t"), "no device key yet")
-        XCTAssertEqual(
-            settings.remote(sshPrivateKey: "KEY", httpsToken: "t"),
-            .ssh(url: "git@relay.example:store.git", privateKey: "KEY", hostKey: "SHA256:abc"))
-        settings.deviceName = ""
-        XCTAssertFalse(settings.isRemoteComplete, "the device's branch needs a name")
+        XCTAssertFalse(settings.isSyncComplete)
+        settings.dropZoneURL = " sftp://drop@zone.example:2222\n"
+        settings.dropZoneHostKey = "SHA256:abc"
+        XCTAssertFalse(settings.isSyncComplete, "nobody to sync with")
+        settings.peers = [PeerSettings(name: "tablet", fingerprint: "AB", publicKey: "KEY", isOwner: false)]
+        XCTAssertFalse(settings.isSyncComplete, "a member is not the owner")
+        XCTAssertNil(settings.owner)
+        settings.peers.append(PeerSettings(name: "pc", fingerprint: "CD", publicKey: "KEY", isOwner: true))
+        XCTAssertTrue(settings.isSyncComplete)
+        XCTAssertEqual(settings.owner?.name, "pc")
+
+        XCTAssertNil(settings.dropZone(sshPrivateKey: nil), "no SSH key yet")
+        let zone = settings.dropZone(sshPrivateKey: "KEY")
+        XCTAssertEqual(zone?.url, "sftp://drop@zone.example:2222")
+        XCTAssertEqual(zone?.hostKey, "SHA256:abc")
+
+        settings.dropZoneHostKey = nil
+        XCTAssertFalse(settings.isSyncComplete, "nothing is sent to a server whose key is not pinned")
+        settings.dropZoneHostKey = "SHA256:abc"
+        settings.deviceName = "My Phone"
+        XCTAssertFalse(settings.isSyncComplete, "not a device name")
     }
 
-    func testHTTPSTrustFollowsTheURL() {
-        var settings = PassSettings()
-        settings.transport = .https
-        settings.url = "https://git.example/alice/store.git"
-        settings.httpsUsername = "alice"
-        XCTAssertFalse(settings.isRemoteComplete, "https is never trusted by omission")
-        XCTAssertNil(settings.trust)
-
-        let pin = String(repeating: "ab", count: 32)
-        settings.pinSHA256 = pin
-        XCTAssertEqual(settings.trust, .pinnedOnly(sha256: pin))
-        settings.verifyChain = true
-        XCTAssertEqual(settings.trust, .pinnedWithCa(sha256: pin, extraCaPem: nil))
-        settings.trustPublicCAs = true
-        XCTAssertEqual(settings.trust, .publicCa)
-        XCTAssertEqual(
-            settings.remote(sshPrivateKey: "KEY", httpsToken: "t0ken"),
-            .http(url: "https://git.example/alice/store.git", username: "alice", password: "t0ken", trust: .publicCa))
-
-        // Plain http: no trust to speak of, and the token stays home.
-        settings.url = "http://10.0.0.2:8080/store.git"
-        XCTAssertTrue(settings.isPlainHTTP)
-        XCTAssertNil(settings.trust)
-        XCTAssertEqual(
-            settings.remote(sshPrivateKey: nil, httpsToken: "t0ken"),
-            .http(url: "http://10.0.0.2:8080/store.git", username: "alice", password: nil, trust: nil))
+    func testDeviceNames() {
+        for good in ["phone", "pc", "0", "alices-iphone-15", String(repeating: "a", count: 32)] {
+            XCTAssertTrue(PassSettings.isDeviceName(good), good)
+        }
+        for bad in ["", "-phone", "Phone", "my phone", "a/b", "é", String(repeating: "a", count: 33)] {
+            XCTAssertFalse(PassSettings.isDeviceName(bad), bad)
+        }
     }
 
     func testStoreConfig() {
         var settings = PassSettings()
-        settings.deviceName = "phone"
-        settings.otherPublicKeys = ["BOB"]
-        settings.signingKeys = ["ABCD"]
-        settings.requireSignedUpdates = true
-        let config = settings.storeConfig(directory: URL(fileURLWithPath: "/store"), ownPublicKey: "ALICE")
+        settings.peers = [PeerSettings(name: "pc", fingerprint: "ABCD", publicKey: "PC-KEY", isOwner: true)]
+        let config = settings.storeConfig(directory: URL(fileURLWithPath: "/store"), ownPublicKey: "MY-KEY")
         XCTAssertEqual(config.directory, "/store")
-        XCTAssertEqual(config.publicKeys, ["ALICE", "BOB"])
-        XCTAssertEqual(config.signingKeys, ["ABCD"])
-        XCTAssertTrue(config.requireSignedUpdates)
-        // Commits need an author: there is one even when none was typed.
-        XCTAssertEqual(config.authorName, "pass on phone")
-        XCTAssertEqual(config.authorEmail, "phone@pass.invalid")
-        settings.authorName = "Alice"
-        settings.authorEmail = "alice@example.org"
-        XCTAssertEqual(settings.storeConfig(directory: URL(fileURLWithPath: "/store"), ownPublicKey: nil).authorName, "Alice")
-        XCTAssertNoThrow(try PassService(config: config.with(publicKeys: [])))
+        XCTAssertEqual(config.device, "phone")
+        XCTAssertEqual(config.publicKey, "MY-KEY")
+        XCTAssertEqual(config.peers, [Peer(name: "pc", fingerprint: "ABCD", publicKey: "PC-KEY", isOwner: true)])
+        // The core checks the keys themselves.
         XCTAssertThrowsError(try PassService(config: config)) {
             XCTAssertTrue(message(for: $0).contains("not an OpenPGP public key"), message(for: $0))
         }
@@ -77,8 +59,9 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(store.load(), PassSettings())
 
         var settings = PassSettings()
-        settings.url = "git@relay.example:store.git"
-        settings.sshHostKey = "SHA256:abc"
+        settings.dropZoneURL = "sftp://drop@zone.example"
+        settings.dropZoneHostKey = "SHA256:abc"
+        settings.peers = [PeerSettings(name: "pc", fingerprint: "ABCD", publicKey: "KEY", isOwner: true)]
         settings.passphrasePolicy = .keychainWithBiometrics
         settings.lockAfter = 30
         try store.save(settings)
@@ -89,10 +72,10 @@ final class SettingsTests: XCTestCase {
         try store.setSecret("", for: .sshPrivateKey)
         XCTAssertNil(store.secret(.sshPrivateKey), "an empty secret is no secret")
 
-        try store.setSecret("t", for: .httpsToken)
+        try store.setSecret("k", for: .openPGPSecretKey)
         try store.erase()
         XCTAssertEqual(store.load(), PassSettings())
-        XCTAssertNil(store.secret(.httpsToken))
+        XCTAssertNil(store.secret(.openPGPSecretKey))
     }
 
     func testOnlyThePassphraseIsBehindBiometry() {
@@ -100,44 +83,67 @@ final class SettingsTests: XCTestCase {
     }
 }
 
-extension StoreConfig {
-    func with(publicKeys: [String]) -> StoreConfig {
-        var copy = self
-        copy.publicKeys = publicKeys
-        return copy
-    }
-}
-
 final class PresentationTests: XCTestCase {
     func testTree() {
-        let tree = storeTree(["bank", "Email/work", "Email/Perso", "email", "web/shops/corner", "web/a", "Email"])
-        XCTAssertEqual(tree.map(\.id), ["Email/", "web/", "bank", "Email", "email"])
+        let tree = storeTree(
+            ["bank", "Email/work", "Email/Perso", "email", "web/shops/corner", "web/a", "Email", "private/diary"],
+            locked: ["private/diary", "web/a"])
+        XCTAssertEqual(tree.map(\.id), ["Email/", "private/", "web/", "bank", "Email", "email"])
         let email = tree[0]
         XCTAssertTrue(email.isFolder)
         XCTAssertEqual(email.children.map(\.path), ["Email/Perso", "Email/work"])
         XCTAssertEqual(email.entryCount, 2)
-        let web = tree[1]
+        let web = tree[2]
         XCTAssertEqual(web.children.map(\.id), ["web/shops/", "web/a"])
         XCTAssertEqual(web.children[0].children.map(\.path), ["web/shops/corner"])
-        XCTAssertEqual(web.entryCount, 2)
+        // What this device cannot read is listed, and marked.
+        XCTAssertEqual(tree[1].children.map(\.isLocked), [true])
+        XCTAssertEqual(web.children.map(\.isLocked), [false, true])
+        XCTAssertFalse(tree[3].isLocked)
         // An entry and a folder of the same name are two rows.
-        XCTAssertFalse(tree[3].isFolder)
-        XCTAssertEqual(tree[3].path, "Email")
+        XCTAssertFalse(tree[4].isFolder)
+        XCTAssertEqual(tree[4].path, "Email")
         XCTAssertEqual(storeTree([]), [])
     }
 
     func testSyncStateInWords() {
-        func state(unmerged: UInt32 = 0, unpushed: UInt32 = 0, behind: UInt32 = 0, repository: Bool = true) -> SyncState {
+        func state(store: Bool = true, outstanding: UInt32 = 0, unpublished: Bool = false, waiting: Bool = false) -> SyncState {
             SyncState(
-                isRepository: repository, branch: "main", deviceBranch: "devices/phone", lastSubject: "", lastTime: 0,
-                unmerged: unmerged, unpushed: unpushed, behind: behind)
+                hasStore: store, outstanding: outstanding, unpublished: unpublished, updateWaiting: waiting,
+                ownerPublishedAt: 0, lastSubject: "", lastTime: 0)
         }
-        XCTAssertEqual(describe(state()), "Up to date with main.")
-        XCTAssertEqual(describe(state(unmerged: 2, unpushed: 2)), "2 change(s) to send.")
-        XCTAssertEqual(describe(state(unmerged: 3, unpushed: 1)), "1 change(s) to send, 2 change(s) sent, waiting to be merged.")
+        XCTAssertEqual(describe(state()), "In step with the owner.")
+        XCTAssertEqual(describe(state(store: false)), "No store yet: sync to receive the owner's.")
+        XCTAssertEqual(describe(state(store: false, waiting: true)), "The owner's store has arrived: look at it to take it.")
+        XCTAssertEqual(describe(state(waiting: true)), "An update from the owner is waiting.")
         XCTAssertEqual(
-            describe(state(unmerged: 1, behind: 4)), "1 change(s) sent, waiting to be merged, 4 new change(s) on main.")
-        XCTAssertEqual(describe(state(repository: false)), "Not synced: the store is not a git repository.")
+            describe(state(outstanding: 2, unpublished: true)),
+            "2 change(s) of this device not taken by the owner yet, not published yet.")
+    }
+
+    func testWhoCanRead() {
+        let pc = Reader(id: "AAAA1111BBBB2222", device: "pc")
+        let phone = Reader(id: "phone@example.org", device: "phone")
+        let stranger = Reader(id: "0123456789ABCDEF0123456789ABCDEF01234567", device: nil)
+        XCTAssertEqual(describe([pc, phone]), "pc, phone")
+        XCTAssertEqual(describe([pc, stranger]), "pc, unknown key 01234567")
+        XCTAssertEqual(describe([Reader]()), "")
+
+        func access(_ readers: [Reader], encryptedTo: [String], matches: Bool) -> Access {
+            Access(gpgId: ".gpg-id", readers: readers, listed: true, encryptedTo: encryptedTo, readable: true, matches: matches)
+        }
+        XCTAssertEqual(warnings(for: access([pc, phone], encryptedTo: ["pc", "phone"], matches: true)), [])
+        XCTAssertEqual(
+            warnings(for: access([pc, stranger], encryptedTo: ["pc", "key 1"], matches: true)),
+            ["One of its readers is a key this device does not know: it cannot write here."])
+        let stale = warnings(for: access([pc], encryptedTo: ["pc", "phone"], matches: false))
+        XCTAssertEqual(stale.count, 1)
+        XCTAssertTrue(stale[0].hasPrefix("The file is encrypted to pc, phone, not to the readers its folder lists"))
+    }
+
+    func testChangeKindsInWords() {
+        XCTAssertEqual(describe(ChangeKind.added), "added")
+        XCTAssertEqual(describe(ChangeKind.renamed(from: "bank")), "renamed from bank")
     }
 
     func testFingerprintGrouping() {
@@ -147,7 +153,9 @@ final class PresentationTests: XCTestCase {
 
     func testErrorsFromTheCoreAreReadable() {
         XCTAssertEqual(message(for: PassError.NotFound(name: "bank")), "bank is not in the password store")
-        XCTAssertEqual(message(for: PassError.WrongPassphrase), "wrong passphrase")
+        XCTAssertEqual(
+            message(for: PassError.ChoiceRequired(names: ["bank", "wifi"])),
+            "both sides changed bank, wifi: choose which version to keep")
         XCTAssertThrowsError(try inspectKey(key: "nope")) {
             XCTAssertTrue(message(for: $0).hasPrefix("not an OpenPGP public key"), message(for: $0))
         }
@@ -181,7 +189,7 @@ final class FakePasteboard: SecretPasteboard, @unchecked Sendable {
 /// A clock the tests move by hand.
 final class FakeClock: @unchecked Sendable {
     private let lock = NSLock()
-    private var current = Date(timeIntervalSince1970: 1_800_000_000)
+    private var current = Date()
 
     var now: Date {
         lock.lock()
@@ -224,6 +232,7 @@ final class Fixture {
     }
 }
 
+/// The model with no computer and no drop zone in sight: keys, devices, the lock.
 @MainActor
 final class ModelTests: XCTestCase {
     func testAFreshInstallAsksForAKey() async throws {
@@ -235,146 +244,86 @@ final class ModelTests: XCTestCase {
         XCTAssertFalse(model.canUnlockWithBiometrics)
         XCTAssertEqual(model.entries, [])
         XCTAssertNil(model.searchResults)
+        XCTAssertNil(model.ownPublicKey)
 
         let unlocked = await model.unlock(passphrase: "x")
         XCTAssertFalse(unlocked)
-        XCTAssertEqual(model.errorMessage, "No secret key on this device.")
+        XCTAssertEqual(model.errorMessage, "No key on this device.")
         model.errorMessage = nil
         let imported = await model.importSecretKey("not a key", passphrase: "x", policy: .askEachTime)
         XCTAssertFalse(imported)
         XCTAssertNotNil(model.errorMessage)
         XCTAssertNil(fixture.store.secret(.openPGPSecretKey), "nothing is kept of a key that was refused")
 
+        model.errorMessage = nil
         await model.sync()
-        XCTAssertEqual(model.errorMessage, "The relay is not set up yet.")
+        XCTAssertEqual(model.errorMessage, "The sync is not set up yet.")
     }
 
-    // (async like its neighbours: on Linux, XCTest cannot list tests of both kinds in a main-actor class.)
-    func testTheDeviceKeyIsMadeOnceAndItsPrivateHalfStaysInTheKeychain() async throws {
+    func testAKeyMadeHereNeverLeavesButItsPublicHalf() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
         let model = fixture.model()
-        XCTAssertNil(model.deviceKey)
-        XCTAssertNil(model.authorizedKeysLine)
-        model.makeDeviceKey()
-        let key = try XCTUnwrap(model.deviceKey)
-        XCTAssertTrue(key.publicKey.hasPrefix("ssh-ed25519 AAAA"))
-        XCTAssertTrue(key.publicKey.hasSuffix(" pass on phone"))
-        XCTAssertEqual(key.privateKey, "", "the model does not hand the private half around")
-        XCTAssertTrue(try XCTUnwrap(fixture.store.secret(.sshPrivateKey)).contains("OPENSSH PRIVATE KEY"))
-        XCTAssertEqual(
-            model.authorizedKeysLine,
-            #"command="PASS_DEVICE=phone exec git-shell -c \"$SSH_ORIGINAL_COMMAND\"",restrict \#(key.publicKey)"#)
+        let made = await model.makeKey(passphrase: "correct horse", policy: .askEachTime)
+        XCTAssertTrue(made, model.errorMessage ?? "")
+        let info = try XCTUnwrap(model.keyInfo)
+        XCTAssertEqual(info.userIds, ["pass on phone"])
+        XCTAssertEqual(info.fingerprint.count, 40)
+        XCTAssertTrue(info.isSecret && info.needsPassphrase)
+        XCTAssertTrue(model.isUnlocked, "the passphrase was just typed")
+        XCTAssertEqual(model.stage, .needsDropZone)
 
-        model.makeDeviceKey()
-        XCTAssertEqual(model.deviceKey, key, "asking again does not replace the key the relay knows")
-        XCTAssertEqual(fixture.model().deviceKey, key, "a relaunch finds it")
-    }
-}
-
-/// Swift → UniFFI → Rust → a real relay (`git http-backend`), on a store made by
-/// gpg and pass.py. `swift-test.sh` makes the fixtures, sets these, and checks
-/// afterwards with gpg and git what was pushed here.
-@MainActor
-final class EndToEndTests: XCTestCase {
-    private var fixture: Fixture!
-    private var secretKey = ""
-    private var passphrase = ""
-    private var fingerprint = ""
-    private var url = ""
-    private var olderURL = ""
-
-    override func setUp() async throws {
-        let env = ProcessInfo.processInfo.environment
-        guard let fixtures = env["PASS_E2E_FIXTURES"], let url = env["PASS_E2E_URL"],
-              let olderURL = env["PASS_E2E_OLDER_URL"], let passphrase = env["PASS_E2E_PASSPHRASE"] else {
-            throw XCTSkip("no fixtures: run `make swift-test`")
-        }
-        let directory = URL(fileURLWithPath: fixtures)
-        secretKey = try String(contentsOf: directory.appendingPathComponent("secret.asc"), encoding: .utf8)
-        fingerprint = try String(contentsOf: directory.appendingPathComponent("fingerprint"), encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        (self.url, self.olderURL, self.passphrase) = (url, olderURL, passphrase)
-        fixture = try Fixture()
-    }
-
-    override func tearDown() async throws {
-        fixture?.cleanUp()
-    }
-
-    private func settings(url: String, device: String) -> PassSettings {
-        var settings = PassSettings()
-        settings.transport = .https
-        settings.url = url
-        settings.deviceName = device
-        settings.lockAfter = 120
-        settings.clipboardExpiry = 45
-        return settings
-    }
-
-    /// Imports the key, points at the relay and clones: a model that is set up and unlocked.
-    private func setUpModel(url: String, device: String) async throws -> AppModel {
-        let model = fixture.model()
-        let imported = await model.importSecretKey(secretKey, passphrase: passphrase, policy: .askEachTime)
-        XCTAssertTrue(imported, model.errorMessage ?? "")
-        XCTAssertEqual(model.stage, .needsRemote)
-        model.save(settings(url: url, device: device))
-        XCTAssertEqual(model.stage, .needsClone)
-        let cloned = await model.cloneStore()
-        XCTAssertTrue(cloned, model.errorMessage ?? "")
-        XCTAssertEqual(model.stage, .ready)
-        return model
-    }
-
-    func testImportingTheKey() async throws {
-        let model = fixture.model()
-        var imported = await model.importSecretKey(secretKey, passphrase: "wrong", policy: .askEachTime)
-        XCTAssertFalse(imported)
-        XCTAssertEqual(model.errorMessage, "wrong passphrase")
-        XCTAssertEqual(model.stage, .needsKey)
-        XCTAssertNil(fixture.store.secret(.openPGPSecretKey))
-
-        let publicKey = try publicKeyOf(secretKey: secretKey)
-        model.errorMessage = nil
-        imported = await model.importSecretKey(publicKey, passphrase: passphrase, policy: .askEachTime)
-        XCTAssertFalse(imported)
-        XCTAssertTrue(try XCTUnwrap(model.errorMessage).hasPrefix("This is a public key."))
-
-        imported = await model.importSecretKey(secretKey, passphrase: passphrase, policy: .askEachTime)
-        XCTAssertTrue(imported)
-        XCTAssertEqual(model.keyInfo?.fingerprint, fingerprint)
-        XCTAssertEqual(model.keyInfo?.needsPassphrase, true)
-        XCTAssertTrue(model.isUnlocked, "importing unlocks: the passphrase was just typed")
+        // What the owner gets: the public key, and the fingerprint to compare.
+        let publicKey = try XCTUnwrap(model.ownPublicKey)
+        XCTAssertTrue(publicKey.contains("BEGIN PGP PUBLIC KEY BLOCK"))
+        XCTAssertFalse(publicKey.contains("PRIVATE"))
+        XCTAssertEqual(try inspectKey(key: publicKey).fingerprint, info.fingerprint)
+        // What stays: the secret key, in the keychain, still locked by its passphrase.
+        let kept = try XCTUnwrap(fixture.store.secret(.openPGPSecretKey))
+        XCTAssertThrowsError(try Identity.unlock(secretKey: kept, passphrase: "wrong"))
         XCTAssertNil(fixture.store.secret(.passphrase), "asked each time: it is nowhere on the phone")
-        XCTAssertFalse(model.canUnlockWithBiometrics)
 
-        // Other recipients are added by their public key, and only that.
-        XCTAssertFalse(model.addRecipientKey(secretKey))
-        XCTAssertFalse(model.addRecipientKey("nope"))
-        XCTAssertEqual(model.settings.otherPublicKeys, [])
-        model.errorMessage = nil
-        XCTAssertTrue(model.addRecipientKey(publicKey))
-        XCTAssertEqual(fixture.store.load().otherPublicKeys, [publicKey])
-
-        // A relaunch has the key, and is locked.
+        // A relaunch has the key, and is locked. The right passphrase opens it, and only that.
         let relaunched = fixture.model()
-        XCTAssertEqual(relaunched.keyInfo?.fingerprint, fingerprint)
+        XCTAssertEqual(relaunched.keyInfo?.fingerprint, info.fingerprint)
         XCTAssertFalse(relaunched.isUnlocked)
-        let glance = await relaunched.unlockWithBiometrics()
-        XCTAssertFalse(glance)
+        var unlocked = await relaunched.unlockWithBiometrics()
+        XCTAssertFalse(unlocked)
         XCTAssertNil(relaunched.errorMessage)
+        unlocked = await relaunched.unlock(passphrase: "wrong")
+        XCTAssertFalse(unlocked)
+        XCTAssertEqual(relaunched.errorMessage, "wrong passphrase")
+        unlocked = await relaunched.unlock(passphrase: "correct horse")
+        XCTAssertTrue(unlocked)
+
+        // Two minutes without use lock it; use keeps it open; leaving the app locks at once.
+        fixture.clock.advance(100)
+        relaunched.lockIfExpired()
+        XCTAssertTrue(relaunched.isUnlocked)
+        relaunched.userDidInteract()
+        fixture.clock.advance(100)
+        relaunched.lockIfExpired()
+        XCTAssertTrue(relaunched.isUnlocked)
+        fixture.clock.advance(121)
+        relaunched.lockIfExpired()
+        XCTAssertFalse(relaunched.isUnlocked)
+        _ = await relaunched.unlock(passphrase: "correct horse")
+        relaunched.didEnterBackground()
+        XCTAssertFalse(relaunched.isUnlocked)
     }
 
     func testFaceIDUnlocksWithTheKeptPassphrase() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
         let model = fixture.model()
-        let imported = await model.importSecretKey(secretKey, passphrase: passphrase, policy: .keychainWithBiometrics)
-        XCTAssertTrue(imported)
+        // Even for a key with no passphrase, Face ID then stands between the phone and the key.
+        let made = await model.makeKey(passphrase: "", policy: .keychainWithBiometrics)
+        XCTAssertTrue(made)
+        XCTAssertEqual(model.keyInfo?.needsPassphrase, false)
         XCTAssertTrue(model.canUnlockWithBiometrics)
         model.lock()
-        XCTAssertFalse(model.isUnlocked)
         let unlocked = await model.unlockWithBiometrics()
         XCTAssertTrue(unlocked)
-        XCTAssertTrue(model.isUnlocked)
 
         // Going back to typing it removes it from the keychain.
         var settings = model.settings
@@ -386,144 +335,288 @@ final class EndToEndTests: XCTestCase {
         XCTAssertFalse(again)
     }
 
-    func testBrowseReadLockAndCopy() async throws {
-        let model = try await setUpModel(url: url, device: "reader")
-        XCTAssertEqual(model.entries, ["Email/work", "bank", "wifi"])
-        XCTAssertEqual(model.tree.map(\.id), ["Email/", "bank", "wifi"])
-        XCTAssertEqual(model.recipientFiles.map(\.path), [".gpg-id"])
-        XCTAssertEqual(model.recipientFiles.first?.unknown, [], "this device's own key is the recipient")
-        model.searchText = " WORK  em "
-        XCTAssertEqual(model.searchResults, ["Email/work"])
-        model.searchText = ""
-        XCTAssertNil(model.searchResults)
+    func testDevicesAreAddedByTheirPublicKeyAndThereIsOneOwner() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let model = fixture.model()
+        _ = await model.makeKey(passphrase: "", policy: .askEachTime)
+        let pc = try generateOpenpgpKey(userId: "pc", passphrase: "")
+        let tablet = try generateOpenpgpKey(userId: "tablet", passphrase: "")
 
-        let shown = await model.show("bank")
-        let bank = try XCTUnwrap(shown)
-        XCTAssertEqual(bank.password, "hunter2")
-        XCTAssertEqual(bank.fields, [EntryField(name: "login", value: "alice")])
-        XCTAssertEqual(bank.otpUris.count, 1)
-        XCTAssertEqual(model.oneTimeCode(for: bank.otpUris[0])?.code.count, 6)
-
-        model.copy(bank.password)
-        let copied = try XCTUnwrap(fixture.pasteboard.last)
-        XCTAssertEqual(copied.text, "hunter2")
-        XCTAssertEqual(copied.expiresAt, fixture.clock.now.addingTimeInterval(45))
-
-        // Use keeps it open; two minutes without use lock it.
-        fixture.clock.advance(100)
-        model.lockIfExpired()
-        XCTAssertTrue(model.isUnlocked)
-        model.userDidInteract()
-        fixture.clock.advance(100)
-        model.lockIfExpired()
-        XCTAssertTrue(model.isUnlocked)
-        fixture.clock.advance(121)
-        let late = await model.show("bank")
-        XCTAssertNil(late, "the timeout is checked before decrypting, not only by the timer")
-        XCTAssertFalse(model.isUnlocked)
-        XCTAssertEqual(model.errorMessage, "The store is locked.")
-        XCTAssertEqual(model.entries.count, 3, "the names stay: listing needs no key")
-
-        model.errorMessage = nil
-        var unlocked = await model.unlock(passphrase: "wrong")
-        XCTAssertFalse(unlocked)
-        XCTAssertEqual(model.errorMessage, "wrong passphrase")
-        unlocked = await model.unlock(passphrase: passphrase)
-        XCTAssertTrue(unlocked)
-        model.didEnterBackground()
-        XCTAssertFalse(model.isUnlocked, "leaving the app locks at once")
-
-        let missing = await fixture.model().show("bank")
-        XCTAssertNil(missing, "a relaunch is locked")
-    }
-
-    /// What `swift-test.sh` then looks for on the relay, with git and gpg.
-    func testChangesGoToTheDeviceBranch() async throws {
-        let model = try await setUpModel(url: url, device: "swift")
-        let added = await model.add("swift/added", content: "from-swift\nlogin: swift")
-        XCTAssertTrue(added, model.errorMessage ?? "")
-        let duplicate = await model.add("swift/added", content: "again")
-        XCTAssertFalse(duplicate)
-        XCTAssertEqual(model.errorMessage, "an entry already exists for swift/added")
+        XCTAssertFalse(model.addPeer(name: "My PC", publicKey: pc.publicKey, isOwner: true))
+        XCTAssertFalse(model.addPeer(name: "phone", publicKey: pc.publicKey, isOwner: true), "this device's own name")
+        XCTAssertFalse(model.addPeer(name: "pc", publicKey: pc.secretKey, isOwner: true), "a secret key")
+        XCTAssertFalse(model.addPeer(name: "pc", publicKey: "nope", isOwner: true))
+        XCTAssertEqual(model.settings.peers, [])
         model.errorMessage = nil
 
-        let generated = await model.generate("swift/generated", length: 24, symbols: false)
-        XCTAssertEqual(generated?.count, 24)
-        let saved = await model.save("bank", content: "hunter3\nlogin: alice\n")
-        XCTAssertTrue(saved)
-        let renamed = await model.rename("wifi", to: "home/wifi")
-        XCTAssertTrue(renamed)
-        let deleted = await model.delete("Email/work")
-        XCTAssertTrue(deleted)
-        XCTAssertEqual(model.entries, ["bank", "home/wifi", "swift/added", "swift/generated"])
-        let reread = await model.show("swift/generated")
-        XCTAssertEqual(reread?.password, generated)
-        let edited = await model.content(of: "bank")
-        XCTAssertEqual(edited, "hunter3\nlogin: alice\n")
-        XCTAssertEqual(model.syncState.map(describe), "5 change(s) to send.")
+        XCTAssertTrue(model.addPeer(name: "pc", publicKey: pc.publicKey, isOwner: true))
+        XCTAssertEqual(model.settings.owner?.fingerprint, pc.fingerprint, "the fingerprint is the key's, to be compared by eye")
+        XCTAssertFalse(model.addPeer(name: "pc", publicKey: tablet.publicKey, isOwner: false), "the name is taken")
+        XCTAssertFalse(model.addPeer(name: "laptop", publicKey: tablet.publicKey, isOwner: true), "one owner")
+        XCTAssertEqual(model.errorMessage, "There is already an owner: pc. Remove it first.")
+        model.errorMessage = nil
+        XCTAssertTrue(model.addPeer(name: "tablet", publicKey: tablet.publicKey, isOwner: false))
+        XCTAssertEqual(fixture.store.load().peers.map(\.name), ["pc", "tablet"])
+        XCTAssertNil(model.configurationProblem)
 
-        // Syncing needs no key: it goes on while locked.
+        // The SSH key for the drop zone: made once, its private half stays in the keychain.
+        XCTAssertNil(model.deviceKey)
+        model.makeDeviceKey()
+        let key = try XCTUnwrap(model.deviceKey)
+        XCTAssertTrue(key.publicKey.hasPrefix("ssh-ed25519 AAAA"))
+        XCTAssertTrue(key.publicKey.hasSuffix(" pass on phone"))
+        XCTAssertEqual(key.privateKey, "", "the model does not hand the private half around")
+        XCTAssertTrue(try XCTUnwrap(fixture.store.secret(.sshPrivateKey)).contains("OPENSSH PRIVATE KEY"))
+        model.makeDeviceKey()
+        XCTAssertEqual(model.deviceKey, key, "asking again does not replace the key the drop zone knows")
+
+        XCTAssertEqual(model.stage, .needsDropZone, "still no drop zone")
+        var settings = model.settings
+        settings.dropZoneURL = "sftp://drop@zone.example:2222"
+        settings.dropZoneHostKey = "SHA256:abc"
+        model.save(settings)
+        XCTAssertEqual(model.stage, .needsStore)
+        XCTAssertEqual(model.syncState.map(describe), "No store yet: sync to receive the owner's.")
+
+        model.removePeer(named: "pc")
+        XCTAssertEqual(model.stage, .needsDropZone, "no owner: nobody to sync with")
+        // Locked, nothing goes to the drop zone: the files are signed with the key.
+        _ = model.addPeer(name: "pc", publicKey: pc.publicKey, isOwner: true)
         model.lock()
         await model.sync()
-        XCTAssertNil(model.errorMessage)
-        XCTAssertEqual(model.syncMessage, "Nothing new. Sent 5 change(s) to devices/swift.")
-        XCTAssertEqual(model.syncState.map(describe), "5 change(s) sent, waiting to be merged.")
-        XCTAssertFalse(model.isSyncing)
-        await model.sync()
-        XCTAssertEqual(model.syncMessage, "Nothing new.")
-    }
+        XCTAssertEqual(model.errorMessage, "Unlock to sync: the files are signed and encrypted with this device's key.")
 
-    func testTakingTheMainBranchAndGivingChangesUp() async throws {
-        // Cloned from the relay as it was two changes ago, then pointed at the relay as it is.
-        let model = try await setUpModel(url: olderURL, device: "late")
-        XCTAssertEqual(model.entries, ["bank"])
-        model.save(settings(url: url, device: "late"))
-        XCTAssertEqual(model.stage, .ready)
-        await model.sync()
-        XCTAssertNil(model.errorMessage)
-        XCTAssertEqual(model.syncMessage, "Took 2 change(s).")
-        XCTAssertEqual(model.entries, ["Email/work", "bank", "wifi"])
-        XCTAssertNil(model.divergence)
-
-        // The same from a device that has changes of its own: nothing is merged here.
-        let other = try Fixture()
-        defer { other.cleanUp() }
-        let behind = other.model()
-        _ = await behind.importSecretKey(secretKey, passphrase: passphrase, policy: .askEachTime)
-        behind.save(settings(url: olderURL, device: "diverged"))
-        _ = await behind.cloneStore()
-        _ = await behind.add("mine", content: "x")
-        behind.save(settings(url: url, device: "diverged"))
-        await behind.sync()
-        XCTAssertNil(behind.errorMessage)
-        XCTAssertEqual(behind.divergence, Divergence(unmerged: 1, behind: 2))
-        XCTAssertEqual(behind.entries, ["bank", "mine"], "nothing was taken")
-        XCTAssertEqual(
-            behind.syncMessage,
-            "2 new change(s) cannot be taken until this device's 1 are merged on the computer. Sent 1 change(s) to devices/diverged.")
-
-        await behind.discardLocalChanges()
-        XCTAssertNil(behind.errorMessage)
-        XCTAssertNil(behind.divergence)
-        XCTAssertEqual(behind.syncMessage, "Dropped 1 change(s) of this device.")
-        XCTAssertEqual(behind.entries, ["Email/work", "bank", "wifi"])
-    }
-
-    func testErasingLeavesNothing() async throws {
-        let model = try await setUpModel(url: url, device: "leaving")
-        model.makeDeviceKey()
-        model.setHTTPSToken("t0ken")
-        XCTAssertTrue(model.hasHTTPSToken)
         model.eraseEverything()
         XCTAssertEqual(model.stage, .needsKey)
-        XCTAssertFalse(model.isUnlocked)
-        XCTAssertEqual(model.entries, [])
         XCTAssertNil(model.deviceKey)
-        XCTAssertFalse(model.hasHTTPSToken)
         for account in SecretAccount.allCases {
             XCTAssertNil(fixture.store.secret(account), account.rawValue)
         }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.directory.appendingPathComponent("store").path))
         XCTAssertEqual(fixture.model().stage, .needsKey)
     }
+}
+
+/// Swift → UniFFI → Rust → a real drop zone (OpenSSH), on a store made and published by
+/// pass.py (`pass sync push`). `swift-test.sh` makes all of it, sets these, and afterwards
+/// has pass.py take what was published here (`pass sync fetch`, `log`, `merge`).
+@MainActor
+final class EndToEndTests: XCTestCase {
+    private var fixture: Fixture!
+    private var secretKey = ""
+    private var sshKey = ""
+    private var ownerKey = ""
+    private var passphrase = ""
+    /// A drop zone holding the owner's store as it was, and one holding it two changes later.
+    private var earlier = (url: "", hostKey: "")
+    private var later = (url: "", hostKey: "")
+
+    override func setUp() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let fixtures = env["PASS_E2E_FIXTURES"], let passphrase = env["PASS_E2E_PASSPHRASE"],
+              let earlierURL = env["PASS_E2E_EARLIER_URL"], let earlierKey = env["PASS_E2E_EARLIER_HOST_KEY"],
+              let laterURL = env["PASS_E2E_LATER_URL"], let laterKey = env["PASS_E2E_LATER_HOST_KEY"] else {
+            throw XCTSkip("no fixtures: run `make swift-test`")
+        }
+        let directory = URL(fileURLWithPath: fixtures)
+        secretKey = try String(contentsOf: directory.appendingPathComponent("phone-secret.asc"), encoding: .utf8)
+        sshKey = try String(contentsOf: directory.appendingPathComponent("phone.ssh"), encoding: .utf8)
+        ownerKey = try String(contentsOf: directory.appendingPathComponent("pc-public.asc"), encoding: .utf8)
+        self.passphrase = passphrase
+        earlier = (earlierURL, earlierKey)
+        later = (laterURL, laterKey)
+        fixture = try Fixture()
+    }
+
+    override func tearDown() async throws {
+        fixture?.cleanUp()
+    }
+
+    private func point(_ model: AppModel, at zone: (url: String, hostKey: String)) {
+        var settings = model.settings
+        settings.dropZoneURL = zone.url
+        settings.dropZoneHostKey = zone.hostKey
+        model.save(settings)
+    }
+
+    /// Imports the key, names the owner, points at a drop zone: a model ready for its first sync, unlocked.
+    private func configuredModel(zone: (url: String, hostKey: String)) async throws -> AppModel {
+        try fixture.store.setSecret(sshKey, for: .sshPrivateKey)
+        let model = fixture.model()
+        let imported = await model.importSecretKey(secretKey, passphrase: passphrase, policy: .askEachTime)
+        XCTAssertTrue(imported, model.errorMessage ?? "")
+        XCTAssertEqual(model.stage, .needsDropZone)
+        XCTAssertTrue(model.addPeer(name: "pc", publicKey: ownerKey, isOwner: true), model.errorMessage ?? "")
+        point(model, at: zone)
+        XCTAssertNil(model.configurationProblem)
+        XCTAssertEqual(model.stage, .needsStore)
+        return model
+    }
+
+    /// The same, with the owner's store received, looked at and accepted.
+    private func readyModel(zone: (url: String, hostKey: String)) async throws -> AppModel {
+        let model = try await configuredModel(zone: zone)
+        await model.sync()
+        XCTAssertNil(model.errorMessage)
+        let accepted = await model.acceptUpdate()
+        XCTAssertTrue(accepted, model.errorMessage ?? "")
+        XCTAssertEqual(model.stage, .ready)
+        return model
+    }
+
+    func testTheOwnersStoreIsShownThenTaken() async throws {
+        let model = try await configuredModel(zone: earlier)
+        await model.sync()
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.syncMessage, "An update from the owner is waiting.")
+        XCTAssertEqual(model.stage, .needsStore, "received is not taken")
+        XCTAssertEqual(model.entries, [])
+        XCTAssertEqual(model.syncState.map(describe), "The owner's store has arrived: look at it to take it.")
+        XCTAssertEqual(model.ownerPublishedAgo?.hasPrefix("published "), true)
+
+        // What it would do: the entries, who can read which folder, what is not an entry.
+        let update = try XCTUnwrap(model.pendingUpdate)
+        XCTAssertEqual(update.entries.map(\.name), ["Email/work", "bank", "private/diary", "wifi"])
+        XCTAssertEqual(update.entries.map(\.kind), [.added, .added, .added, .added])
+        XCTAssertEqual(update.entries[0].readersAfter, ["pc", "phone"])
+        XCTAssertEqual(update.entries[2].readersAfter, ["pc"])
+        XCTAssertEqual(update.recipientChanges.map(\.path), [".gpg-id", "private/.gpg-id"])
+        XCTAssertEqual(update.recipientChanges.map { describe($0.after) }, ["pc, phone", "pc"])
+        XCTAssertEqual(update.otherFiles, [".gitattributes"])
+        XCTAssertEqual(update.outstanding, 0)
+        XCTAssertEqual(model.undecided, [])
+        // An entry can be read before the update is taken; one that is not for this device says so.
+        let bank = await model.versions(of: "bank")
+        XCTAssertEqual(bank?.before, .absent)
+        XCTAssertEqual(bank?.theirs, .content(text: "hunter2\nlogin: alice\notpauth://totp/x?secret=JBSWY3DPEHPK3PXP\n"))
+        let diary = await model.versions(of: "private/diary")
+        guard case .unreadable = diary?.theirs else { return XCTFail("the diary is not for the phone") }
+        // It is still there after a restart of the app, and still not applied.
+        XCTAssertEqual(fixture.model().stage, .needsStore)
+
+        let accepted = await model.acceptUpdate()
+        XCTAssertTrue(accepted, model.errorMessage ?? "")
+        XCTAssertEqual(model.stage, .ready)
+        XCTAssertNil(model.pendingUpdate)
+        XCTAssertEqual(model.entries, ["Email/work", "bank", "private/diary", "wifi"])
+        XCTAssertEqual(model.syncState.map(describe), "In step with the owner.")
+        XCTAssertEqual(model.syncMessage, "Published this device's changes. Nothing new from the owner.")
+
+        // Who can read what, folder by folder; what this device cannot read is listed, locked.
+        XCTAssertEqual(model.locked, ["private/diary"])
+        XCTAssertEqual(model.tree.map(\.id), ["Email/", "private/", "bank", "wifi"])
+        XCTAssertEqual(model.tree[1].children.map(\.isLocked), [true])
+        let root = await model.access(toFolder: "")
+        XCTAssertEqual(root.map { describe($0.readers) }, "pc, phone")
+        let privateFolder = await model.access(toFolder: "private")
+        XCTAssertEqual(privateFolder.map { describe($0.readers) }, "pc")
+        XCTAssertEqual(privateFolder?.readable, false)
+        let bankAccess = try await XCTUnwrapAsync(await model.access(toEntry: "bank"))
+        XCTAssertEqual(bankAccess.encryptedTo, ["pc", "phone"])
+        XCTAssertTrue(bankAccess.readable && bankAccess.matches)
+        XCTAssertEqual(warnings(for: bankAccess), [])
+        let diaryAccess = try await XCTUnwrapAsync(await model.access(toEntry: "private/diary"))
+        XCTAssertFalse(diaryAccess.readable)
+        let locked = await model.show("private/diary")
+        XCTAssertNil(locked)
+        XCTAssertEqual(model.errorMessage, "this entry is not encrypted to the key on this device")
+        model.errorMessage = nil
+
+        // Reading, searching, copying.
+        model.searchText = " WORK  em "
+        XCTAssertEqual(model.searchResults, ["Email/work"])
+        let shown = await model.show("bank")
+        let entry = try XCTUnwrap(shown)
+        XCTAssertEqual(entry.password, "hunter2")
+        XCTAssertEqual(entry.fields, [EntryField(name: "login", value: "alice")])
+        XCTAssertEqual(model.oneTimeCode(for: entry.otpUris[0])?.code.count, 6)
+        model.copy(entry.password)
+        let copied = try XCTUnwrap(fixture.pasteboard.last)
+        XCTAssertEqual(copied.text, "hunter2")
+        XCTAssertEqual(copied.expiresAt, fixture.clock.now.addingTimeInterval(45))
+        // The timeout is checked before decrypting, not only by the timer.
+        fixture.clock.advance(121)
+        let late = await model.show("bank")
+        XCTAssertNil(late)
+        XCTAssertEqual(model.errorMessage, "The store is locked.")
+        XCTAssertEqual(model.entries.count, 4, "the names stay: listing needs no key")
+    }
+
+    func testChangesHereArePublishedAndCanBeDropped() async throws {
+        let model = try await readyModel(zone: earlier)
+        let added = await model.add("phone/added", content: "from-phone")
+        XCTAssertTrue(added, model.errorMessage ?? "")
+        XCTAssertEqual(model.syncMessage, "Published this device's changes. Nothing new from the owner.")
+        XCTAssertEqual(model.syncState.map(describe), "1 change(s) of this device not taken by the owner yet.")
+        let generated = await model.generate("phone/generated", length: 24, symbols: false)
+        XCTAssertEqual(generated?.count, 24)
+        let duplicate = await model.add("phone/added", content: "again")
+        XCTAssertFalse(duplicate)
+        XCTAssertEqual(model.errorMessage, "an entry already exists for phone/added")
+        model.errorMessage = nil
+        // A folder this device cannot read: it can still write there, for those who can.
+        let intruding = await model.add("private/mine", content: "x")
+        XCTAssertTrue(intruding, "its one reader is a device, whose key is here")
+        XCTAssertEqual(model.locked, ["private/diary", "private/mine"])
+        XCTAssertEqual(model.syncState?.outstanding, 3)
+
+        await model.discardOutstanding()
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(model.entries, ["Email/work", "bank", "private/diary", "wifi"])
+        XCTAssertEqual(model.syncState.map(describe), "In step with the owner.")
+        XCTAssertEqual(model.syncMessage, "Dropped 3 change(s) of this device.")
+    }
+
+    /// What `swift-test.sh` then has pass.py look at and take: `pass sync fetch`, `log`, `merge`.
+    func testAnUpdateIsMergedWithAChoiceThenPublished() async throws {
+        // Set up from the owner's store as it was, then changed here while the owner went on.
+        let model = try await readyModel(zone: earlier)
+        _ = await model.save("bank", content: "phone-version\n")
+        _ = await model.add("swift/added", content: "from-swift\nlogin: swift")
+        _ = await model.rename("wifi", to: "home/wifi")
+        XCTAssertEqual(model.syncState?.outstanding, 3)
+
+        point(model, at: later)
+        await model.sync()
+        XCTAssertNil(model.errorMessage)
+        let update = try XCTUnwrap(model.pendingUpdate)
+        XCTAssertEqual(update.outstanding, 3)
+        XCTAssertEqual(update.entries.map(\.name), ["bank", "later"])
+        XCTAssertEqual(update.entries.map(\.kind), [.changed, .added])
+        XCTAssertEqual(update.entries.map(\.conflict), [true, false])
+        XCTAssertEqual(update.commits.map(\.subject), [
+            "Add given password for later to store.", "Add given password for bank to store.",
+        ])
+        XCTAssertEqual(model.entries.contains("later"), false, "nothing is applied yet")
+
+        // Both changed bank: nothing is taken until one version is chosen, having seen both.
+        XCTAssertEqual(model.undecided, ["bank"])
+        var accepted = await model.acceptUpdate()
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(model.errorMessage, "Choose a version for: bank.")
+        model.errorMessage = nil
+        let versions = await model.versions(of: "bank")
+        XCTAssertEqual(versions?.mine, .content(text: "phone-version\n"))
+        XCTAssertEqual(versions?.theirs, .content(text: "pc-version\n"))
+        model.choose(.mine, for: "bank")
+        XCTAssertEqual(model.undecided, [])
+        accepted = await model.acceptUpdate()
+        XCTAssertTrue(accepted, model.errorMessage ?? "")
+
+        XCTAssertNil(model.pendingUpdate)
+        XCTAssertEqual(model.choices, [:])
+        XCTAssertEqual(model.entries, ["Email/work", "bank", "home/wifi", "later", "private/diary", "swift/added"])
+        let bank = await model.show("bank")
+        XCTAssertEqual(bank?.password, "phone-version")
+        let later = await model.show("later")
+        XCTAssertEqual(later?.password, "from-pc")
+        XCTAssertEqual(model.syncState?.outstanding, 4, "its three commits and the merge")
+        XCTAssertEqual(model.syncState?.unpublished, false, "accepted, then published")
+        XCTAssertEqual(model.syncMessage, "Published this device's changes. Nothing new from the owner.")
+    }
+}
+
+/// `XCTUnwrap` for a value that was awaited.
+func XCTUnwrapAsync<T>(_ value: T?, file: StaticString = #filePath, line: UInt = #line) async throws -> T {
+    try XCTUnwrap(value, file: file, line: line)
 }

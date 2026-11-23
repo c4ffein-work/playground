@@ -9,19 +9,13 @@ public protocol SecretPasteboard: Sendable {
 
 /// What is missing before the store can be used, in the order the setup asks for it.
 public enum SetupStage: Equatable, Sendable {
-    /// No OpenPGP secret key has been imported.
+    /// No OpenPGP key: make one here, or import one.
     case needsKey
-    /// The relay is not fully described (URL, pinned host key or certificate, device key or token).
-    case needsRemote
-    /// Everything is there but the store itself: clone it.
-    case needsClone
+    /// The sync is not fully described: the drop zone, its pinned host key, this device's SSH key, the owner.
+    case needsDropZone
+    /// Everything is there but the store itself: sync, look at what the owner published, accept it.
+    case needsStore
     case ready
-}
-
-/// The main branch has moved and this device has changes that are not in it.
-public struct Divergence: Equatable, Sendable {
-    public let unmerged: UInt32
-    public let behind: UInt32
 }
 
 /// Everything the views show, and everything they can ask for. No view talks to the core itself.
@@ -32,16 +26,17 @@ public struct Divergence: Equatable, Sendable {
 @Observable
 public final class AppModel {
     public private(set) var settings: PassSettings
-    /// The imported OpenPGP key, described. `nil` when there is none.
+    /// This device's OpenPGP key, described. `nil` when there is none.
     public private(set) var keyInfo: KeyInfo?
-    /// The public half of this device's SSH key, for the relay's `authorized_keys`.
+    /// Its public half, armored: what the owner imports on the computer.
+    public private(set) var ownPublicKey: String?
+    /// The public half of this device's SSH key: what the drop zone is given.
     public private(set) var deviceKey: DeviceKey?
-    public private(set) var hasHTTPSToken = false
 
     /// Every entry of the store, sorted.
     public private(set) var entries: [String] = []
-    /// The `.gpg-id` files, with the recipients this device has no public key for.
-    public private(set) var recipientFiles: [RecipientFile] = []
+    /// The entries this device cannot decrypt: listed, by name only.
+    public private(set) var locked: Set<String> = []
     /// What the search field holds. Each word narrows the list.
     public var searchText = ""
 
@@ -50,9 +45,10 @@ public final class AppModel {
     public private(set) var isSyncing = false
     /// What the last sync did, in a sentence.
     public private(set) var syncMessage: String?
-    /// An update that changes who the store is encrypted to: to be shown, then accepted or left.
+    /// What the owner published that has not been taken: to be looked at, then accepted or left.
     public private(set) var pendingUpdate: PendingUpdate?
-    public private(set) var divergence: Divergence?
+    /// For the entries both sides changed: which version to keep, once chosen.
+    public private(set) var choices: [String: Side] = [:]
 
     /// The last failure, for an alert. Set to `nil` to dismiss.
     public var errorMessage: String?
@@ -64,9 +60,7 @@ public final class AppModel {
 
     private var service: PassService?
     private var identity: Identity?
-    private var ownPublicKey: String?
     private var lockAt: Date?
-    private var hasStore = false
 
     public init(
         store: SettingsStore, storeDirectory: URL, pasteboard: SecretPasteboard,
@@ -85,14 +79,13 @@ public final class AppModel {
 
     public var stage: SetupStage {
         if keyInfo == nil { return .needsKey }
-        if remote == nil { return .needsRemote }
-        return hasStore ? .ready : .needsClone
+        if dropZone == nil || service == nil { return .needsDropZone }
+        return syncState?.hasStore == true ? .ready : .needsStore
     }
 
-    /// The relay with its secrets, when everything it needs is there.
-    private var remote: Remote? {
-        settings.remote(
-            sshPrivateKey: store.secret(.sshPrivateKey), httpsToken: store.secret(.httpsToken))
+    /// The drop zone with this device's SSH key, when everything it needs is there.
+    private var dropZone: DropZone? {
+        settings.dropZone(sshPrivateKey: store.secret(.sshPrivateKey))
     }
 
     /// Whether Face ID can unlock: the passphrase was put in the keychain for that.
@@ -113,17 +106,62 @@ public final class AppModel {
         keyInfo = secretKey.flatMap { try? inspectKey(key: $0) }
         ownPublicKey = secretKey.flatMap { try? publicKeyOf(secretKey: $0) }
         deviceKey = store.secret(.sshPrivateKey).flatMap { try? devicePublicKey(privateKey: $0) }
-        hasHTTPSToken = store.secret(.httpsToken) != nil
     }
 
-    /// (Re)opens the store with the current settings and keys. Reads nothing of it.
+    /// (Re)opens the store with the current settings and keys. `nil` while the settings do not
+    /// make a valid set of devices (no owner yet, a bad name...): `configurationProblem` says why.
     private func openStore() {
-        hasStore = FileManager.default.fileExists(atPath: storeDirectory.appendingPathComponent(".git").path)
-        service = try? PassService(config: settings.storeConfig(directory: storeDirectory, ownPublicKey: ownPublicKey))
+        service = nil
+        configurationProblem = nil
+        syncState = nil
+        guard let ownPublicKey, settings.owner != nil else { return }
+        do {
+            let opened = try PassService(config: settings.storeConfig(directory: storeDirectory, ownPublicKey: ownPublicKey))
+            service = opened
+            syncState = try opened.currentState()
+        } catch {
+            configurationProblem = message(for: error)
+        }
     }
 
-    /// Checks the key and its passphrase, then keeps the key in the keychain (as exported:
-    /// still protected by the passphrase), and the passphrase too when the policy says so.
+    /// Why the devices as they are set up cannot be used (two owners, a key that is not the one
+    /// with the fingerprint...). `nil` when they can.
+    public private(set) var configurationProblem: String?
+
+    /// Keeps a key that was just checked: the key in the keychain (still protected by its
+    /// passphrase), the passphrase too when the policy says so.
+    private func keep(secretKey: String, passphrase: String, policy: PassphrasePolicy) async throws {
+        let unlocked = try await unlockIdentity(secretKey: secretKey, passphrase: passphrase)
+        guard unlocked.canSign() else {
+            throw PassError.CannotSign
+        }
+        try store.setSecret(secretKey, for: .openPGPSecretKey)
+        let kept = policy == .keychainWithBiometrics ? Self.keptPassphraseMark + passphrase : nil
+        try store.setSecret(kept, for: .passphrase)
+        settings.passphrasePolicy = policy
+        try store.save(settings)
+        loadKeys()
+        openStore()
+        didUnlock(unlocked)
+        await refresh()
+    }
+
+    /// Makes this device's OpenPGP key, here: its private half never exists anywhere else.
+    /// The public half (`ownPublicKey`) is then for the owner to import and add as a recipient.
+    @discardableResult
+    public func makeKey(passphrase: String, policy: PassphrasePolicy) async -> Bool {
+        do {
+            let name = "pass on \(settings.deviceName)"
+            let made = try await offMain { try generateOpenpgpKey(userId: name, passphrase: passphrase) }
+            try await keep(secretKey: made.secretKey, passphrase: passphrase, policy: policy)
+            return true
+        } catch {
+            fail(error)
+            return false
+        }
+    }
+
+    /// Imports a key made elsewhere (`gpg --export-secret-keys --armor <id>`), after checking it and its passphrase.
     @discardableResult
     public func importSecretKey(_ armored: String, passphrase: String, policy: PassphrasePolicy) async -> Bool {
         do {
@@ -132,16 +170,7 @@ public final class AppModel {
                 errorMessage = "This is a public key. Export the secret one: gpg --export-secret-keys --armor <id>"
                 return false
             }
-            let unlocked = try await unlockIdentity(secretKey: armored, passphrase: passphrase)
-            try store.setSecret(armored, for: .openPGPSecretKey)
-            let kept = policy == .keychainWithBiometrics ? Self.keptPassphraseMark + passphrase : nil
-            try store.setSecret(kept, for: .passphrase)
-            settings.passphrasePolicy = policy
-            try store.save(settings)
-            loadKeys()
-            openStore()
-            didUnlock(unlocked)
-            await refresh()
+            try await keep(secretKey: armored, passphrase: passphrase, policy: policy)
             return true
         } catch {
             fail(error)
@@ -163,18 +192,31 @@ public final class AppModel {
         }
     }
 
-    /// Adds the public key of another recipient of the store (someone named in a `.gpg-id`),
-    /// so that entries can be written for them too.
+    /// Adds another device, from its armored public key. Its fingerprint is taken from the key:
+    /// it is to be compared by eye with what that device shows of itself before relying on it.
     @discardableResult
-    public func addRecipientKey(_ armored: String) -> Bool {
+    public func addPeer(name: String, publicKey: String, isOwner: Bool) -> Bool {
         do {
-            let info = try inspectKey(key: armored)
+            guard PassSettings.isDeviceName(name) else {
+                errorMessage = "A device name is lowercase letters, digits and hyphens, 32 at most."
+                return false
+            }
+            guard name != settings.deviceName, !settings.peers.contains(where: { $0.name == name }) else {
+                errorMessage = "There is already a device named \(name)."
+                return false
+            }
+            guard !isOwner || settings.owner == nil else {
+                errorMessage = "There is already an owner: \(settings.owner?.name ?? ""). Remove it first."
+                return false
+            }
+            let info = try inspectKey(key: publicKey)
             guard !info.isSecret else {
-                errorMessage = "This is a secret key: a recipient is added by their public key."
+                errorMessage = "This is a secret key: a device is added by its public key."
                 return false
             }
             var changed = settings
-            changed.otherPublicKeys.append(armored)
+            changed.peers.append(PeerSettings(
+                name: name, fingerprint: info.fingerprint, publicKey: publicKey, isOwner: isOwner))
             save(changed)
             return true
         } catch {
@@ -183,17 +225,14 @@ public final class AppModel {
         }
     }
 
-    public func setHTTPSToken(_ token: String) {
-        do {
-            try store.setSecret(token, for: .httpsToken)
-            hasHTTPSToken = !token.isEmpty
-        } catch {
-            fail(error)
-        }
+    public func removePeer(named name: String) {
+        var changed = settings
+        changed.peers.removeAll { $0.name == name }
+        save(changed)
     }
 
     /// Makes this device's SSH key, once: the private half goes to the keychain and stays
-    /// there, the public half is to be added to the relay's `authorized_keys`.
+    /// there, the public half is what the drop zone is given (`DROPZONE_KEY_<NAME>`).
     public func makeDeviceKey() {
         guard deviceKey == nil else { return }
         do {
@@ -205,38 +244,9 @@ public final class AppModel {
         }
     }
 
-    /// The line for the relay's `authorized_keys` that lets this device push to its own
-    /// branch and nowhere else (with the `update` hook of `apps/pass/relay`).
-    public var authorizedKeysLine: String? {
-        guard let deviceKey else { return nil }
-        let device = settings.deviceName
-        return #"command="PASS_DEVICE=\#(device) exec git-shell -c \"$SSH_ORIGINAL_COMMAND\"",restrict \#(deviceKey.publicKey)"#
-    }
-
-    /// Clones the relay. The store is then there, to be looked at (`recipientFiles`) before it is written to.
-    @discardableResult
-    public func cloneStore() async -> Bool {
-        guard let remote else {
-            errorMessage = "The relay is not set up yet."
-            return false
-        }
-        isSyncing = true
-        defer { isSyncing = false }
-        do {
-            let config = settings.storeConfig(directory: storeDirectory, ownPublicKey: ownPublicKey)
-            service = try await PassService.clone(config: config, remote: remote)
-            hasStore = true
-            syncMessage = "Cloned."
-            await refresh()
-            return true
-        } catch {
-            fail(error)
-            return false
-        }
-    }
-
-    /// Removes the store from this device, and everything the app knows: settings, keys, token.
-    /// Nothing is removed on the relay; changes that were not pushed are lost.
+    /// Removes the store from this device, and everything the app knows: settings and keys.
+    /// Nothing is removed in the drop zone; changes that were not published are lost, and a
+    /// key made here is gone for good.
     public func eraseEverything() {
         lock()
         try? FileManager.default.removeItem(at: storeDirectory)
@@ -247,11 +257,10 @@ public final class AppModel {
         }
         settings = PassSettings()
         entries = []
-        recipientFiles = []
-        syncState = nil
+        locked = []
         syncMessage = nil
         pendingUpdate = nil
-        divergence = nil
+        choices = [:]
         loadKeys()
         openStore()
     }
@@ -268,7 +277,7 @@ public final class AppModel {
     @discardableResult
     public func unlock(passphrase: String) async -> Bool {
         guard let secretKey = store.secret(.openPGPSecretKey) else {
-            errorMessage = "No secret key on this device."
+            errorMessage = "No key on this device."
             return false
         }
         do {
@@ -318,7 +327,7 @@ public final class AppModel {
     // MARK: Entries
 
     /// The entries as folders, when nothing is searched.
-    public var tree: [StoreNode] { storeTree(entries) }
+    public var tree: [StoreNode] { storeTree(entries, locked: locked) }
 
     /// The entries whose name holds every word of `searchText`, whatever the case. `nil` when nothing is searched.
     public var searchResults: [String]? {
@@ -330,19 +339,36 @@ public final class AppModel {
         }
     }
 
-    /// Reads the list of entries, the recipients and the sync state again. Needs no key.
+    /// Reads the list of entries, what is locked, the sync state and the waiting update again. Needs no key.
     public func refresh() async {
-        guard let service, hasStore else {
+        guard let service else {
             entries = []
+            locked = []
             return
         }
         do {
             entries = try await service.entries()
-            recipientFiles = try await service.recipientFiles()
+            locked = Set(try await service.unreadable())
             syncState = try await service.syncState()
+            let update = try await service.pendingUpdate()
+            if update != pendingUpdate {
+                // Another update than the one the choices were made for.
+                choices = [:]
+                pendingUpdate = update
+            }
         } catch {
             fail(error)
         }
+    }
+
+    /// Who can read an entry: what its folder says, what the file is really encrypted to, and whether this device can.
+    public func access(toEntry name: String) async -> Access? {
+        try? await service?.access(toEntry: name)
+    }
+
+    /// Who can read what is put in a folder (`""` for the top of the store).
+    public func access(toFolder folder: String) async -> Access? {
+        try? await service?.access(toFolder: folder)
     }
 
     /// Runs something that needs the unlocked key, and reports its failure.
@@ -363,6 +389,13 @@ public final class AppModel {
         }
     }
 
+    /// After a change made here: publishes it, as the protocol asks. Without the network it
+    /// stays to be published (`syncState.unpublished`), and the next sync sends it: no alert for that.
+    private func changed() async {
+        await refresh()
+        await sync(quietly: true)
+    }
+
     /// Decrypts an entry. The result is the caller's to drop.
     public func show(_ name: String) async -> Entry? {
         await withIdentity { try await $0.show(name, identity: $1) }
@@ -377,7 +410,7 @@ public final class AppModel {
     @discardableResult
     public func add(_ name: String, content: String) async -> Bool {
         let done: Void? = await withIdentity { try await $0.insert(name, content: content, identity: $1) }
-        await refresh()
+        if done != nil { await changed() }
         return done != nil
     }
 
@@ -386,7 +419,7 @@ public final class AppModel {
         let password = await withIdentity {
             try await $0.generate(name, length: UInt32(clamping: length), symbols: symbols, identity: $1)
         }
-        await refresh()
+        if password != nil { await changed() }
         return password
     }
 
@@ -395,7 +428,7 @@ public final class AppModel {
         let password = await withIdentity {
             try await $0.regenerate(name, length: UInt32(clamping: length), symbols: symbols, identity: $1)
         }
-        await refresh()
+        if password != nil { await changed() }
         return password
     }
 
@@ -403,21 +436,21 @@ public final class AppModel {
     @discardableResult
     public func save(_ name: String, content: String) async -> Bool {
         let done = await withIdentity { try await $0.edit(name, content: content, identity: $1) }
-        await refresh()
+        if done == true { await changed() }
         return done != nil
     }
 
     @discardableResult
     public func delete(_ name: String) async -> Bool {
         let done: Void? = await withIdentity { try await $0.remove(name, identity: $1) }
-        await refresh()
+        if done != nil { await changed() }
         return done != nil
     }
 
     @discardableResult
     public func rename(_ name: String, to newName: String) async -> Bool {
         let done: Void? = await withIdentity { try await $0.rename(name, to: newName, identity: $1) }
-        await refresh()
+        if done != nil { await changed() }
         return done != nil
     }
 
@@ -434,72 +467,108 @@ public final class AppModel {
 
     // MARK: Sync
 
-    private func took(_ outcome: PullOutcome) -> String {
-        switch outcome {
-        case .upToDate:
-            pendingUpdate = nil
-            divergence = nil
-            return "Nothing new."
-        case .fastForwarded(let commits, _):
-            pendingUpdate = nil
-            divergence = nil
-            return "Took \(commits) change(s)."
-        case .needsReview(let update):
-            pendingUpdate = update
-            divergence = nil
-            return "An update changes who the store is encrypted to: review it."
-        case .diverged(let unmerged, let behind):
-            divergence = Divergence(unmerged: unmerged, behind: behind)
-            return "\(behind) new change(s) cannot be taken until this device's \(unmerged) are merged on the computer."
+    /// How long ago the owner signed the last file received: "published 3 days ago".
+    public var ownerPublishedAgo: String? {
+        guard let state = syncState, state.ownerPublishedAt > 0 else { return nil }
+        let seconds = max(0, Int(now().timeIntervalSince1970) - Int(state.ownerPublishedAt))
+        switch seconds {
+        case ..<120: return "published just now"
+        case ..<7200: return "published \(seconds / 60) minutes ago"
+        case ..<172_800: return "published \(seconds / 3600) hours ago"
+        default: return "published \(seconds / 86_400) days ago"
         }
     }
 
-    /// Takes what the main branch has (fast-forward only, never a merge) and sends this
-    /// device's changes to its own branch. Needs no key: the store can sync while locked.
+    private func describe(_ report: SyncReport) -> String {
+        var parts: [String] = []
+        if report.published { parts.append("Published this device's changes.") }
+        switch report.fetch {
+        case .nothingPublished: parts.append("The owner has published nothing yet.")
+        case .unchanged: parts.append("Nothing new from the owner.")
+        case .received(let update):
+            parts.append(update == nil ? "The owner has everything of this device." : "An update from the owner is waiting.")
+        case .stale: parts.append("The drop zone served an older file than the one already received: ignored.")
+        case .refused(let reason): parts.append(reason.prefix(1).uppercased() + reason.dropFirst() + ".")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    /// One visit to the drop zone: publishes this device's tip when it changed, and receives what
+    /// the owner published. Nothing received is applied: it becomes `pendingUpdate`, to be looked at.
+    /// Needs the key: the files are encrypted to it and signed with it.
     public func sync() async {
-        guard let service, let remote, hasStore else {
-            errorMessage = "The relay is not set up yet."
+        await sync(quietly: false)
+    }
+
+    private func sync(quietly: Bool) async {
+        guard let service, let dropZone else {
+            if !quietly { errorMessage = "The sync is not set up yet." }
+            return
+        }
+        guard let identity else {
+            if !quietly { errorMessage = "Unlock to sync: the files are signed and encrypted with this device's key." }
             return
         }
         guard !isSyncing else { return }
         isSyncing = true
         defer { isSyncing = false }
         do {
-            let report = try await service.sync(remote)
-            var parts = [took(report.pull)]
-            if report.pushed > 0 {
-                parts.append("Sent \(report.pushed) change(s) to \(report.state.deviceBranch).")
+            syncMessage = describe(try await service.sync(dropZone, identity: identity))
+        } catch {
+            if quietly {
+                syncMessage = "Not published yet: \(message(for: error))"
+            } else {
+                fail(error)
             }
-            syncMessage = parts.joined(separator: " ")
-        } catch {
-            fail(error)
         }
         await refresh()
     }
 
-    /// Takes the update that `pendingUpdate` shows: exactly that one, with its new recipients.
-    public func acceptPendingUpdate() async {
-        guard let service, let update = pendingUpdate else { return }
-        do {
-            syncMessage = took(try await service.accept(update))
-        } catch {
-            fail(error)
-        }
-        await refresh()
+    /// The entries of the waiting update that both sides changed and that have no choice yet.
+    public var undecided: [String] {
+        (pendingUpdate?.entries ?? []).filter { $0.conflict && choices[$0.name] == nil }.map(\.name)
     }
 
-    /// Gives up this device's unmerged changes and goes back to the main branch.
-    public func discardLocalChanges() async {
-        guard let service, let remote else { return }
-        isSyncing = true
-        defer { isSyncing = false }
+    /// Keeps this device's version or the owner's, for an entry both changed.
+    public func choose(_ side: Side, for name: String) {
+        choices[name] = side
+    }
+
+    /// An entry of the waiting update, decrypted: before the owner's changes, here, and in the update.
+    public func versions(of name: String) async -> EntryVersions? {
+        await withIdentity { try await $0.versions(of: name, identity: $1) }
+    }
+
+    /// Takes the update that `pendingUpdate` shows: exactly that one. With changes of this device
+    /// outstanding it is a merge, which needs every choice made; then the result is published.
+    @discardableResult
+    public func acceptUpdate() async -> Bool {
+        guard let update = pendingUpdate else { return false }
+        guard undecided.isEmpty else {
+            errorMessage = "Choose a version for: \(undecided.joined(separator: ", "))."
+            return false
+        }
+        let kept = choices.map { Choice(name: $0.key, keep: $0.value) }
+        let taken = await withIdentity { try await $0.accept(update, choices: kept, identity: $1) }
+        guard taken != nil else {
+            await refresh()
+            return false
+        }
+        choices = [:]
+        await changed()
+        return true
+    }
+
+    /// Gives up this device's changes that the owner has not taken, and goes back to the owner's
+    /// history as it was last accepted. Then publishes where it now stands.
+    public func discardOutstanding() async {
+        guard let service else { return }
         do {
-            let dropped = try await service.discardLocalCommits(remote)
-            divergence = nil
+            let dropped = try await service.discardOutstanding()
+            await changed()
             syncMessage = "Dropped \(dropped) change(s) of this device."
         } catch {
             fail(error)
         }
-        await refresh()
     }
 }

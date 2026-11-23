@@ -647,8 +647,18 @@ impl PassStore {
         std::iter::once(&self.me).chain(&self.peers)
     }
 
+    /// Where the tip last received from a device is kept: `refs/pass-sync/<name>`.
+    fn reference_of(&self, device: &Device) -> String {
+        format!("refs/pass-sync/{}", device.name)
+    }
+
     fn owner_reference(&self) -> String {
-        format!("refs/pass-sync/{}", self.owner().name)
+        self.reference_of(self.owner())
+    }
+
+    /// Only the owner's updates may change who can read, and anything that is not an entry.
+    fn may_change_non_entries(&self, device: &Device) -> bool {
+        device.name == self.owner().name
     }
 
     fn my_reference(&self) -> String {
@@ -858,15 +868,16 @@ impl PassStore {
         })
     }
 
-    /// The three sides of the update that is waiting: where the histories last agreed, here, and the owner's.
-    /// `None` when there is nothing to take.
+    /// The three sides of what `from` published and is not here: where the histories last agreed,
+    /// here, and theirs. `None` when there is nothing to take.
     #[allow(clippy::type_complexity)]
     fn update_sides(
         &self,
         repo: &gix::Repository,
+        from: &Device,
     ) -> Result<Option<(Option<ObjectId>, Option<ObjectId>, ObjectId)>, PassError> {
         let head = git::head_commit(repo)?;
-        let Some(theirs) = git::reference(repo, &self.owner_reference()) else {
+        let Some(theirs) = git::reference(repo, &self.reference_of(from)) else {
             return Ok(None);
         };
         let base = match head {
@@ -891,8 +902,9 @@ impl PassStore {
         })
     }
 
-    fn describe_update(&self, repo: &gix::Repository) -> Result<Option<PendingUpdate>, PassError> {
-        let Some((base, head, theirs)) = self.update_sides(repo)? else {
+    /// What taking the tip `from` published would do, for the review.
+    fn describe_update(&self, repo: &gix::Repository, from: &Device) -> Result<Option<PendingUpdate>, PassError> {
+        let Some((base, head, theirs)) = self.update_sides(repo, from)? else {
             return Ok(None);
         };
         let sides = self.three_way(repo, base, head, theirs)?;
@@ -997,18 +1009,19 @@ impl PassStore {
         Ok(Some(update))
     }
 
-    /// Takes the owner's file out of what the drop zone served, when it is one to take.
+    /// Takes the file of the device `from` out of what the drop zone served, when it is one to take.
     fn receive(
         &self,
         repo: &gix::Repository,
         file: Option<Vec<u8>>,
+        from: &Device,
         identity: &Identity,
     ) -> Result<FetchOutcome, PassError> {
         let Some(file) = file else {
             return Ok(FetchOutcome::NothingPublished);
         };
-        let owner = self.owner();
-        let reference = self.owner_reference();
+        let owner = from;
+        let reference = self.reference_of(from);
         // 1. It decrypts, and is signed by the owner's key.
         let (bundle, published_at) = identity.inner.open_sealed(&file, &owner.certificate)?;
         // 2. One reference, the owner's.
@@ -1032,7 +1045,7 @@ impl PassStore {
             message: format!("cannot note when the owner published: {e}"),
         })?;
         Ok(FetchOutcome::Received {
-            update: self.describe_update(&repo)?,
+            update: self.describe_update(&repo, from)?,
         })
     }
 
@@ -1041,6 +1054,69 @@ impl PassStore {
         let bundle = bundle::write(repo, tip, &self.my_reference())?;
         let recipients: Vec<&Certificate> = self.devices().map(|device| &device.certificate).collect();
         identity.inner.seal(bundle, &recipients)
+    }
+
+    /// Merges the tip `theirs`, published by `from`, into this device's line at `head`:
+    /// a signed merge commit, which is returned. Entries are merged as whole files, the
+    /// user's `choices` deciding where both sides changed one. What is not an entry is
+    /// taken from `from` when it is the owner, and left as it is here otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn merge(
+        &self,
+        repo: &gix::Repository,
+        sides: &ThreeWay,
+        head: ObjectId,
+        theirs: ObjectId,
+        from: &Device,
+        choices: &[Choice],
+        identity: &Identity,
+    ) -> Result<ObjectId, PassError> {
+        // The tree the merge starts from decides whose non-entries stay.
+        let from_theirs = self.may_change_non_entries(from);
+        let (start, started_with) = if from_theirs {
+            (theirs, &sides.theirs)
+        } else {
+            (head, &sides.ours)
+        };
+        let mut edits: Vec<git::Edit> = Vec::new();
+        let mut undecided = Vec::new();
+        let paths: BTreeSet<&String> = sides
+            .base
+            .keys()
+            .chain(sides.ours.keys())
+            .chain(sides.theirs.keys())
+            .collect();
+        for path in paths {
+            let Some(name) = entry_name(path) else { continue };
+            let keep_mine = if sides.is_conflict(path) {
+                match choices.iter().find(|choice| choice.name == name) {
+                    Some(choice) => choice.keep == Side::Mine,
+                    None => {
+                        undecided.push(name.to_string());
+                        continue;
+                    }
+                }
+            } else {
+                // Changed here only: here wins. Otherwise theirs, changed or not.
+                sides.theirs.get(path) == sides.base.get(path)
+            };
+            let kept = if keep_mine {
+                sides.ours.get(path)
+            } else {
+                sides.theirs.get(path)
+            };
+            // Only what differs from the starting tree is written.
+            if kept != started_with.get(path) {
+                let content = kept.map(|blob| git::blob(repo, *blob)).transpose()?;
+                edits.push((path.clone(), content));
+            }
+        }
+        if !undecided.is_empty() {
+            return Err(PassError::ChoiceRequired { names: undecided });
+        }
+        let tree = git::edit_tree(repo, Some(git::tree_of(repo, start)?), &edits)?;
+        let message = format!("Merge the changes of {} into those of {}.", from.name, self.me.name);
+        git::write_commit(repo, tree, &[head, theirs], &message, &self.author, &identity.inner)
     }
 
     fn version(&self, repo: &gix::Repository, blob: Option<&ObjectId>, identity: &Identity) -> EntryVersion {
@@ -1328,7 +1404,7 @@ impl PassStore {
 
         let name = format!("{}.bundle.gpg", self.owner().name);
         let fetch = match sftp.download(&name, MAX_PUBLISHED_FILE) {
-            Ok(file) => self.receive(&repo, file, &identity),
+            Ok(file) => self.receive(&repo, file, self.owner(), &identity),
             Err(e) => Err(e),
         };
         // What makes a file not one to take is told, not thrown: the rest of the sync happened.
@@ -1350,7 +1426,7 @@ impl PassStore {
     /// What the owner has published that is not in the store yet, described. `None` when there is nothing to take.
     pub fn pending_update(&self) -> Result<Option<PendingUpdate>, PassError> {
         match git::open(&self.root, &self.author)? {
-            Some(repo) => self.describe_update(&repo),
+            Some(repo) => self.describe_update(&repo, self.owner()),
             None => Ok(None),
         }
     }
@@ -1360,7 +1436,7 @@ impl PassStore {
     pub fn update_versions(&self, name: String, identity: Arc<Identity>) -> Result<EntryVersions, PassError> {
         let path = layout::file_of(&layout::clean_name(&name)?);
         let repo = git::open(&self.root, &self.author)?.ok_or(PassError::NoStore)?;
-        let (base, head, theirs) = self.update_sides(&repo)?.ok_or(PassError::StaleUpdate)?;
+        let (base, head, theirs) = self.update_sides(&repo, self.owner())?.ok_or(PassError::StaleUpdate)?;
         let sides = self.three_way(&repo, base, head, theirs)?;
         Ok(EntryVersions {
             before: self.version(&repo, sides.base.get(&path), &identity),
@@ -1386,7 +1462,7 @@ impl PassStore {
         let _busy = self.busy.lock().unwrap();
         self.check(&identity)?;
         let repo = git::open(&self.root, &self.author)?.ok_or(PassError::NoStore)?;
-        let (base, head, theirs) = self.update_sides(&repo)?.ok_or(PassError::StaleUpdate)?;
+        let (base, head, theirs) = self.update_sides(&repo, self.owner())?.ok_or(PassError::StaleUpdate)?;
         if ObjectId::from_hex(commit.as_bytes()).ok() != Some(theirs) {
             return Err(PassError::StaleUpdate);
         }
@@ -1397,45 +1473,7 @@ impl PassStore {
         let target = match head {
             Some(head) if !outstanding.is_empty() => {
                 let sides = self.three_way(&repo, base, Some(head), theirs)?;
-                let mut edits: Vec<git::Edit> = Vec::new();
-                let mut undecided = Vec::new();
-                let paths: BTreeSet<&String> = sides
-                    .base
-                    .keys()
-                    .chain(sides.ours.keys())
-                    .chain(sides.theirs.keys())
-                    .collect();
-                for path in paths {
-                    let Some(name) = entry_name(path) else { continue };
-                    let (ours, theirs_blob) = (sides.ours.get(path), sides.theirs.get(path));
-                    let keep_mine = if sides.is_conflict(path) {
-                        match choices.iter().find(|choice| choice.name == name) {
-                            Some(choice) => choice.keep == Side::Mine,
-                            None => {
-                                undecided.push(name.to_string());
-                                continue;
-                            }
-                        }
-                    } else {
-                        // Changed here only: here wins. Otherwise the owner's, changed or not.
-                        theirs_blob == sides.base.get(path)
-                    };
-                    // The merge starts from the owner's tree: only what differs from it is written.
-                    if keep_mine && ours != theirs_blob {
-                        let content = ours.map(|blob| git::blob(&repo, *blob)).transpose()?;
-                        edits.push((path.clone(), content));
-                    }
-                }
-                if !undecided.is_empty() {
-                    return Err(PassError::ChoiceRequired { names: undecided });
-                }
-                let tree = git::edit_tree(&repo, Some(git::tree_of(&repo, theirs)?), &edits)?;
-                let message = format!(
-                    "Merge the changes of {} into those of {}.",
-                    self.owner().name,
-                    self.me.name
-                );
-                git::write_commit(&repo, tree, &[head, theirs], &message, &self.author, &identity.inner)?
+                self.merge(&repo, &sides, head, theirs, self.owner(), &choices, &identity)?
             }
             _ => theirs,
         };
