@@ -13,6 +13,7 @@ help:
 	@echo "make bindings    generate the Swift bindings of every app into apps/<app>/Package/Generated"
 	@echo "make swift-test  every app's Swift package tests (apps/<app>/swift-test.sh; Docker when there is no swift)"
 	@echo "make check       fmt, clippy, and all of the above"
+	@echo "make scenarios   [root] pass sync: 30 situations on every mix of pass.py and the phone core (about an hour)"
 	@echo "make apple       [macOS] build every Rust core as an xcframework"
 	@echo "make xcode       [macOS] apple + generate and open apps/\$$APP/*.xcodeproj (needs xcodegen; APP=$(APP))"
 
@@ -28,6 +29,12 @@ bindings:
 swift-test: bindings
 	@set -e; for app in $(APPS); do echo "== $$app"; apps/$$app/swift-test.sh; done
 
+# Thirty sync situations on every mix of pass.py and phone-core devices, through a real drop zone.
+# Needs root (it starts sshd) and takes about an hour: not part of check.
+scenarios:
+	cargo build -p pass-core --example pass-device
+	apps/pass/scenarios/run.py
+
 check:
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
@@ -39,4 +46,4 @@ apple:
 xcode: apple
 	cd apps/$(APP) && xcodegen generate && open *.xcodeproj
 
-.PHONY: help test e2e bindings swift-test check apple xcode
+.PHONY: help test e2e bindings swift-test scenarios check apple xcode

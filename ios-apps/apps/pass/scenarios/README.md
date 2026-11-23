@@ -40,7 +40,7 @@ and report nothing stale and nothing left to take.
 | 16 | request: `b` adds itself to the readers of `work/`, which it cannot read | `a` is shown `readers work/` and the entries as `stale`; after `a` takes, `b` takes back and reads `work/*` |
 | 17 | request left alone: as 16, but `a` does not take | `b` still reads nothing of `work/` |
 | 18 | `a` removes `b` from `shared/` and re-encrypts; `b` takes | `b` no longer reads the current `shared/*` |
-| 19 | `a` and `b` change the readers of the same folder differently | `conflict` on `shared/`; the chosen set, and the entries encrypted for it |
+| 19 | `shared/` is read by `a b c`; `a` makes it `a b`, `b` makes it `a c` | `conflict` on `shared/` only (`a` reads both re-encryptions of the entries); the chosen set everywhere, and the entries encrypted for it |
 | 20 | `a` moves an entry from `private/` (readers `a`) to `shared/` (readers `a b`) | `b` reads it after taking; it is re-encrypted for `shared/` |
 | 21 | `b` changes an entry in `shared/` while `a` changes the readers of `shared/` to `a b c` | after everyone took: the entry has `b`'s content and is encrypted for `a b c` |
 | 22 | three devices: `a` and `b` and `c` each add an entry; taken in a ring (`b` takes `a`, `c` takes `b`, `a` takes `c`), then once more | all three have all three |

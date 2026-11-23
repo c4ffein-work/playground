@@ -640,8 +640,8 @@ def s15(make):
     fleet.a.set_readers('shared/', ['a', 'b', 'c'])
     fleet.a.sync()
     fleet.c.sync()
-    expect(fleet.c.pending('a') == ['readers shared/: a b c'] or
-           fleet.c.pending('a') == ['changed shared/s1', 'readers shared/: a b c'],
+    # c could not read the entry before: to it, the re-encryption is a change like any other.
+    expect(fleet.c.pending('a') == ['changed shared/s1', 'readers shared/: a b c'],
            f"c is shown {fleet.c.pending('a')}")
     settle(fleet.all())
     check(fleet.all(), {'private': 'p', 'shared/s1': '1'})
@@ -690,30 +690,25 @@ def s18(make):
 
 
 def s19(make):
-    for choice, expected in (('mine', ['a', 'b']), ('theirs', ['a', 'b', 'c'])):
+    for choice, expected in (('mine', ['a', 'b']), ('theirs', ['a', 'c'])):
         fleet = make(3)
         fleet.a.create(['a', 'b', 'c'])
         fleet.a.insert('shared/s1', '1')
         fleet.a.set_readers('shared/', ['a', 'b', 'c'])
         settle(fleet.all())
         fleet.a.set_readers('shared/', ['a', 'b'])
-        fleet.b.set_readers('shared/', ['a', 'b', 'c'])  # the same set, written again: no change
-        fleet.b.set_readers('shared/', ['b', 'a', 'c'])
-        fleet.b.insert('shared/s2', '2')
-        fleet.a.set_readers('shared/', ['a'])
-        fleet.a.set_readers('shared/', ['a', 'b'])
+        fleet.b.set_readers('shared/', ['a', 'c'])
         both_sync(fleet)
-        pending = fleet.a.pending('b')
-        if 'conflict shared/' in pending:
-            unchanged(fleet.a, 'take', 'b')
-            fleet.a.take('b', **{choice: ['shared/']})
-        else:
-            # b ended on the set it started from: only a changed the readers, and a's set stands.
-            expected = ['a', 'b']
-            fleet.a.take('b')
+        # a reads both re-encryptions, so the entry itself is no conflict: only who reads is.
+        expect(fleet.a.pending('b') == ['conflict shared/', 'readers shared/: a c'],
+               f"a is shown {fleet.a.pending('b')}")
+        unchanged(fleet.a, 'take', 'b')
+        fleet.a.take('b', **{choice: ['shared/']})
         settle(fleet.all())
-        expect(fleet.a.readers('shared/') == expected, f"the readers of shared/ are {fleet.a.readers('shared/')}")
-        check(fleet.all(), {'shared/s1': '1', 'shared/s2': '2'})
+        for device in fleet.all():
+            expect(device.readers('shared/') == expected,
+                   f"{device.name} has the readers of shared/ as {device.readers('shared/')}")
+        check(fleet.all(), {'shared/s1': '1'})
 
 
 def s20(make):
@@ -989,7 +984,7 @@ def main(argv):
                     note = SCENARIOS[number](make)
                     # A scenario with two devices is the same for every third kind: once is enough.
                     used = tuple(mix[:max((len(fleet.devices) for fleet in fleets), default=0)])
-                    if (number, used) in played and not note:
+                    if (number, used) in played:
                         outcome = None
                     else:
                         played.add((number, used))
