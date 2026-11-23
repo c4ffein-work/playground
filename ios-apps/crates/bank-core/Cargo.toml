@@ -1,0 +1,25 @@
+[package]
+name = "bank-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Client for the Qonto API, a port of github.com/c4ffein/bank, exposed to Swift through UniFFI"
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+pinned-http = { path = "../pinned-http" }
+# Already there through pinned-http. Here for SHA-256 over a stream, and SHA-1 for the UUIDv5 of an idempotency key.
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uniffi = "0.32"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+
+[dev-dependencies]
+# For the TLS side of the mock (tests/tls.rs): the same versions as pinned-http.
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
