@@ -1,2 +1,4 @@
 # Local clones of patch targets (see AGENTS.md)
 /clones/
+# Worktrees of agents working in parallel: scratch, never committed
+/.claude/worktrees/
