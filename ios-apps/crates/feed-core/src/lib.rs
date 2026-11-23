@@ -343,12 +343,11 @@ fn parse(bytes: &[u8], base: Option<&Url>) -> Result<ParsedFeed, FeedError> {
         }
         (other, _) => return Err(not_a_feed(format!("the document is a <{other}>, neither RSS nor Atom"))),
     };
-    let mut entries: Vec<Entry> = Vec::new();
-    for entry in raw.filter_map(|raw| raw.entry(base)) {
-        if !entries.iter().any(|known| known.id == entry.id) {
-            entries.push(entry);
-        }
-    }
+    let mut seen = std::collections::HashSet::new();
+    let entries = raw
+        .filter_map(|raw| raw.entry(base))
+        .filter(|entry| seen.insert(entry.id.clone()))
+        .collect();
     Ok(ParsedFeed {
         title: sanitize_title(title.to_string()),
         entries,
