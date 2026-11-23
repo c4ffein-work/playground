@@ -1,0 +1,775 @@
+From d3294c57a7caede295ac1d7ae105bc4035b26a58 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 23 Nov 2026 14:44:02 +0000
+Subject: [PATCH] Add sync: trade the store with other devices through a drop
+ zone
+
+A drop zone is a directory every device can reach and nobody has to trust:
+a local path, or sftp://user@host[:port][/dir]. Each device publishes one
+file there, <device>.bundle.gpg: a git bundle of its whole history under the
+single reference refs/pass-sync/<device>, signed with the device's OpenPGP
+key and encrypted to every device.
+
+    pass sync setup device-name drop-zone own-key-fingerprint
+    pass sync peer [--remove] device-name [key-fingerprint]
+    pass sync push | fetch [device-name...]
+    pass sync log | diff | merge device-name
+
+This side is the owner of the store. It takes a file only when it decrypts,
+carries one valid signature by the key configured for that device, and holds
+that device's reference alone with its full history; an older file served
+again is ignored. It merges a device's commits only as a fast-forward, only
+when each is signed by that device or by this one, and only when they change
+nothing but entries: no .gpg-id, nothing under .extensions/, no symlink.
+
+The settings live in the store's git configuration (pass-sync.*).
+
+Also exit quietly when whoever reads the output goes away (| grep -q),
+instead of a BrokenPipeError traceback.
+
+Tests: u0008-sync-tests.sh, the other device played with git and gpg alone.
+---
+ Makefile                                      |   5 +-
+ README.md                                     |  30 ++
+ pass.py                                       | 405 ++++++++++++++++++
+ .../additional-tests/u0008-sync-tests.sh      | 226 ++++++++++
+ 4 files changed, 665 insertions(+), 1 deletion(-)
+ create mode 100755 test_tricks/additional-tests/u0008-sync-tests.sh
+
+diff --git a/Makefile b/Makefile
+index 504f6af..d494654 100644
+--- a/Makefile
++++ b/Makefile
+@@ -4,7 +4,7 @@
+         test-u0001-advanced-grep-tests test-u0002-special-characters-tests \
+         test-u0003-complex-move-tests test-u0004-password-generation-options \
+         test-u0005-edit-unchanged-tests test-u0006-tree-listing-tests \
+-        test-u0007-find-tree-tests check-submodule verify
++        test-u0007-find-tree-tests test-u0008-sync-tests check-submodule verify
+ 
+ help:
+ 	@echo "Available targets:"
+@@ -32,6 +32,7 @@ help:
+ 	@echo "  test-u0005-edit-unchanged-tests"
+ 	@echo "  test-u0006-tree-listing-tests"
+ 	@echo "  test-u0007-find-tree-tests"
++	@echo "  test-u0008-sync-tests"
+ 	@echo ""
+ 	@echo "Other targets:"
+ 	@echo "  diff-override TEST=t0500-find  - Show diff between upstream test and our override"
+@@ -123,3 +124,5 @@ test-u0006-tree-listing-tests: check-submodule
+ 	./test_tricks/test-adapter.sh u0006-tree-listing-tests.sh
+ test-u0007-find-tree-tests: check-submodule
+ 	./test_tricks/test-adapter.sh u0007-find-tree-tests.sh
++test-u0008-sync-tests: check-submodule
++	./test_tricks/test-adapter.sh u0008-sync-tests.sh
+diff --git a/README.md b/README.md
+index 27d8c55..69dba60 100644
+--- a/README.md
++++ b/README.md
+@@ -56,6 +56,36 @@ The `pass.py` script can be used as a drop-in replacement for the original `pass
+ ./pass.py ls
+ ```
+ 
++## Sync
++
++Not in the original `pass`: `pass.py sync` trades the store with other devices (a phone) through a
++*drop zone*, a directory every device can reach and nobody has to trust: a local path (a USB stick,
++a synced folder) or `sftp://user@host[:port][/dir]`.
++
++Each device publishes one file there, `<device>.bundle.gpg`: a git bundle of its whole history,
++signed with its OpenPGP key and encrypted to every device. The drop zone sees those files and
++nothing else: no entry name, no history. This computer is the owner of the store: it takes another
++device's commits only as a fast-forward, only when each is signed by that device, and only when
++they change nothing but entries (never a `.gpg-id`, never an extension).
++
++```bash
++# Once: name this computer, say where the drop zone is and which key signs
++./pass.py sync setup pc sftp://drop@example.org:2222 <own-key-fingerprint>
++./pass.py sync peer phone <phone-key-fingerprint>     # its public key must be in gpg
++
++./pass.py sync push            # publish the store
++./pass.py sync fetch           # take what the other devices published
++./pass.py sync log phone       # their commits, and who signed each
++./pass.py sync diff phone      # the same, decrypted
++./pass.py sync merge phone     # take them, then publish
++./pass.py sync                 # where everything stands
++```
++
++`ssh` options (a key, a port in `~/.ssh/config`) apply as usual; more can be set with
++`git config pass-sync.sftp-options "-i ~/.ssh/dropzone"` in the store. The store must be a git
++repository (`pass git init`). The protocol, a drop zone server and a phone client live in
++[c4ffein-work/playground](https://github.com/c4ffein-work/playground), under `ios-apps/apps/pass`.
++
+ ## Testing
+ 
+ The Python implementation is designed to be fully compatible with the original bash script and should pass all the tests in `submodules/password-store/tests/`. Additional tests have also been written in an automated way, see [the documentation about Claude Code](chat_history/00-INDEX.md)
+diff --git a/pass.py b/pass.py
+index 44b24d1..bde29a4 100755
+--- a/pass.py
++++ b/pass.py
+@@ -449,6 +449,17 @@ def cmd_usage():
+     {EXECUTABLE_NAME} git git-command-args...
+         If the password store is a git repository, execute a git command
+         specified by git-command-args.
++    {EXECUTABLE_NAME} sync [setup device-name drop-zone own-key-fingerprint | peer [--remove] device-name [key-fingerprint]]
++        Set up trading the store with other devices through a drop zone: a directory that
++        every device reaches (a local path, or sftp://user@host[:port][/dir]) and nobody trusts.
++        Without arguments, show how this store and the other devices stand.
++    {EXECUTABLE_NAME} sync push
++        Publish the store to the drop zone, signed, and encrypted to every device.
++    {EXECUTABLE_NAME} sync fetch [device-name...]
++        Take what the other devices published, when it is signed by their key.
++    {EXECUTABLE_NAME} sync [log | diff | merge] device-name
++        Show the commits a device has that this store lacks, show them decrypted, or take them:
++        only as a fast-forward, signed by that device, and changing nothing but entries.
+     {EXECUTABLE_NAME} help
+         Show this text.
+     {EXECUTABLE_NAME} version
+@@ -1613,6 +1624,394 @@ def cmd_git(argv):
+     else:
+         die("Error: the password store is not a git repository. Try \"pass git init\".")
+ 
++# pass sync: trade the store with other devices through a drop zone.
++#
++# A drop zone is a directory that every device can reach and that nobody has to trust: a local
++# path, or sftp://user@host[:port][/dir]. Each device publishes one file there,
++# <device>.bundle.gpg: a git bundle of its whole history under the single reference
++# refs/pass-sync/<device>, signed with the device's key and encrypted to every device.
++# This computer is the owner of the store: it takes the other devices' commits only as a
++# fast-forward, only when they are signed by a device, and only when they change entries.
++
++SYNC_MAX_FILE_SIZE = 256 * 1024 * 1024
++SYNC_DEVICE_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
++# What a device that is not the owner may change: entries, and nothing hidden (.gpg-id, .extensions/...).
++SYNC_ENTRY_PATH = re.compile(r'(?:[^./][^/]*/)*[^./][^/]*\.gpg')
++
++def sync_git(*args, check=True, text=True, extra_env=None):
++    """Run git on the store. Returns the completed process; dies on failure when check is set."""
++    env = dict(os.environ, **extra_env) if extra_env else None
++    result = subprocess.run(['git', '-C', PASSWORD_STORE_DIR] + list(args),
++                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=text, env=env)
++    if check and result.returncode != 0:
++        stderr = result.stderr if text else result.stderr.decode(errors='replace')
++        die(f"git {args[0]} failed: {stderr.strip()}")
++    return result
++
++def sync_fingerprint(text):
++    """A key fingerprint as 40 uppercase hex digits, however it was typed."""
++    fingerprint = re.sub(r'[\s:]', '', text).upper()
++    if fingerprint.startswith('0X'):
++        fingerprint = fingerprint[2:]
++    if not re.fullmatch(r'[0-9A-F]{40}', fingerprint):
++        die(f"Not a full key fingerprint (40 hex digits): {text}")
++    return fingerprint
++
++def sync_check_device_name(name):
++    if not SYNC_DEVICE_NAME.fullmatch(name):
++        die(f"Not a device name (a-z, 0-9 and -, at most 32, not starting with -): {name}")
++    return name
++
++def sync_check_key(fingerprint, secret=False):
++    """Die unless gpg has this key: as a primary key, by its full fingerprint."""
++    listing = subprocess.run([GPG, '--batch', '--with-colons', '--list-secret-keys' if secret else '--list-keys',
++                              fingerprint], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    kind = None
++    for line in listing.stdout.splitlines():
++        fields = line.split(':')
++        if fields[0] in ('pub', 'sec', 'sub', 'ssb'):
++            kind = fields[0]
++        elif fields[0] == 'fpr' and kind in ('pub', 'sec') and fields[9] == fingerprint:
++            return
++    die(f"gpg has no {'secret' if secret else 'public'} key with the fingerprint {fingerprint}")
++
++def sync_config():
++    """The sync settings of this store, from its git configuration."""
++    if not is_git_repository(PASSWORD_STORE_DIR):
++        die("The password store is not a git repository. Try \"pass git init\".")
++    def get(key):
++        return sync_git('config', '--local', '--get', f'pass-sync.{key}', check=False).stdout.strip()
++    config = {'device': get('device'), 'url': get('url'), 'key': get('key'), 'peers': {}}
++    if not (config['device'] and config['url'] and config['key']):
++        die(f"Sync is not set up. Try \"{EXECUTABLE_NAME} sync setup device-name drop-zone own-key-fingerprint\".")
++    sync_check_device_name(config['device'])
++    for value in sync_git('config', '--local', '--get-all', 'pass-sync.peer', check=False).stdout.splitlines():
++        name, _, fingerprint = value.partition(' ')
++        config['peers'][sync_check_device_name(name)] = sync_fingerprint(fingerprint)
++    config['sftp-options'] = get('sftp-options').split()
++    return config
++
++def sync_peer(config, name):
++    if name not in config['peers']:
++        known = ', '.join(sorted(config['peers'])) or 'none'
++        die(f"No device named {name} (known: {known}). Try \"{EXECUTABLE_NAME} sync peer name key-fingerprint\".")
++    return config['peers'][name]
++
++def sync_ref(device):
++    return f'refs/pass-sync/{device}'
++
++def sync_tip(device):
++    """The commit held for a device, or None."""
++    result = sync_git('rev-parse', '--verify', '--quiet', sync_ref(device) + '^{commit}', check=False)
++    return result.stdout.strip() or None
++
++def sync_tmpdir():
++    return tempfile.mkdtemp(prefix=f"{os.path.basename(sys.argv[0])}.sync.",
++                            dir='/dev/shm' if os.path.isdir('/dev/shm') else None)
++
++def sync_sftp(config, commands):
++    """Run sftp commands in the drop zone. Returns whether all of them worked."""
++    match = re.fullmatch(r'sftp://(?:([^@/:]+)@)?(\[[0-9A-Fa-f:.]+\]|[^@/:\[\]]+)(?::(\d+))?(/.*)?', config['url'])
++    if not match:
++        die(f"Not a drop zone address (sftp://user@host[:port][/dir], or a local directory): {config['url']}")
++    user, host, port, directory = match.groups()
++    if host.startswith('-') or (user or '').startswith('-'):
++        die(f"Not a drop zone address: {config['url']}")
++    command = ['sftp', '-q', '-b', '-'] + (['-P', port] if port else []) + config['sftp-options']
++    command.append(f'{user}@{host}' if user else host)
++    batch = ''.join(f'{line}\n' for line in ([f'cd "{directory}"'] if directory and directory != '/' else []) + commands)
++    try:
++        result = subprocess.run(command, input=batch, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    except FileNotFoundError:
++        die("sftp is not installed.")
++    return result.returncode == 0, result.stderr.strip()
++
++def sync_upload(config, local_path, name):
++    """Put a file in the drop zone under a name: beside it first, then renamed over it."""
++    if config['url'].startswith('sftp://'):
++        ok, error = sync_sftp(config, [f'put "{local_path}" "{name}.part"', f'rename "{name}.part" "{name}"'])
++        if not ok:
++            die(f"Could not publish to {config['url']}: {error}")
++        return
++    if not os.path.isdir(config['url']):
++        die(f"The drop zone {config['url']} is not a directory.")
++    part = os.path.join(config['url'], f'{name}.part')
++    shutil.copyfile(local_path, part)
++    os.replace(part, os.path.join(config['url'], name))
++
++def sync_download(config, name, local_path):
++    """Get a file from the drop zone. Returns False when it is not there."""
++    if config['url'].startswith('sftp://'):
++        ok, error = sync_sftp(config, [f'get "{name}" "{local_path}"'])
++        if not ok and not re.search(r'not found|no such file', error, re.IGNORECASE):
++            die(f"Could not read {config['url']}: {error}")
++        return ok and os.path.isfile(local_path)
++    source = os.path.join(config['url'], name)
++    if not os.path.isfile(source):
++        return False
++    if os.path.getsize(source) > SYNC_MAX_FILE_SIZE:
++        return True  # the caller measures the copy: an empty one says "too big" as well as a full one
++    shutil.copyfile(source, local_path)
++    return True
++
++def sync_bundle_references(path):
++    """What a bundle says it holds: (references as (commit, name), prerequisite commits)."""
++    references, prerequisites = [], []
++    with open(path, 'rb') as bundle:
++        if bundle.readline() != b'# v2 git bundle\n':
++            return None, None
++        for line in iter(bundle.readline, b''):
++            if line == b'\n':
++                return references, prerequisites
++            line = line.decode('utf-8', errors='replace').rstrip('\n')
++            if line.startswith('-'):
++                prerequisites.append(line[1:].split(' ')[0])
++            else:
++                commit, _, name = line.partition(' ')
++                references.append((commit, name))
++    return None, None  # no end of header: not a bundle
++
++def sync_changes(base, tip):
++    """The files that differ between two commits: (status, mode after, path). No rename detection."""
++    raw = sync_git('diff', '--raw', '-z', '--no-renames', '--no-abbrev', base, tip).stdout
++    fields = raw.split('\0')
++    return [(meta.split(' ')[4], meta.split(' ')[1], path) for meta, path in zip(fields[0::2], fields[1::2])]
++
++def sync_outstanding(config, name):
++    """How a device's tip stands against the store: (tip, commits it has more, commits it lacks)."""
++    tip = sync_tip(name)
++    if not tip:
++        return None, 0, 0
++    ahead, behind = sync_git('rev-list', '--left-right', '--count', f'{tip}...HEAD').stdout.split()
++    return tip, int(ahead), int(behind)
++
++def sync_describe(config, name):
++    tip, ahead, behind = sync_outstanding(config, name)
++    if not tip:
++        return f"{name}: nothing received yet"
++    if ahead == 0:
++        return f"{name}: has nothing this store lacks" + (f", is {behind} commit(s) behind" if behind else "")
++    text = f"{name}: {ahead} commit(s) to take"
++    if behind:
++        text += f", but {behind} behind: publish with \"{EXECUTABLE_NAME} sync push\" and let it merge first"
++    return text
++
++def cmd_sync_setup(argv):
++    if len(argv) != 3:
++        die(f"Usage: {EXECUTABLE_NAME} sync setup device-name drop-zone own-key-fingerprint")
++    if not is_git_repository(PASSWORD_STORE_DIR):
++        die("The password store is not a git repository. Try \"pass git init\".")
++    name, url, fingerprint = sync_check_device_name(argv[0]), argv[1], sync_fingerprint(argv[2])
++    sync_check_key(fingerprint, secret=True)
++    if not url.startswith('sftp://'):
++        url = os.path.abspath(url)
++        if not os.path.isdir(url):
++            die(f"The drop zone {url} is not a directory (for a server: sftp://user@host[:port][/dir]).")
++    for key, value in (('device', name), ('url', url), ('key', fingerprint)):
++        sync_git('config', '--local', f'pass-sync.{key}', value)
++    print(f"This store is {name}, published to {url}, signed with {fingerprint}.")
++
++def cmd_sync_peer(argv):
++    remove = argv[:1] == ['--remove']
++    if len(argv) != 2:
++        die(f"Usage: {EXECUTABLE_NAME} sync peer [--remove] device-name [key-fingerprint]")
++    config = sync_config()
++    name = sync_check_device_name(argv[1] if remove else argv[0])
++    if name == config['device']:
++        die(f"{name} is this device.")
++    if not remove:
++        fingerprint = sync_fingerprint(argv[1])
++        sync_check_key(fingerprint)
++        config['peers'][name] = fingerprint
++    elif config['peers'].pop(name, None) is None:
++        die(f"No device named {name}.")
++    sync_git('config', '--local', '--unset-all', 'pass-sync.peer', check=False)
++    for peer, fingerprint in sorted(config['peers'].items()):
++        sync_git('config', '--local', '--add', 'pass-sync.peer', f'{peer} {fingerprint}')
++    if remove:
++        sync_git('update-ref', '-d', sync_ref(name))
++        print(f"{name} is no longer a device of this store. It can still read what it could read: "
++              "remove its key from the .gpg-id files with \"pass init\", and change those passwords.")
++    else:
++        print(f"{name} is a device of this store, with the key {fingerprint}.")
++
++def cmd_sync_status(argv):
++    config = sync_config()
++    print(f"This device: {config['device']} ({config['key']})")
++    print(f"Drop zone: {config['url']}")
++    published = sync_tip(config['device'])
++    head = sync_git('rev-parse', 'HEAD').stdout.strip()
++    print("Published: " + ("the current state" if published == head else
++                           "not yet" if not published else "an earlier state: \"sync push\" to publish"))
++    for name in sorted(config['peers']):
++        print(sync_describe(config, name))
++    if not config['peers']:
++        print(f"No other device. Try \"{EXECUTABLE_NAME} sync peer name key-fingerprint\".")
++
++def cmd_sync_push(argv):
++    config = sync_config()
++    name = config['device']
++    sync_check_key(config['key'], secret=True)
++    if sync_git('status', '--porcelain').stdout.strip():
++        print("Note: the store has changes that are not committed. They are not published.", file=sys.stderr)
++    sync_git('update-ref', sync_ref(name), 'HEAD')
++    tmpdir = sync_tmpdir()
++    try:
++        bundle, message = os.path.join(tmpdir, 'bundle'), os.path.join(tmpdir, 'message')
++        sync_git('bundle', 'create', '--version=2', bundle, sync_ref(name))
++        command = [GPG, '--batch', '--yes', '--quiet', '--no-encrypt-to', '--compress-algo', 'none',
++                   '--trust-model', 'always', '--local-user', config['key'] + '!', '--sign', '--encrypt',
++                   '--recipient', config['key']]
++        for fingerprint in config['peers'].values():
++            command += ['--recipient', fingerprint]
++        result = subprocess.run(command + ['--output', message, bundle], stderr=subprocess.PIPE, text=True)
++        if result.returncode != 0:
++            die(f"gpg could not sign and encrypt the bundle: {result.stderr.strip()}")
++        sync_upload(config, message, f'{name}.bundle.gpg')
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++    readers = ', '.join(sorted(config['peers'])) or 'no other device yet'
++    print(f"Published {sync_git('rev-parse', '--short', 'HEAD').stdout.strip()} for: {readers}.")
++
++def sync_receive(config, name, tmpdir):
++    """Take the file a device published. Returns a one-line account of what happened."""
++    fingerprint = sync_peer(config, name)
++    message, bundle = os.path.join(tmpdir, f'{name}.message'), os.path.join(tmpdir, f'{name}.bundle')
++    if not sync_download(config, f'{name}.bundle.gpg', message):
++        return f"{name}: has published nothing"
++    if not os.path.isfile(message) or os.path.getsize(message) > SYNC_MAX_FILE_SIZE:
++        return f"{name}: REFUSED, its file is larger than {SYNC_MAX_FILE_SIZE // (1024 * 1024)} MiB"
++    # --status-fd is the only thing to believe: one valid signature, made by this device's key.
++    result = subprocess.run([GPG, '--batch', '--yes', '--quiet', '--status-fd', '1', '--output', bundle,
++                             '--decrypt', message], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    status = [line.split(' ')[1:] for line in result.stdout.splitlines() if line.startswith('[GNUPG:] ')]
++    valid = [fields for fields in status if fields[0] == 'VALIDSIG']
++    bad = [fields[0] for fields in status if fields[0] in ('BADSIG', 'ERRSIG', 'EXPSIG', 'EXPKEYSIG', 'REVKEYSIG')]
++    if result.returncode != 0 or not any(fields[0] == 'DECRYPTION_OKAY' for fields in status):
++        return f"{name}: REFUSED, its file does not decrypt"
++    if bad or len(valid) != 1 or valid[0][-1] != fingerprint:
++        signer = valid[0][-1] if len(valid) == 1 and not bad else 'nobody we can check'
++        return f"{name}: REFUSED, its file is signed by {signer}, not by its key {fingerprint}"
++    published = time.strftime('%Y-%m-%d %H:%M', time.localtime(int(valid[0][3])))
++
++    references, prerequisites = sync_bundle_references(bundle)
++    if references is None:
++        return f"{name}: REFUSED, its file is not a git bundle"
++    if prerequisites or len(references) != 1 or references[0][1] != sync_ref(name):
++        return f"{name}: REFUSED, its bundle must hold {sync_ref(name)} alone, with its whole history"
++    tip = references[0][0]
++    if not re.fullmatch(r'[0-9a-f]{40}', tip):
++        return f"{name}: REFUSED, its bundle names no commit"
++    held = sync_tip(name)
++    if held == tip:
++        return f"{sync_describe(config, name)} (nothing new since {published})"
++    if held and sync_git('merge-base', '--is-ancestor', tip, held, check=False).returncode == 0:
++        return f"{name}: IGNORED, an old file was served again (published {published})"
++    fetched = sync_git('fetch', '--quiet', '--no-tags', bundle, f'+{sync_ref(name)}:{sync_ref(name)}', check=False)
++    if fetched.returncode != 0:
++        return f"{name}: REFUSED, its bundle is not complete: {fetched.stderr.strip()}"
++    return f"{sync_describe(config, name)} (published {published})"
++
++def cmd_sync_fetch(argv):
++    config = sync_config()
++    names = argv or sorted(config['peers'])
++    if not names:
++        die(f"No other device. Try \"{EXECUTABLE_NAME} sync peer name key-fingerprint\".")
++    tmpdir = sync_tmpdir()
++    try:
++        accounts = [sync_receive(config, name, tmpdir) for name in names]
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++    print('\n'.join(accounts))
++    if any('REFUSED' in account for account in accounts):
++        sys.exit(1)
++
++def sync_signers(config, name, tip):
++    """The commits a device has more than the store: (commit, subject, who signed it or None)."""
++    devices = {config['key']: config['device'], sync_peer(config, name): name}
++    log = sync_git('log', '--reverse', '--format=%H%x1f%G?%x1f%GP%x1f%s', f'HEAD..{tip}').stdout
++    commits = []
++    for line in log.splitlines():
++        commit, state, fingerprint, subject = line.split('\x1f', 3)
++        # G: good, from a key gpg trusts. U: good, from a key it has no opinion on. The key is ours to judge.
++        commits.append((commit, subject, devices.get(fingerprint) if state in ('G', 'U') else None))
++    return commits
++
++def cmd_sync_log(argv):
++    if len(argv) != 1:
++        die(f"Usage: {EXECUTABLE_NAME} sync log device-name")
++    config = sync_config()
++    name = argv[0]
++    tip, ahead, _ = sync_outstanding(config, name) if sync_peer(config, name) else (None, 0, 0)
++    if not ahead:
++        print(sync_describe(config, name))
++        return
++    for commit, subject, signer in sync_signers(config, name, tip):
++        print(f"{commit[:10]}  {('signed by ' + signer) if signer else 'NOT SIGNED BY A DEVICE':24}  {subject}")
++    print()
++    letters = {'A': 'added', 'M': 'changed', 'D': 'removed', 'T': 'changed type'}
++    for status, _, path in sync_changes('HEAD', tip):
++        print(f"  {letters.get(status, status):8} {path[:-4] if path.endswith('.gpg') else path}")
++    print()
++    print(sync_describe(config, name))
++
++def cmd_sync_diff(argv):
++    if len(argv) != 1:
++        die(f"Usage: {EXECUTABLE_NAME} sync diff device-name")
++    config = sync_config()
++    sync_peer(config, argv[0])
++    tip = sync_tip(argv[0])
++    if not tip:
++        die(f"Nothing received from {argv[0]} yet. Try \"{EXECUTABLE_NAME} sync fetch\".")
++    # Decrypted, whatever the store's own git configuration says.
++    tmpdir = sync_tmpdir()
++    try:
++        attributes = os.path.join(tmpdir, 'attributes')
++        with open(attributes, 'w') as f:
++            f.write('*.gpg diff=pass-sync\n')
++        subprocess.run(['git', '-C', PASSWORD_STORE_DIR, '-c', f'core.attributesFile={attributes}',
++                        '-c', 'diff.pass-sync.binary=true',
++                        '-c', f'diff.pass-sync.textconv={GPG} --decrypt --quiet --yes --batch',
++                        'diff', '--no-renames', 'HEAD', tip], check=False)
++    finally:
++        shutil.rmtree(tmpdir, ignore_errors=True)
++
++def cmd_sync_merge(argv):
++    if len(argv) != 1:
++        die(f"Usage: {EXECUTABLE_NAME} sync merge device-name")
++    config = sync_config()
++    name = argv[0]
++    sync_peer(config, name)
++    tip, ahead, behind = sync_outstanding(config, name)
++    if not tip:
++        die(f"Nothing received from {name} yet. Try \"{EXECUTABLE_NAME} sync fetch\".")
++    if ahead == 0:
++        print(sync_describe(config, name))
++        return
++    if behind:
++        die(f"{name} has not merged this store's last {behind} commit(s): not a fast-forward. "
++            f"Publish with \"{EXECUTABLE_NAME} sync push\", let {name} merge, then fetch again.")
++    if sync_git('status', '--porcelain', '--untracked-files=no').stdout.strip():
++        die("The store has changes that are not committed.")
++    unsigned = [commit[:10] for commit, _, signer in sync_signers(config, name, tip) if not signer]
++    if unsigned:
++        die(f"Not signed by {name} or by this device: {', '.join(unsigned)}. Nothing was taken.")
++    for status, mode, path in sync_changes('HEAD', tip):
++        if not SYNC_ENTRY_PATH.fullmatch(path) or (status != 'D' and mode != '100644'):
++            die(f"{name} changes {path}, which is not an entry: only this device does that. Nothing was taken.")
++    sync_git('merge', '--quiet', '--ff-only', tip)
++    print(f"Took {ahead} commit(s) from {name}.")
++    cmd_sync_push([])
++
++def cmd_sync(argv):
++    """Trade the store with other devices through a drop zone."""
++    commands = {'setup': cmd_sync_setup, 'peer': cmd_sync_peer, 'status': cmd_sync_status, 'push': cmd_sync_push,
++                'fetch': cmd_sync_fetch, 'log': cmd_sync_log, 'diff': cmd_sync_diff, 'merge': cmd_sync_merge}
++    command = argv[0] if argv else 'status'
++    if command not in commands:
++        die(f"Usage: {EXECUTABLE_NAME} sync [{' | '.join(commands)}]")
++    commands[command](argv[1:])
++
+ def main():
+     """Main function."""
+     set_umask()
+@@ -1652,6 +2051,8 @@ def main():
+         cmd_copy_move("copy", sys.argv[2:])
+     elif command == "git":
+         cmd_git(sys.argv[2:])
++    elif command == "sync":
++        cmd_sync(sys.argv[2:])
+     else:
+         # Not found - Use show command by default
+         cmd_show([command] + sys.argv[2:])
+@@ -1667,3 +2068,7 @@ if __name__ == "__main__":
+     except KeyboardInterrupt:
+         print("", file=sys.stderr)
+         sys.exit(130)
++    except BrokenPipeError:
++        # Whoever read the output left (| head, | grep -q): not an error worth a traceback.
++        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
++        sys.exit(141)
+diff --git a/test_tricks/additional-tests/u0008-sync-tests.sh b/test_tricks/additional-tests/u0008-sync-tests.sh
+new file mode 100755
+index 0000000..c6e31dc
+--- /dev/null
++++ b/test_tricks/additional-tests/u0008-sync-tests.sh
+@@ -0,0 +1,226 @@
++#!/usr/bin/env bash
++
++test_description='Test sync: trading the store with another device through a drop zone'
++cd "$(dirname "$0")"
++. ./setup.sh
++
++# This store is the device "pc", with KEY1. The other device, "phone", has KEY2 and is played
++# here with git and gpg alone: what it publishes is what any implementation of it must publish.
++DROP="$SHARNESS_TRASH_DIRECTORY/drop"
++PHONE="$SHARNESS_TRASH_DIRECTORY/phone"
++
++phone_git() {
++	env -u GIT_DIR -u GIT_WORK_TREE git -C "$PHONE" "$@"
++}
++
++# phone_publish [signing key [reference [recipient...]]]
++phone_publish() {
++	local key="${1:-$KEY2}" ref="${2:-refs/pass-sync/phone}"
++	phone_git update-ref "$ref" HEAD &&
++	phone_git bundle create --version=2 "$SHARNESS_TRASH_DIRECTORY/phone.bundle" "$ref" &&
++	$GPG --batch --yes --quiet --trust-model always --compress-algo none --local-user "$key" \
++		--sign --encrypt --recipient $KEY1 --recipient $KEY2 \
++		--output "$DROP/phone.bundle.gpg" "$SHARNESS_TRASH_DIRECTORY/phone.bundle"
++}
++
++# phone_take: start again from what pc published.
++phone_take() {
++	$GPG --batch --yes --quiet --output "$SHARNESS_TRASH_DIRECTORY/pc.bundle" --decrypt "$DROP/pc.bundle.gpg" &&
++	phone_git fetch --quiet "$SHARNESS_TRASH_DIRECTORY/pc.bundle" "+refs/pass-sync/pc:refs/pass-sync/pc" &&
++	phone_git checkout --quiet -B work refs/pass-sync/pc
++}
++
++# phone_insert name content [commit options...]: an entry encrypted to KEY1, as the .gpg-id says.
++phone_insert() {
++	local name="$1" content="$2"
++	shift 2
++	echo "$content" | $GPG --batch --yes --quiet --trust-model always --encrypt --recipient $KEY1 \
++		--output "$PHONE/$name.gpg" &&
++	phone_git add "$name.gpg" &&
++	phone_git commit --quiet "${@:--S}" -m "Add given password for $name to store."
++}
++
++head_of() {
++	git rev-parse "${1:-HEAD}"
++}
++
++test_expect_success 'Setup: a store in git, a drop zone, a phone' '
++	"$PASS" init $KEY1 &&
++	"$PASS" git init &&
++	"$PASS" generate first 20 &&
++	mkdir "$DROP" &&
++	env -u GIT_DIR -u GIT_WORK_TREE git init --quiet "$PHONE" &&
++	phone_git config user.signingkey $KEY2 &&
++	phone_git config gpg.program $GPG
++'
++
++test_expect_success 'Sync says what is missing before it is set up' '
++	test_must_fail "$PASS" sync push 2>err &&
++	grep -q "sync setup" err &&
++	test_must_fail "$PASS" sync setup Pc "$DROP" $KEY1 &&
++	test_must_fail "$PASS" sync setup pc "$DROP" 0123 &&
++	test_must_fail "$PASS" sync setup pc "$DROP/missing" $KEY1 &&
++	"$PASS" sync setup pc "$DROP" $KEY1 &&
++	test_must_fail "$PASS" sync peer phone 0000000000000000000000000000000000000000 &&
++	test_must_fail "$PASS" sync peer pc $KEY1 &&
++	test_must_fail "$PASS" sync log phone &&
++	"$PASS" sync peer phone "$(echo $KEY2 | tr A-F a-f | sed "s/..../& /g")" &&
++	"$PASS" sync status >out &&
++	grep -q "Published: not yet" out &&
++	grep -q "phone: nothing received yet" out
++'
++
++test_expect_success 'Push publishes one signed file that holds one reference' '
++	"$PASS" sync push &&
++	test "$(ls "$DROP")" = "pc.bundle.gpg" &&
++	$GPG --batch --yes --quiet --status-fd 3 --output pc.bundle --decrypt "$DROP/pc.bundle.gpg" 3>status &&
++	grep -q "VALIDSIG .* $KEY1\$" status &&
++	test "$(grep -c "ENC_TO" status)" = 2 &&
++	test "$(env -u GIT_DIR -u GIT_WORK_TREE git bundle list-heads pc.bundle)" = "$(head_of) refs/pass-sync/pc" &&
++	"$PASS" sync status | grep -q "Published: the current state"
++'
++
++test_expect_success 'Fetch, log, diff and merge take what the phone signed' '
++	phone_take &&
++	phone_insert from-phone "typed on the phone" &&
++	phone_publish &&
++	"$PASS" sync fetch >out &&
++	grep -q "phone: 1 commit(s) to take" out &&
++	test_must_fail "$PASS" show from-phone &&
++	"$PASS" sync log phone >out &&
++	grep -q "signed by phone .*Add given password for from-phone" out &&
++	grep -q "added *from-phone\$" out &&
++	"$PASS" sync diff phone | grep -q "^+typed on the phone" &&
++	"$PASS" sync merge phone >out &&
++	grep -q "Took 1 commit(s) from phone" out &&
++	test "$("$PASS" show from-phone)" = "typed on the phone" &&
++	test "$(head_of)" = "$(phone_git rev-parse HEAD)" &&
++	test "$(head_of refs/pass-sync/pc)" = "$(head_of)" &&
++	"$PASS" sync merge phone | grep -q "has nothing this store lacks"
++'
++
++test_expect_success 'A commit that no device signed is not taken' '
++	before=$(head_of) &&
++	phone_insert unsigned "nobody vouches for this" --no-gpg-sign &&
++	phone_publish &&
++	"$PASS" sync fetch &&
++	"$PASS" sync log phone | grep -q "NOT SIGNED BY A DEVICE" &&
++	test_must_fail "$PASS" sync merge phone 2>err &&
++	grep -q "Not signed by phone" err &&
++	test "$(head_of)" = "$before" &&
++	phone_take &&
++	phone_insert signed-by-another "a key that is not a device" -S$KEY3 &&
++	phone_publish &&
++	"$PASS" sync fetch &&
++	test_must_fail "$PASS" sync merge phone 2>err &&
++	grep -q "Not signed by phone" err &&
++	test "$(head_of)" = "$before"
++'
++
++test_expect_success 'A commit that changes who can read is not taken' '
++	before=$(head_of) &&
++	phone_take &&
++	echo $KEY2 >>"$PHONE/.gpg-id" &&
++	phone_git commit --quiet -S -am "Let the phone read everything." &&
++	phone_publish &&
++	"$PASS" sync fetch &&
++	test_must_fail "$PASS" sync merge phone 2>err &&
++	grep -q ".gpg-id, which is not an entry" err &&
++	test "$(head_of)" = "$before" &&
++	phone_take &&
++	mkdir -p "$PHONE/.extensions" &&
++	echo "#!/bin/sh" >"$PHONE/.extensions/x.bash" &&
++	phone_git add .extensions &&
++	phone_git commit --quiet -S -m "An extension." &&
++	phone_publish &&
++	"$PASS" sync fetch &&
++	test_must_fail "$PASS" sync merge phone &&
++	phone_take &&
++	ln -s /etc/passwd "$PHONE/link.gpg" &&
++	phone_git add link.gpg &&
++	phone_git commit --quiet -S -m "A link dressed as an entry." &&
++	phone_publish &&
++	"$PASS" sync fetch &&
++	test_must_fail "$PASS" sync merge phone &&
++	test "$(head_of)" = "$before"
++'
++
++test_expect_success 'Only a fast-forward is taken, and removing an entry is one' '
++	phone_take &&
++	phone_insert early "written before the store moved" &&
++	phone_publish &&
++	"$PASS" generate later 20 &&
++	before=$(head_of) &&
++	"$PASS" sync fetch >out &&
++	grep -q "1 commit(s) to take, but 1 behind" out &&
++	test_must_fail "$PASS" sync merge phone 2>err &&
++	grep -q "not a fast-forward" err &&
++	test "$(head_of)" = "$before" &&
++	"$PASS" sync push &&
++	old=$(phone_git rev-parse HEAD) &&
++	phone_take &&
++	phone_git merge --quiet -S --no-edit $old &&
++	phone_git rm --quiet from-phone.gpg &&
++	phone_git commit --quiet -S -m "Remove from-phone from store." &&
++	phone_publish &&
++	"$PASS" sync fetch &&
++	"$PASS" sync merge phone &&
++	test "$("$PASS" show early)" = "written before the store moved" &&
++	test_must_fail "$PASS" show from-phone &&
++	"$PASS" show later
++'
++
++test_expect_success 'A file is refused unless the phone signed it and it holds its reference alone' '
++	held=$(head_of refs/pass-sync/phone) &&
++	phone_insert more "one more" &&
++	phone_publish $KEY3 &&
++	test_must_fail "$PASS" sync fetch >out &&
++	grep -q "REFUSED, its file is signed by $KEY3" out &&
++	phone_publish $KEY2 refs/pass-sync/pc &&
++	test_must_fail "$PASS" sync fetch >out &&
++	grep -q "REFUSED, its bundle must hold refs/pass-sync/phone alone" out &&
++	phone_git bundle create --version=2 "$SHARNESS_TRASH_DIRECTORY/partial.bundle" HEAD~1..work &&
++	$GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --sign --encrypt --recipient $KEY1 \
++		--output "$DROP/phone.bundle.gpg" "$SHARNESS_TRASH_DIRECTORY/partial.bundle" &&
++	test_must_fail "$PASS" sync fetch >out &&
++	grep -q "REFUSED" out &&
++	echo "not a bundle" | $GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --sign --encrypt \
++		--recipient $KEY1 --output "$DROP/phone.bundle.gpg" &&
++	test_must_fail "$PASS" sync fetch >out &&
++	grep -q "REFUSED, its file is not a git bundle" out &&
++	echo "not a bundle" | $GPG --batch --yes --quiet --trust-model always --encrypt --recipient $KEY1 \
++		--output "$DROP/phone.bundle.gpg" &&
++	test_must_fail "$PASS" sync fetch >out &&
++	grep -q "REFUSED, its file is signed by nobody" out &&
++	echo "noise" >"$DROP/phone.bundle.gpg" &&
++	test_must_fail "$PASS" sync fetch >out &&
++	grep -q "REFUSED, its file does not decrypt" out &&
++	test "$(head_of refs/pass-sync/phone)" = "$held"
++'
++
++test_expect_success 'An old file served again is ignored, a missing one is not an error' '
++	phone_publish &&
++	"$PASS" sync fetch &&
++	held=$(head_of refs/pass-sync/phone) &&
++	cp "$DROP/phone.bundle.gpg" newest &&
++	phone_git reset --quiet --hard HEAD~1 &&
++	phone_publish &&
++	"$PASS" sync fetch >out &&
++	grep -q "IGNORED, an old file was served again" out &&
++	test "$(head_of refs/pass-sync/phone)" = "$held" &&
++	rm "$DROP/phone.bundle.gpg" &&
++	"$PASS" sync fetch >out &&
++	grep -q "phone: has published nothing" out
++'
++
++test_expect_success 'A removed device is no longer published to, nor listened to' '
++	cp newest "$DROP/phone.bundle.gpg" &&
++	"$PASS" sync peer --remove phone &&
++	test_must_fail git rev-parse --verify --quiet refs/pass-sync/phone &&
++	test_must_fail "$PASS" sync fetch phone &&
++	"$PASS" sync push &&
++	$GPG --batch --yes --quiet --status-fd 3 --output /dev/null --decrypt "$DROP/pc.bundle.gpg" 3>status &&
++	test "$(grep -c "ENC_TO" status)" = 1
++'
++
++test_done
+-- 
+2.43.0
+

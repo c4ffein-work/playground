@@ -1,0 +1,9 @@
+{
+  "repo": "c4ffein/pass",
+  "remote": "https://github.com/c4ffein/pass",
+  "base_branch": "master",
+  "base_sha": "da3d32f0aef375d30769f1c8d8cc496664aae333",
+  "created": "2026-11-23",
+  "patches": 1,
+  "title": "Add sync: trade the store with other devices through a drop zone"
+}
