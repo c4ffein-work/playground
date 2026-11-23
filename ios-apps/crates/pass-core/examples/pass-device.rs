@@ -119,10 +119,11 @@ fn exactly<const N: usize>(arguments: Vec<String>, usage: &str) -> Result<[Strin
         .map_err(|_| format!("usage: pass-device {usage}").into())
 }
 
-/// One line per other device, after a sync.
-fn sync(store: &PassStore, zone: DropZone, identity: Arc<Identity>) -> Result<Vec<String>, Failure> {
+/// One line per other device, after a sync; and why this device could not publish, when it could not.
+fn sync(store: &PassStore, zone: DropZone, identity: Arc<Identity>) -> Result<(Vec<String>, Option<String>), Failure> {
     let report = store.sync(zone, identity)?;
-    Ok(report
+    let refused = report.publish_refused;
+    let lines = report
         .peers
         .into_iter()
         .map(|peer| {
@@ -137,7 +138,8 @@ fn sync(store: &PassStore, zone: DropZone, identity: Arc<Identity>) -> Result<Ve
             };
             format!("{}: {stands}", peer.state.device)
         })
-        .collect())
+        .collect();
+    Ok((lines, refused))
 }
 
 fn run(command: &str, mut arguments: Vec<String>) -> Result<Vec<String>, Failure> {
@@ -247,6 +249,20 @@ fn run(command: &str, mut arguments: Vec<String>) -> Result<Vec<String>, Failure
             names.sort();
             names
         }
+        // Not in the README's list, but what the runner asks to know where a folder's readers come
+        // from: the readers a folder names itself. Fails when it has no `.gpg-id` of its own.
+        "readers-file" => {
+            let [folder] = exactly(arguments, "readers-file DIR")?;
+            let Some(readers) = home.open()?.0.folder_readers(folder.clone())? else {
+                return fail(format!("{folder} has no .gpg-id of its own"));
+            };
+            let mut names: Vec<String> = readers
+                .into_iter()
+                .map(|reader| reader.device.unwrap_or(format!("?{}", reader.id)))
+                .collect();
+            names.sort();
+            names
+        }
         "set-readers" => {
             if arguments.is_empty() {
                 return fail("usage: pass-device set-readers DIR [DEVICE...]");
@@ -263,7 +279,15 @@ fn run(command: &str, mut arguments: Vec<String>) -> Result<Vec<String>, Failure
         "sync" => {
             exactly::<0>(arguments, "sync")?;
             let (store, identity) = home.open()?;
-            sync(&store, home.drop_zone()?, identity)?
+            let (lines, refused) = sync(&store, home.drop_zone()?, identity)?;
+            if let Some(reason) = refused {
+                // The others' files were received all the same: their lines are printed, then the failure.
+                for line in lines {
+                    println!("{line}");
+                }
+                return fail(format!("not published: {reason}"));
+            }
+            lines
         }
         "pending" => {
             let [device] = exactly(arguments, "pending DEVICE")?;
@@ -287,7 +311,9 @@ fn run(command: &str, mut arguments: Vec<String>) -> Result<Vec<String>, Failure
             let (store, identity) = home.open()?;
             store.take_update(device, None, choices, identity.clone())?;
             // "Then it publishes."
-            sync(&store, home.drop_zone()?, identity)?;
+            if let (_, Some(reason)) = sync(&store, home.drop_zone()?, identity)? {
+                return fail(format!("taken, but not published: {reason}"));
+            }
             Vec::new()
         }
         "drop" => {

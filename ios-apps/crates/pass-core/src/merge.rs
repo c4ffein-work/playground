@@ -176,7 +176,7 @@ pub(crate) fn merge(
     let mut merged = Merged::default();
     let mut conflicts = BTreeSet::new();
     let mut undecided = BTreeSet::new();
-    // Each entry on its own first.
+    // Each entry on its own first: where it lands, and with what.
     let mut placed: Vec<(usize, Place)> = Vec::new();
     for (index, item) in items.iter().enumerate() {
         match verdict(item, same) {
@@ -194,14 +194,23 @@ pub(crate) fn merge(
         }
     }
     // Then together: two entries cannot end under one name (one moved there, another was added
-    // there). That too is a choice, by that name: each of them as this side has it, or as theirs.
-    let mut by_name: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (position, (_, place)) in placed.iter().enumerate() {
-        if let Some((name, _)) = place {
-            by_name.entry(name.clone()).or_default().push(position);
+    // there). When they do not hold the same thing, that too is a choice, by that name, and
+    // whole: each of the entries involved as this side has it, or each as theirs has it.
+    let colliding = |placed: &[(usize, Place)], same: &mut dyn FnMut(ObjectId, ObjectId) -> bool| {
+        let mut by_name: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (position, (_, place)) in placed.iter().enumerate() {
+            if let Some((name, _)) = place {
+                by_name.entry(name.clone()).or_default().push(position);
+            }
         }
-    }
-    for (name, positions) in by_name.into_iter().filter(|(_, positions)| positions.len() > 1) {
+        by_name.retain(|_, positions| {
+            let version = |position: usize| placed[position].1.as_ref().expect("it is placed").1;
+            let first = version(positions[0]);
+            positions.iter().any(|position| !same(first, version(*position)))
+        });
+        by_name
+    };
+    for (name, positions) in colliding(&placed, same) {
         conflicts.insert(name.clone());
         match choices.get(&name) {
             Some(side) => {
@@ -218,13 +227,16 @@ pub(crate) fn merge(
             }
         }
     }
+    // Two entries still under one name after that: the choices given cannot all hold.
+    let still: BTreeSet<String> = colliding(&placed, same).into_keys().collect();
     for (_, place) in placed {
         if let Some((name, version)) = place {
-            // Two entries still under one name after the choices: the choices cannot both hold.
-            if merged.entries.insert(name.clone(), version).is_some() && !undecided.contains(&name) {
-                undecided.insert(name.clone());
-                conflicts.insert(name);
-            }
+            merged.entries.entry(name).or_insert(version);
+        }
+    }
+    for name in still {
+        if undecided.insert(name.clone()) {
+            conflicts.insert(name);
         }
     }
     merged.undecided = undecided.into_iter().collect();
@@ -468,14 +480,21 @@ mod tests {
         let added = entries(&[("x", v(1)), ("y", v(2))]);
         for (mine, theirs) in [(&moved, &added), (&added, &moved)] {
             let merged = run(&base, mine, theirs, &[]);
-            assert_eq!(
-                (merged.conflicts.clone(), merged.undecided),
-                (vec!["y".to_string()], vec!["y".to_string()])
-            );
-            // Whole: each side's choice is that side's store, as far as these two entries go.
+            assert_eq!(merged.conflicts, ["y"]);
+            assert_eq!(merged.undecided, ["y"]);
+            // Whole: each side's choice is that side's state of both entries involved.
             assert_eq!(run(&base, mine, theirs, &[("y", Side::Mine)]).entries, *mine);
             assert_eq!(run(&base, mine, theirs, &[("y", Side::Theirs)]).entries, *theirs);
         }
+    }
+
+    #[test]
+    fn two_entries_with_the_same_content_can_end_under_one_name() {
+        // One side moves x to y, the other adds a y that says the same: one y, no choice.
+        let base = entries(&[("x", v(1))]);
+        let moved = entries(&[("y", version(1, 1))]);
+        let added = entries(&[("x", v(1)), ("y", version(1, 2))]);
+        settles(&base, &moved, &added, &[("y", v(1))]);
     }
 
     #[test]

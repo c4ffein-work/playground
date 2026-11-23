@@ -278,8 +278,8 @@ pub enum ReviewLine {
     Removed {
         name: String,
     },
-    /// The readers of a folder (`work/`, `/` for the root) change: the new set, in the order
-    /// of the file; or the file is removed, and the folder inherits those of the one above.
+    /// The readers of a folder (`work/`, `/` for the root) change: the new set, by name;
+    /// or the file is removed, and the folder inherits those of the one above.
     Readers {
         folder: String,
         devices: Vec<String>,
@@ -406,6 +406,9 @@ pub struct PeerSync {
 pub struct SyncReport {
     /// Whether this device's tip was sent (it is, whenever it is not what was last published).
     pub published: bool,
+    /// Why this device's tip was not sent although it should have been: its store holds
+    /// what a synced store does not. The rest of the sync happened.
+    pub publish_refused: Option<String>,
     /// One per other device, in the order of the configuration.
     pub peers: Vec<PeerSync>,
 }
@@ -941,6 +944,14 @@ impl PassStore {
                 ),
             });
         }
+        if let Some(attributes) = tip.attributes {
+            // Attributes can name filters, which are programs: only what `pass git init` writes.
+            if git::blob(repo, attributes)? != GIT_ATTRIBUTES.as_bytes() {
+                return Err(PassError::RefusedTip {
+                    message: ".gitattributes is not the one line of `pass git init`".into(),
+                });
+            }
+        }
         if !tip.readers.contains_key("") {
             return Err(PassError::RefusedTip {
                 message: "it has no .gpg-id at its root".into(),
@@ -1044,24 +1055,24 @@ impl PassStore {
 
     /// Encrypts again every stale entry this device can read, for the readers its folder
     /// now has: one commit per folder. Returns their names. What it cannot read stays stale,
-    /// for a device that can.
+    /// for a device that can; so does what is under a `.gpg-id` that names someone who is no device.
     fn reencrypt_stale(&self, identity: &Identity) -> Result<Vec<String>, PassError> {
-        let (repo, head) = self.repository()?;
-        let tip = self.read_tip(&repo, head)?;
-        let readers = self.tip_readers(&repo, &tip)?;
         let mut by_folder: BTreeMap<String, Vec<git::Edit>> = BTreeMap::new();
         let mut names = Vec::new();
-        for name in self.stale_in(&repo, &tip)? {
-            let Ok(content) = identity.inner.decrypt(&git::blob(&repo, tip.entries[&name])?) else {
+        for name in self.list()? {
+            let file = layout::read(&self.root, &layout::file_of(&name))?;
+            let access = self.access_of(&name, Some(&file))?;
+            if !access.stale {
+                continue;
+            }
+            let (Ok(content), Ok(recipients)) = (identity.inner.decrypt(&file), self.recipients_of(&name)) else {
                 continue;
             };
-            let (folder, devices) = governing(&readers, &name).expect("the root has readers");
-            let recipients: Vec<&Certificate> = devices.iter().map(|device| &device.certificate).collect();
-            let encrypted = crypto::encrypt(&content, &recipients)?;
+            let folder = readers_folder(&access.gpg_id).unwrap_or("").to_string();
             by_folder
-                .entry(folder.to_string())
+                .entry(folder)
                 .or_default()
-                .push((layout::file_of(&name), Some(encrypted)));
+                .push((layout::file_of(&name), Some(crypto::encrypt(&content, &recipients)?)));
             names.push(name);
         }
         for (folder, edits) in by_folder {
@@ -1193,26 +1204,12 @@ impl PassStore {
         })?;
         let repo = self.open_repository()?.ok_or(PassError::NoStore)?;
         // And it is a store that syncs: nothing but entries and readers files, every reader a device.
-        let tip = self.valid_tip(&repo, header.tip)?;
-        if let Some(head) = git::head_commit(&repo)? {
-            self.same_attributes(&self.read_tip(&repo, head)?, &tip)?;
-        }
+        self.valid_tip(&repo, header.tip)?;
         git::set_reference(&repo, &reference, header.tip, "pass sync: received")?;
         std::fs::write(self.published_at_file(from), published_at.to_string()).map_err(|e| PassError::Io {
             message: format!("cannot note when {} published: {e}", from.name),
         })?;
         Ok(FetchOutcome::Received)
-    }
-
-    /// `.gitattributes` is taken with the store and never changes afterwards.
-    fn same_attributes(&self, mine: &Tip, theirs: &Tip) -> Result<(), PassError> {
-        if mine.attributes == theirs.attributes {
-            Ok(())
-        } else {
-            Err(PassError::RefusedTip {
-                message: ".gitattributes is not the one this store was adopted with".into(),
-            })
-        }
     }
 
     /// The file this device publishes: its whole history, signed, for every device.
@@ -1243,7 +1240,6 @@ impl PassStore {
             return Ok(None);
         }
         let mine = self.read_tip(repo, head)?;
-        self.same_attributes(&mine, &theirs)?;
         let base_commit = git::merge_base(repo, head, theirs_commit)?.ok_or(PassError::Unrelated)?;
         Ok(Some(Plan {
             kind: if base_commit == head {
@@ -1331,11 +1327,13 @@ impl PassStore {
                 continue;
             }
             let devices = their_readers.get(folder);
+            let mut names: Vec<String> = devices
+                .map(|devices| devices.iter().map(|device| device.name.clone()).collect())
+                .unwrap_or_default();
+            names.sort();
             lines.push(ReviewLine::Readers {
                 folder: folder_label(folder),
-                devices: devices
-                    .map(|devices| devices.iter().map(|device| device.name.clone()).collect())
-                    .unwrap_or_default(),
+                devices: names,
                 inherited: devices.is_none(),
             });
         }
@@ -1452,6 +1450,16 @@ impl PassStore {
             format!("{folder}/entry")
         };
         self.access_of(&inside, None)
+    }
+
+    /// The readers a folder names itself, in its own `.gpg-id`: `None` when it has none
+    /// (and so has the readers of the folder above).
+    pub fn folder_readers(&self, folder: String) -> Result<Option<Vec<Reader>>, PassError> {
+        let path = readers_path(&clean_folder(&folder)?);
+        if !self.root.join(&path).is_file() {
+            return Ok(None);
+        }
+        Ok(Some(self.readers_of(self.ids_of(&path)?)))
     }
 
     /// The entries this device cannot decrypt: not encrypted to its key. Needs no key itself.
@@ -1717,17 +1725,25 @@ impl PassStore {
     /// One visit to the drop zone: publishes this device's tip when it is not the one last
     /// published, then looks at the file of every other device. What they published is
     /// received (checked, and kept aside) but never applied: see [`Self::pending_update`].
-    /// Refuses, having done nothing, when this device's own store holds what a synced store does not.
+    /// A store of this device that holds what a synced store does not is not published
+    /// ([`SyncReport::publish_refused`]); the others' files are still received.
     pub fn sync(&self, zone: DropZone, identity: Arc<Identity>) -> Result<SyncReport, PassError> {
         let _busy = self.busy.lock().unwrap();
         self.check(&identity)?;
         let remote = ssh::SshRemote::new(&zone.url, &zone.private_key, &zone.host_key)?;
         let repo = git::open_or_init(&self.root, &self.author)?;
         let head = git::head_commit(&repo)?;
+        let mut publish_refused = None;
         let to_publish = match head {
             Some(head) if git::reference(&repo, &self.reference_of(&self.me)) != Some(head) => {
-                self.valid_tip(&repo, head)?;
-                Some((head, self.sealed_bundle(&repo, head, &identity)?))
+                match self.valid_tip(&repo, head) {
+                    Ok(_) => Some((head, self.sealed_bundle(&repo, head, &identity)?)),
+                    Err(e @ (PassError::RefusedTip { .. } | PassError::UnknownRecipient { .. })) => {
+                        publish_refused = Some(e.to_string());
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
             }
             _ => None,
         };
@@ -1762,6 +1778,7 @@ impl PassStore {
         }
         Ok(SyncReport {
             published: to_publish.is_some(),
+            publish_refused,
             peers,
         })
     }
@@ -1834,7 +1851,7 @@ impl PassStore {
                 reencrypted: Vec::new(),
             });
         };
-        if commit.is_some_and(|commit| commit != plan.theirs_commit.to_string()) {
+        if commit.is_some_and(|commit| ObjectId::from_hex(commit.as_bytes()).ok() != Some(plan.theirs_commit)) {
             return Err(PassError::StaleUpdate);
         }
         let target = match (plan.kind, plan.head) {
@@ -1864,7 +1881,7 @@ impl PassStore {
                 let merged = Tip {
                     entries: entries.entries,
                     readers,
-                    attributes: plan.mine.attributes,
+                    attributes: plan.mine.attributes.or(plan.theirs.attributes),
                 };
                 let tree = git::tree_of_files(&repo, &merged.files())?;
                 let message = format!("Merge the changes of {} into those of {}.", from.name, self.me.name);
