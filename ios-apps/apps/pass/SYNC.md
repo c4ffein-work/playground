@@ -1,26 +1,27 @@
 # pass sync: the protocol
 
-How a password-store is kept in step between a computer and a phone through a server that
-understands nothing. Three programs implement this, and must agree on every line of it:
-the drop zone (`dropzone/`), the computer (`pass sync`, a command of
-[pass.py](https://github.com/c4ffein/pass)) and the phone (`crates/pass-core`).
+How a password-store is kept in step between devices through a server that understands nothing.
+Three programs implement this, and must agree on every line of it: the drop zone (`dropzone/`),
+`pass sync` (a command of [pass.py](https://github.com/c4ffein/pass)) and the phone
+(`crates/pass-core`). `scenarios/` runs the same situations through both implementations, mixed.
+
+Devices are equals: each keeps its own line of history, publishes it, and takes the others'
+changes when its user has looked at them. Nothing designates a main line.
 
 ## Devices
 
 - A device has a **name**: `[a-z0-9][a-z0-9-]{0,31}`.
 - A device has an **OpenPGP key**. It signs what the device publishes, and it is a recipient of
-  what the others publish. It may or may not be a recipient of a given entry: that is `.gpg-id`'s
-  business, as in any password-store.
-- A device has an **SSH key**, which only lets it into the drop zone.
-- Exactly one device is the **owner**: the computer, where the store is managed. The others are
-  **members**.
+  what the others publish. Whether it can read a given entry is `.gpg-id`'s business, as in any
+  password-store. A device can be a key and nothing more (a backup key that only ever reads).
+- A device that syncs has an **SSH key**, which only lets it into the drop zone.
 - Each device knows the others from its own configuration: name, OpenPGP fingerprint (40 hex),
-  public key, and which one is the owner. Nothing in the store or in the drop zone can introduce
-  a device or change a key.
+  public key. **Nothing in the store or in the drop zone can introduce a device or change a key.**
 
 ## The drop zone
 
 An SFTP-only account. After login the working directory is the one directory there is.
+(`pass sync` also accepts a local directory in its place: same files, same rules.)
 
 - One file per device: `<name>.bundle.gpg`. A device writes its own file and reads the others'.
 - To publish: upload as `<name>.bundle.gpg.part`, then rename over `<name>.bundle.gpg`
@@ -39,9 +40,8 @@ left to itself gpg can pick SHA-1); a reader refuses a weaker one. A reader refu
 device's public key, so that bound holds before any signature is looked at.
 
 Its plaintext is a **git bundle** (version 2, SHA-1 objects) holding **exactly one reference,
-`refs/pass-sync/<name>`**, with its full history: no prerequisite commits. For the owner that
-reference is the tip of the store's branch. For a member it is the tip of that member's own
-line of work.
+`refs/pass-sync/<name>`**, the tip of that device's line, with its full history: no prerequisite
+commits.
 
 A reader takes the file of device D only if all of this holds, and otherwise changes nothing:
 
@@ -52,76 +52,133 @@ A reader takes the file of device D only if all of this holds, and otherwise cha
 Then the reader stores that tip as its own `refs/pass-sync/D`. That is all receiving does: no
 branch moves, no file changes in the working tree.
 
+That signature is the authentication: D vouches for its tip and all that is in it, including what
+it took from others. Commits may be signed too (the phone signs its own, `pass sync setup` turns
+it on for pass.py); a reader shows who signed each, and requires nothing.
+
 The signature's time is shown to the user ("published 3 days ago"). A tip that is an ancestor of the
 one already held for D is an old file served again: it is reported as such and ignored. A tip that
-is neither ahead of nor behind the one held (D rewrote its history) is taken like any other: D
-signed it, and whoever merges it sees what it does.
+is neither ahead of nor behind the one held (D rewrote its history) is taken like any other.
 
-## Who may change what
+## What a synced store holds
 
-- **Reading** is `.gpg-id`, per directory, as in any password-store: an entry is encrypted to the
-  keys listed in the nearest `.gpg-id` above it.
-- **Only the owner changes who can read**, and anything that is not an entry. A member's commits may
-  add, change, rename and remove `*.gpg` files, and nothing else: no `.gpg-id`, no `.gpg-id.sig`,
-  no `.gitattributes`, nothing under `.extensions/`.
-- A member writes an entry encrypted to the recipients of its governing `.gpg-id`, and signs each
-  of its commits with its OpenPGP key. The public keys it has are the devices': where a `.gpg-id`
-  lists a key that is no device's, the member reads (if it is listed) but does not write.
-- A member never re-encrypts what it did not change. After the owner changes a `.gpg-id`, bringing
-  every entry below it in line is the owner's job (`pass init` does it); until then a member shows
-  the entries whose file and `.gpg-id` disagree.
+Three kinds of path, and nothing else:
 
-## The member's side (the phone)
+- an **entry**: a regular file named `*.gpg`, no part of its path starting with a dot.
+  Its name is its path without `.gpg`;
+- a **readers file**: a regular file named `.gpg-id`, at the root or in a directory no part of
+  whose path starts with a dot. The root has one;
+- `.gitattributes` at the root, which `pass git init` writes. It is taken when a device first
+  adopts the store and never changes afterwards.
 
-The member's line of work is the owner's history plus its own commits. It reads the owner's file
-only, and needs its OpenPGP key unlocked for anything that touches the drop zone.
+A device does not publish a tip that holds anything else (`.extensions/`, `.gpg-id.sig`, a symbolic
+link, a note), and does not take one: the update is refused whole, naming the paths. Extensions
+are code: they stay out of git, on the device that runs them.
 
-- **Taking the owner's update** (its `refs/pass-sync/<owner>` moved) is never automatic. The member
-  shows what the update does: the commits, the entries added, changed, renamed and removed (with
-  both versions decrypted on demand, when it can read them), and any change of recipients, entry
-  by entry and directory by directory. The user accepts or leaves it for later. The very first one, which brings the
-  whole store, goes through the same screen.
-- On accept:
-  - no commit of its own outstanding: it moves forward to the owner's tip;
-  - otherwise it **merges** the owner's tip into its line, as a merge commit signed like the
-    others. Entries are merged as whole files: changed on one side only, that side wins; changed
-    on both sides to different contents (or changed on one and removed on the other), the user
-    chooses between the two, having seen both. Anything that is not an entry is taken from the
-    owner as it is.
-- After any commit of its own, and after any accepted update, it publishes its tip.
-- It can also drop its own outstanding commits and go back to the owner's state it last accepted
-  (not to an update it has not reviewed), then publishes that.
+## Readers
 
-## The owner's side (the computer)
+An entry is encrypted to the keys listed in the nearest `.gpg-id` above it. **Any device may change
+a `.gpg-id`**, with two things holding always:
 
-The settings are in the store's git configuration (`pass-sync.device`, `pass-sync.url`,
-`pass-sync.key`, one `pass-sync.peer` per member), written by `pass sync setup` and `pass sync peer`.
-The drop zone may also be a local directory (a USB stick, a synced folder): same files, same rules.
+- **Readers are devices.** Every line of every `.gpg-id` of a tip must name exactly one key, and
+  that key must be a device's: its fingerprint or 16-hex key id (primary or encryption subkey),
+  or a text found in the user ID of one device's key and no other's. A tip where a line names
+  anything else is refused whole. A device that writes a `.gpg-id` writes full fingerprints.
+  Likewise an entry encrypted to a key that is no device's: refused whole.
+- **Saying is not doing.** A `.gpg-id` says who should read; an entry is read by those its file is
+  encrypted to. An entry whose file and governing `.gpg-id` disagree is **stale**. A device that
+  changes a `.gpg-id` re-encrypts the entries below that it can read, in the same commit or the
+  next. Having taken an update, a device re-encrypts every stale entry it can read, commits that
+  (`Reencrypt for the readers of <dir>.`), and publishes. So a device adding itself where it cannot
+  read has only *asked*: it reads nothing until a device that can read takes that change, which
+  shows it as what it is ("12 entries below are not encrypted for phone yet; taking this
+  re-encrypts them").
 
-- `pass sync push`: publish the current tip.
-- `pass sync fetch`: take each member's file, as above, then say for each member how many commits
-  it has that the store does not, and what they touch.
-- `pass sync log <member>` / `pass sync diff <member>`: the member's outstanding commits, with who
-  signed each, and the decrypted difference.
-- `pass sync merge <member>`: take the member's commits. Refused unless
-  - the result is a fast-forward (the member has already merged the owner's tip),
-  - every outstanding commit is signed by that member's key or by the owner's, and
-  - between the store and the member's tip, nothing differs but entries: regular files named
-    `*.gpg`, with no component of their path starting with a dot. No `.gpg-id`, nothing under
-    `.extensions/`, no symbolic link.
+A device writes an entry encrypted to the keys of its governing `.gpg-id`, whether or not it is
+one of them.
 
-  When it is not a fast-forward, publish (`pass sync push`) and let the member merge first.
-  Then publishes the new tip.
+## Taking a device's update
+
+Never automatic. For a device D whose tip is not contained in ours, the user is shown what taking
+it would do, then takes it or leaves it.
+
+With *base* the last common ancestor of the two lines, *theirs* what D did since, *mine* what this
+device did since:
+
+- no common ancestor: refused, unless this device's store is empty. Then it **adopts** D's tip
+  as it is (same screen: everything shows as added);
+- nothing of mine: this device moves forward to D's tip;
+- otherwise it merges, into a commit whose parents are [mine, theirs], signed like its others.
+
+Then it publishes.
+
+### Entries
+
+Two versions of an entry are **the same** when their bytes are equal, or when this device can
+decrypt both and their plaintexts are equal (a re-encryption changes nothing).
+
+Within one side, an entry removed at one name and one added at another with the same content
+(as just defined) is a **move**: the same entry under a new name. Matching is one to one, in name
+order. An entry both moved and changed on the same side is not recognised: a removal and an addition.
+
+For each entry, following it through moves:
+
+| One side | The other side | Result |
+| :-- | :-- | :-- |
+| changed it in any way (content, name, removal) | did nothing | the change |
+| moved it | changed its content | the new content under the new name |
+| did the same thing | | that |
+| anything else (two contents, two names, a removal against a change, two new entries of one name) | | **a choice**: mine or theirs, whole |
+
+A choice is named by the entry's name on this device's side, or on theirs if this device has
+removed it. Without a choice for each, nothing is taken. Having landed, an entry whose file does
+not match its new directory's readers is stale, and is handled as above.
+
+### Readers files
+
+Changed on one side: that side's. Changed on both to the same content: that. Otherwise **a
+choice**, named by the directory with a trailing slash (`work/`, and `/` for the root).
+
+### What the user is shown
+
+One line per thing, in this vocabulary (which the scenario runner reads), all about *theirs*:
+
+```
+added NAME
+changed NAME
+moved OLD -> NEW
+removed NAME
+readers DIR: DEVICE DEVICE ...        the new set, names in order; "inherited" when the file is removed
+stale NAME                            in their tip, not encrypted for its readers
+conflict NAME                         needs a choice (an entry name, or a directory with its slash)
+```
+
+plus, on demand, the versions of an entry decrypted (base, mine, theirs) when this device reads them.
+
+## pass sync (the computer)
+
+Settings are in the store's git configuration (`pass-sync.device`, `pass-sync.url`,
+`pass-sync.key`, one `pass-sync.peer` per other device), written by the first two commands.
+
+- `pass sync setup <name> <drop zone> <own fingerprint>`, `pass sync peer [--remove] <name> [<fingerprint>]`.
+- `pass sync push`: publish the current tip. Refused when the store holds what a synced store does not.
+- `pass sync fetch [<device>...]`: receive, as above; one line per device saying where it stands.
+- `pass sync log <device>`: the commits of theirs and who signed each, then the lines above.
+- `pass sync diff <device>`: theirs, decrypted.
+- `pass sync merge <device> [--mine NAME]... [--theirs NAME]...`: take the update, with the
+  choices it needs. Then re-encrypts what is stale and readable, and publishes.
 
 ## What this gives, and what it does not
 
-- The drop zone sees two files, their sizes and the times they change. No entry name, no history.
-- Nobody who is not a device can add an entry, a recipient, or a commit: it takes a device's
-  OpenPGP key to publish anything a reader accepts.
-- A member cannot give anyone access, nor change what the owner runs (`.extensions/`).
-  It can change or remove any entry, including one it cannot read: the owner sees that before
-  merging, and git keeps the previous version.
-- A device's OpenPGP key reads every published file, past ones included if someone kept them.
-  Removing a device means removing it from the configuration of the others and from every
-  `.gpg-id`, and changing the passwords it could read.
+- The drop zone sees one file per device, their sizes and the times they change. No entry name,
+  no history.
+- Nobody who is not a device can add an entry, a reader, or a commit: it takes a device's OpenPGP
+  key to publish anything a reader accepts, and a reader is always a device.
+- Any device can change or remove any entry, including one it cannot read, and can ask to read
+  anything. Every device sees that before taking it, and git keeps what was there.
+- A device that reads an entry can show it to another device (move it, add a reader and
+  re-encrypt). Nothing can stop a reader from telling; this at least shows it.
+- A device's OpenPGP key reads every published file, past ones included if someone kept them, and
+  every entry it was ever a reader of. Removing a device means removing it from the configuration
+  of the others and from every `.gpg-id`, and changing the passwords it could read.
 - Two devices publishing at the same moment cannot collide: each has its own file.
