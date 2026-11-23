@@ -348,6 +348,14 @@ final class EndToEndTests: XCTestCase {
         XCTAssertNil(fixture.store.secret(.passphrase), "asked each time: it is nowhere on the phone")
         XCTAssertFalse(model.canUnlockWithBiometrics)
 
+        // Other recipients are added by their public key, and only that.
+        XCTAssertFalse(model.addRecipientKey(secretKey))
+        XCTAssertFalse(model.addRecipientKey("nope"))
+        XCTAssertEqual(model.settings.otherPublicKeys, [])
+        model.errorMessage = nil
+        XCTAssertTrue(model.addRecipientKey(publicKey))
+        XCTAssertEqual(fixture.store.load().otherPublicKeys, [publicKey])
+
         // A relaunch has the key, and is locked.
         let relaunched = fixture.model()
         XCTAssertEqual(relaunched.keyInfo?.fingerprint, fingerprint)

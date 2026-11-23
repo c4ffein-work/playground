@@ -163,6 +163,26 @@ public final class AppModel {
         }
     }
 
+    /// Adds the public key of another recipient of the store (someone named in a `.gpg-id`),
+    /// so that entries can be written for them too.
+    @discardableResult
+    public func addRecipientKey(_ armored: String) -> Bool {
+        do {
+            let info = try inspectKey(key: armored)
+            guard !info.isSecret else {
+                errorMessage = "This is a secret key: a recipient is added by their public key."
+                return false
+            }
+            var changed = settings
+            changed.otherPublicKeys.append(armored)
+            save(changed)
+            return true
+        } catch {
+            fail(error)
+            return false
+        }
+    }
+
     public func setHTTPSToken(_ token: String) {
         do {
             try store.setSecret(token, for: .httpsToken)

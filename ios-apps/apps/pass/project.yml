@@ -1,0 +1,50 @@
+# XcodeGen spec: `make xcode APP=pass` (from ios-apps/) builds the Rust core and generates Pass.xcodeproj.
+# Before the first build on a device, change dev.cafeine to an identifier of your own (two places
+# here), and set DEVELOPMENT_TEAM (or pick the team in Xcode > Signing & Capabilities).
+name: Pass
+options:
+  bundleIdPrefix: dev.cafeine
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+packages:
+  PassKit:
+    path: Package
+targets:
+  Pass:
+    type: application
+    platform: iOS
+    sources: [App]
+    dependencies:
+      - package: PassKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cafeine.pass
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Pass
+        UILaunchScreen: {}
+        # No ITSAppUsesNonExemptEncryption here: the app does OpenPGP and SSH itself, so the
+        # export-compliance question is the owner's to answer when uploading a build.
+        NSFaceIDUsageDescription: Pass uses Face ID to unlock the password store.
+        # The Rust core opens plain sockets: App Transport Security does not apply to it,
+        # the local network permission does (a relay on the home network).
+        NSLocalNetworkUsageDescription: Pass syncs with the git relay on your network.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
