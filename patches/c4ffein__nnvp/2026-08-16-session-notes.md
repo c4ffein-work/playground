@@ -5,6 +5,14 @@ session, so a local session can pick up with full context. The only code
 change shipped is the patch in `2026-08-16-readme-test-targets/`; everything
 else below is design work, not yet implemented.
 
+> **Status 2026-11-23**: the README patch landed upstream (folded into
+> `87cfc4b` "historing", 2026-08-17; series deleted from the drop-box per
+> convention). The spaced-folder-name bug below was fixed in that same
+> commit — `foldFolders` now keys links with a `\0` separator. The
+> sections still describing open work: sync-layer gaps, residency tiers,
+> testing strategy (upstream has since grown `safetensors.ts` /
+> `weightsFile.ts`, so check overlap before starting residency).
+
 ## What actually changed (the diff)
 
 One commit, exported as a patch series against `master` @ `32515f8`:
