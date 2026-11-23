@@ -8,13 +8,15 @@
 use std::io::Cursor;
 
 use pgp::composed::{
-    ArmorOptions, DecryptionOptions, Deserializable, DetachedSignature, Esk, Message, MessageBuilder, SignedPublicKey,
-    SignedPublicSubKey, SignedSecretKey, TheRing,
+    ArmorOptions, DecryptionOptions, Deserializable, DetachedSignature, EncryptionCaps, Esk, KeyType, Message,
+    MessageBuilder, SecretKeyParamsBuilder, SignedPublicKey, SignedPublicSubKey, SignedSecretKey, SubkeyParamsBuilder,
+    TheRing,
 };
+use pgp::crypto::ecc_curve::ECCCurve;
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{Signature, SignatureType};
-use pgp::types::{KeyDetails, Password, Timestamp};
+use pgp::types::{CompressionAlgorithm, KeyDetails, Password, SigningKey, Timestamp};
 use zeroize::Zeroizing;
 
 use crate::PassError;
@@ -198,6 +200,13 @@ impl Certificate {
         Err(refused("has no usable encryption key"))
     }
 
+    /// Whether one of the keys of this certificate has this long id (16 hex digits, uppercase).
+    pub(crate) fn has_key_id(&self, key_id: &str) -> bool {
+        self.fingerprints()
+            .iter()
+            .any(|fingerprint| fingerprint.ends_with(key_id))
+    }
+
     /// The long id of the key a message to this certificate is encrypted to: what
     /// `gpg --list-only` shows for a file, and what tells whether it must be re-encrypted.
     pub(crate) fn encryption_key_id(&self) -> Result<String, PassError> {
@@ -361,11 +370,9 @@ impl SecretIdentity {
             .map_err(|e| crypto_error("cannot decrypt", e))
     }
 
-    /// An armored detached signature over `data`, as `gpg --detach-sign --armor` makes
-    /// (what git puts in a commit's `gpgsig` header). `None` when no signing key of this
-    /// identity has its secret part here.
-    pub(crate) fn sign(&self, data: &[u8]) -> Result<Option<String>, PassError> {
-        let rng = rand::thread_rng();
+    /// The key this identity signs with: a signing subkey, or the primary key. `None`
+    /// when neither has its secret part here (a subkeys-only export of a key whose primary signs).
+    fn signing_key(&self) -> Option<&dyn SigningKey> {
         let unlocks = |result: pgp::errors::Result<pgp::errors::Result<()>>| matches!(result, Ok(Ok(())));
         let subkey = self.key.secret_subkeys.iter().find(|sub| {
             sub.key.public_key().algorithm().can_sign()
@@ -373,20 +380,155 @@ impl SecretIdentity {
                 && unlocks(sub.key.unlock(&self.no_passphrase, |_, _| Ok(())))
         });
         let primary = &self.key.primary_key;
-        let signature = if let Some(sub) = subkey {
-            DetachedSignature::sign_binary_data(rng, &sub.key, &self.no_passphrase, HashAlgorithm::Sha512, data)
+        if let Some(sub) = subkey {
+            Some(&sub.key)
         } else if primary.public_key().algorithm().can_sign()
             && unlocks(primary.unlock(&self.no_passphrase, |_, _| Ok(())))
         {
-            DetachedSignature::sign_binary_data(rng, primary, &self.no_passphrase, HashAlgorithm::Sha512, data)
+            Some(primary)
         } else {
-            return Ok(None);
-        };
-        signature
+            None
+        }
+    }
+
+    pub(crate) fn can_sign(&self) -> bool {
+        self.signing_key().is_some()
+    }
+
+    /// An armored detached signature over `data`, as `gpg --detach-sign --armor` makes
+    /// (what git puts in a commit's `gpgsig` header).
+    pub(crate) fn sign(&self, data: &[u8]) -> Result<String, PassError> {
+        let key = self.signing_key().ok_or(PassError::CannotSign)?;
+        let rng = rand::thread_rng();
+        DetachedSignature::sign_binary_data(rng, &Box::new(key), &self.no_passphrase, HashAlgorithm::Sha512, data)
             .and_then(|signature| signature.to_armored_string(ArmorOptions::default()))
-            .map(Some)
             .map_err(|e| crypto_error("cannot sign", e))
     }
+
+    /// Signs `data`, then encrypts it to every recipient: what
+    /// `gpg --sign --encrypt --compress-algo none -r A -r B` writes.
+    pub(crate) fn seal(&self, data: Vec<u8>, recipients: &[&Certificate]) -> Result<Vec<u8>, PassError> {
+        let key = self.signing_key().ok_or(PassError::CannotSign)?;
+        let failed = |e: pgp::errors::Error| crypto_error("cannot sign and encrypt", e);
+        let mut rng = rand::thread_rng();
+        let mut builder = MessageBuilder::from_bytes("", data).seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+        builder.sign(key, Password::empty(), HashAlgorithm::Sha512);
+        for recipient in recipients {
+            match recipient.encryption_target()? {
+                EncryptionTarget::Primary(key) => builder.encrypt_to_key(&mut rng, key),
+                EncryptionTarget::Subkey(sub) => builder.encrypt_to_key(&mut rng, sub),
+            }
+            .map_err(failed)?;
+        }
+        builder.to_vec(&mut rng).map_err(failed)
+    }
+
+    /// Decrypts a message and checks that it carries a valid signature by `signer`.
+    /// Returns what was signed, and when (seconds since 1970). Anything else is an
+    /// error: there is no "decrypted but not verified" result.
+    pub(crate) fn open_sealed(
+        &self,
+        ciphertext: &[u8],
+        signer: &Certificate,
+    ) -> Result<(Zeroizing<Vec<u8>>, i64), PassError> {
+        let untrusted = |why: &str| PassError::UntrustedFile {
+            message: why.to_string(),
+        };
+        let (message, _) = Message::from_reader(Cursor::new(ciphertext))
+            .map_err(|_| untrusted("it is not an OpenPGP message (cut short, or not what it should be)"))?;
+        let ring = TheRing {
+            secret_keys: vec![&self.key],
+            key_passwords: vec![&self.no_passphrase],
+            decrypt_options: DecryptionOptions::new().enable_gnupg_aead(),
+            ..Default::default()
+        };
+        let (mut message, _) = message.decrypt_the_ring(ring, true).map_err(|e| match e {
+            pgp::errors::Error::MissingKey => untrusted("it is not encrypted to this device's key"),
+            _ => untrusted("it does not decrypt (cut short, or tampered with)"),
+        })?;
+        if message.is_compressed() {
+            message = message.decompress().map_err(|_| untrusted("it does not decompress"))?;
+        }
+        if !message.is_signed() {
+            return Err(untrusted("it is not signed"));
+        }
+        // The data is read to its end first: that is also what checks the integrity of the encryption.
+        let data = message
+            .as_data_vec()
+            .map(Zeroizing::new)
+            .map_err(|_| untrusted("it does not decrypt to the end (cut short, or tampered with)"))?;
+        let by_primary = message.verify(&signer.key);
+        let signature = match by_primary {
+            Ok(signature) => Some(signature),
+            Err(_) => signer
+                .key
+                .public_subkeys
+                .iter()
+                .filter(|sub| signs(&sub.signatures))
+                .find_map(|sub| message.verify(sub).ok()),
+        };
+        let signature =
+            signature.ok_or_else(|| untrusted("it is not signed by the key of the device it is named after"))?;
+        let signed_at = signature.created().map(|time| i64::from(time.as_secs())).unwrap_or(0);
+        Ok((data, signed_at))
+    }
+}
+
+/// A new key for this device, as `gpg --quick-generate-key <user id> ed25519` makes them:
+/// an Ed25519 primary key that certifies and signs, a Curve25519 subkey that decrypts.
+/// Returns the secret key, armored, protected by `passphrase` when it is not empty.
+pub(crate) fn generate_secret_key(user_id: &str, passphrase: &str) -> Result<Zeroizing<String>, PassError> {
+    let failed = |e: &dyn std::fmt::Display| key_error("cannot make a key", e);
+    let passphrase = (!passphrase.is_empty()).then(|| passphrase.to_string());
+    let mut subkey = SubkeyParamsBuilder::default();
+    subkey
+        .key_type(KeyType::ECDH(ECCCurve::Curve25519Legacy))
+        .can_sign(false)
+        .can_encrypt(EncryptionCaps::All)
+        .can_authenticate(false)
+        .passphrase(passphrase.clone());
+    let mut primary = SecretKeyParamsBuilder::default();
+    primary
+        .key_type(KeyType::Ed25519Legacy)
+        .can_certify(true)
+        .can_sign(true)
+        .can_encrypt(EncryptionCaps::None)
+        .primary_user_id(user_id.to_string())
+        // What others should use when writing to this key. Without them gpg assumes the least
+        // (3DES, and SHA-1 for the signature of a message it encrypts to this key).
+        .preferred_symmetric_algorithms(
+            [
+                SymmetricKeyAlgorithm::AES256,
+                SymmetricKeyAlgorithm::AES192,
+                SymmetricKeyAlgorithm::AES128,
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .preferred_hash_algorithms(
+            [HashAlgorithm::Sha512, HashAlgorithm::Sha384, HashAlgorithm::Sha256]
+                .into_iter()
+                .collect(),
+        )
+        .preferred_compression_algorithms(
+            [
+                CompressionAlgorithm::ZLIB,
+                CompressionAlgorithm::ZIP,
+                CompressionAlgorithm::Uncompressed,
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .passphrase(passphrase)
+        .subkeys(vec![subkey.build().map_err(|e| failed(&e))?]);
+    let key = primary
+        .build()
+        .map_err(|e| failed(&e))?
+        .generate(rand::thread_rng())
+        .map_err(|e| failed(&e))?;
+    key.to_armored_string(ArmorOptions::default())
+        .map(Zeroizing::new)
+        .map_err(|e| failed(&e))
 }
 
 /// Whether a subkey is bound for signing, and not revoked.

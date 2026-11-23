@@ -1,45 +1,30 @@
 //! The git side of a store, with gitoxide and no `git` program.
 //!
-//! gitoxide gives the object database, references, the index, and fetching.
-//! What it does not have is written here, in the small form a password store needs:
-//! committing given files, moving the work tree from one commit to another
-//! (a store is a few hundred small files: no diff machinery), and pushing (push.rs).
+//! gitoxide gives the object database, references and the index. What a store needs
+//! on top is written here, in the small form it needs: committing given files,
+//! merging whole files, and moving the work tree from one commit to another
+//! (a store is a few hundred small files: no diff machinery).
 //!
-//! The commit is the truth and the work tree follows it: a change is committed
-//! first and written to the directory after, so the two cannot disagree for long.
+//! The commit is the truth and the work tree follows it: a change becomes a commit
+//! first, and the directory is then moved to that commit.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
 use gix::bstr::{BString, ByteSlice};
 use gix::objs::tree::EntryKind;
 use gix::refs::transaction::PreviousValue;
-use gix::remote::Direction;
 use gix::ObjectId;
-use gix_transport::client::blocking_io::Transport;
-use gix_transport::Protocol;
 
 use crate::crypto::SecretIdentity;
-use crate::http::{GitHttp, HttpRemote};
-use crate::ssh::SshRemote;
 use crate::{layout, PassError};
 
-pub(crate) const REMOTE_NAME: &str = "origin";
+/// The branch a store made here is on.
+const BRANCH: &str = "main";
 
 pub(crate) fn git_error(context: &str, e: impl std::fmt::Display) -> PassError {
     PassError::Git {
         message: format!("{context}: {e}"),
-    }
-}
-
-/// gitoxide's error with its cause: "Failed to list references on the remote: connection refused".
-fn with_cause(e: &gix::Error) -> String {
-    let (what, cause) = (e.to_string(), e.probable_cause().to_string());
-    if what == cause {
-        what
-    } else {
-        format!("{what}: {cause}")
     }
 }
 
@@ -82,7 +67,7 @@ fn configure(mut repo: gix::Repository, author: &Author) -> Result<gix::Reposito
     Ok(repo)
 }
 
-/// The repository of a store, `None` when the store is a plain directory.
+/// The repository of a store, `None` when there is none (yet), or the store is a plain directory.
 pub(crate) fn open(dir: &Path, author: &Author) -> Result<Option<gix::Repository>, PassError> {
     if !dir.join(".git").exists() {
         return Ok(None);
@@ -91,12 +76,20 @@ pub(crate) fn open(dir: &Path, author: &Author) -> Result<Option<gix::Repository
     configure(repo, author).map(Some)
 }
 
-fn init(dir: &Path, author: &Author) -> Result<gix::Repository, PassError> {
+/// The repository of a store, made empty (on the branch `main`, with no commit) when there is none.
+pub(crate) fn open_or_init(dir: &Path, author: &Author) -> Result<gix::Repository, PassError> {
+    if let Some(repo) = open(dir, author)? {
+        return Ok(repo);
+    }
+    std::fs::create_dir_all(dir).map_err(|e| PassError::Io {
+        message: format!("cannot create the store directory: {e}"),
+    })?;
+    let overrides = [format!("init.defaultBranch={BRANCH}")];
     let repo = gix::ThreadSafeRepository::init_opts(
         dir,
         gix::create::Kind::WithWorktree,
         gix::create::Options::default(),
-        options(),
+        options().config_overrides(overrides),
     )
     .map_err(|e| git_error("cannot create the repository", e))?
     .to_thread_local();
@@ -113,47 +106,50 @@ pub(crate) fn head_commit(repo: &gix::Repository) -> Result<Option<ObjectId>, Pa
         .map_err(|e| git_error("cannot read HEAD", e))
 }
 
-/// The branch `HEAD` is on: `main`.
-pub(crate) fn branch(repo: &gix::Repository) -> Result<String, PassError> {
+/// The full name of the branch `HEAD` is on: `refs/heads/main`.
+fn branch(repo: &gix::Repository) -> Result<String, PassError> {
     let name = repo
         .head_name()
         .map_err(|e| git_error("cannot read HEAD", e))?
-        .ok_or_else(|| git_error("cannot sync", "HEAD is detached: check a branch out"))?;
-    Ok(name.shorten().to_string())
+        .ok_or_else(|| git_error("cannot change the store", "HEAD is detached: check a branch out"))?;
+    Ok(name.as_bstr().to_string())
 }
 
-/// The tip of `refs/remotes/origin/<branch>` as of the last fetch or push.
-pub(crate) fn remote_tip(repo: &gix::Repository, branch: &str) -> Option<ObjectId> {
-    let name = format!("refs/remotes/{REMOTE_NAME}/{branch}");
-    let mut reference = repo.try_find_reference(name.as_str()).ok()??;
+/// What a reference points to, `None` when there is no such reference.
+pub(crate) fn reference(repo: &gix::Repository, name: &str) -> Option<ObjectId> {
+    let mut reference = repo.try_find_reference(name).ok()??;
     reference.peel_to_id().ok().map(gix::Id::detach)
 }
 
-fn set_reference(repo: &gix::Repository, name: &str, commit: ObjectId, why: &str) -> Result<(), PassError> {
+pub(crate) fn set_reference(repo: &gix::Repository, name: &str, commit: ObjectId, why: &str) -> Result<(), PassError> {
     repo.reference(name, commit, PreviousValue::Any, why)
         .map(|_| ())
         .map_err(|e| git_error(&format!("cannot update {name}"), e))
 }
 
-pub(crate) fn set_remote_tip(repo: &gix::Repository, branch: &str, commit: ObjectId) -> Result<(), PassError> {
-    let name = format!("refs/remotes/{REMOTE_NAME}/{branch}");
-    set_reference(repo, &name, commit, "update by push")
-}
-
-fn find_commit<'r>(repo: &'r gix::Repository, id: ObjectId) -> Result<gix::Commit<'r>, PassError> {
+fn find_commit(repo: &gix::Repository, id: ObjectId) -> Result<gix::Commit<'_>, PassError> {
     repo.find_commit(id)
         .map_err(|e| git_error(&format!("cannot read the commit {id}"), e))
 }
 
-fn tree_of(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, PassError> {
+pub(crate) fn tree_of(repo: &gix::Repository, commit: ObjectId) -> Result<ObjectId, PassError> {
     find_commit(repo, commit)?
         .tree_id()
         .map(gix::Id::detach)
         .map_err(|e| git_error(&format!("cannot read the commit {commit}"), e))
 }
 
-/// The first line of a commit's message, and when it was made (seconds since 1970).
-pub(crate) fn summary(repo: &gix::Repository, commit: ObjectId) -> Result<(String, i64), PassError> {
+/// What a commit says of itself.
+pub(crate) struct Summary {
+    /// The first line of its message.
+    pub(crate) subject: String,
+    /// `Name <email>`.
+    pub(crate) author: String,
+    /// Seconds since 1970.
+    pub(crate) time: i64,
+}
+
+pub(crate) fn summary(repo: &gix::Repository, commit: ObjectId) -> Result<Summary, PassError> {
     let commit = find_commit(repo, commit)?;
     let subject = commit
         .message_raw_sloppy()
@@ -161,8 +157,12 @@ pub(crate) fn summary(repo: &gix::Repository, commit: ObjectId) -> Result<(Strin
         .next()
         .map(|line| line.to_str_lossy().into_owned())
         .unwrap_or_default();
+    let author = commit
+        .author()
+        .map(|author| format!("{} <{}>", author.name, author.email))
+        .unwrap_or_default();
     let time = commit.time().map(|time| time.seconds).unwrap_or(0);
-    Ok((subject, time))
+    Ok(Summary { subject, author, time })
 }
 
 // MARK: history
@@ -180,27 +180,80 @@ pub(crate) fn ancestors(repo: &gix::Repository, tip: ObjectId) -> Result<HashSet
     Ok(seen)
 }
 
-/// How many commits `ours` has that `theirs` has not, and the reverse.
-pub(crate) fn ahead_behind(
+/// The commits `tip` has that `base` (nothing, when `None`) has not: every commit before
+/// its parents, the newest first where that leaves a choice (as `git log` lists them).
+pub(crate) fn commits_since(
     repo: &gix::Repository,
-    ours: Option<ObjectId>,
-    theirs: Option<ObjectId>,
-) -> Result<(u32, u32), PassError> {
-    if ours == theirs {
-        return Ok((0, 0));
+    base: Option<ObjectId>,
+    tip: ObjectId,
+) -> Result<Vec<ObjectId>, PassError> {
+    let known = base.map(|base| ancestors(repo, base)).transpose()?.unwrap_or_default();
+    // Each new commit: when it was made, its parents among the new ones, and how many children wait before it.
+    let mut new: std::collections::HashMap<ObjectId, (i64, Vec<ObjectId>, usize)> = Default::default();
+    for id in ancestors(repo, tip)? {
+        if !known.contains(&id) {
+            let commit = find_commit(repo, id)?;
+            let time = commit.time().map(|time| time.seconds).unwrap_or(0);
+            let parents = commit
+                .parent_ids()
+                .map(gix::Id::detach)
+                .filter(|parent| !known.contains(parent))
+                .collect();
+            new.insert(id, (time, parents, 0));
+        }
     }
-    let ours = ours.map(|tip| ancestors(repo, tip)).transpose()?.unwrap_or_default();
-    let theirs = theirs.map(|tip| ancestors(repo, tip)).transpose()?.unwrap_or_default();
-    Ok((
-        ours.difference(&theirs).count() as u32,
-        theirs.difference(&ours).count() as u32,
-    ))
+    let parents: Vec<ObjectId> = new.values().flat_map(|(_, parents, _)| parents.clone()).collect();
+    for parent in parents {
+        if let Some(entry) = new.get_mut(&parent) {
+            entry.2 += 1;
+        }
+    }
+    let mut ordered = Vec::with_capacity(new.len());
+    while !new.is_empty() {
+        let next = new
+            .iter()
+            .filter(|(_, (_, _, waiting))| *waiting == 0)
+            .max_by_key(|(id, (time, _, _))| (*time, **id))
+            .map(|(id, _)| *id)
+            .ok_or_else(|| git_error("cannot read the history", "it goes in a circle"))?;
+        let (_, parents, _) = new.remove(&next).expect("just found");
+        for parent in parents {
+            if let Some(entry) = new.get_mut(&parent) {
+                entry.2 -= 1;
+            }
+        }
+        ordered.push(next);
+    }
+    Ok(ordered)
+}
+
+/// The commit two histories last had in common, `None` when they share nothing.
+pub(crate) fn merge_base(
+    repo: &gix::Repository,
+    ours: ObjectId,
+    theirs: ObjectId,
+) -> Result<Option<ObjectId>, PassError> {
+    let theirs = ancestors(repo, theirs)?;
+    let common: Vec<ObjectId> = ancestors(repo, ours)?.intersection(&theirs).copied().collect();
+    // Common ancestors come with all their own ancestors: the last ones are those that are nobody's parent.
+    let mut parents = HashSet::new();
+    for id in &common {
+        parents.extend(find_commit(repo, *id)?.parent_ids().map(gix::Id::detach));
+    }
+    let mut last = Vec::new();
+    for id in common {
+        if !parents.contains(&id) {
+            last.push((summary(repo, id)?.time, id));
+        }
+    }
+    // Several only after a criss-cross merge, which this protocol does not produce: the newest then.
+    Ok(last.into_iter().max().map(|(_, id)| id))
 }
 
 // MARK: trees and the work tree
 
 /// A path of a tree can be written to the work tree: nothing in it leaves the
-/// directory or lands in `.git`. The tree comes from the remote: it is not trusted.
+/// directory or lands in `.git`. The tree comes from another device: it is not trusted.
 fn is_safe_path(path: &str) -> bool {
     !path.is_empty()
         && !path.contains('\\')
@@ -241,6 +294,17 @@ pub(crate) fn files(repo: &gix::Repository, commit: ObjectId) -> Result<BTreeMap
     Ok(out)
 }
 
+/// The files of a commit, or none for no commit.
+pub(crate) fn files_at(
+    repo: &gix::Repository,
+    commit: Option<ObjectId>,
+) -> Result<BTreeMap<String, ObjectId>, PassError> {
+    Ok(commit
+        .map(|commit| files(repo, commit))
+        .transpose()?
+        .unwrap_or_default())
+}
+
 pub(crate) fn blob(repo: &gix::Repository, id: ObjectId) -> Result<Vec<u8>, PassError> {
     repo.find_blob(id)
         .map(|mut blob| blob.take_data())
@@ -255,13 +319,13 @@ pub(crate) struct FileChange {
     pub(crate) after: Option<ObjectId>,
 }
 
-/// What changes from the commit `from` (nothing, when `None`) to the commit `to`.
+/// What changes from the commit `from` (nothing, when `None`) to the commit `to`, sorted by path.
 pub(crate) fn changes(
     repo: &gix::Repository,
     from: Option<ObjectId>,
     to: ObjectId,
 ) -> Result<Vec<FileChange>, PassError> {
-    let before = from.map(|commit| files(repo, commit)).transpose()?.unwrap_or_default();
+    let before = files_at(repo, from)?;
     let after = files(repo, to)?;
     let mut out = Vec::new();
     for (path, id) in &after {
@@ -322,8 +386,7 @@ pub(crate) fn move_to(repo: &gix::Repository, to: ObjectId, why: &str) -> Result
             None => layout::remove(&root, &change.path)?,
         }
     }
-    let name = format!("refs/heads/{}", branch(repo)?);
-    set_reference(repo, &name, to, why)?;
+    set_reference(repo, &branch(repo)?, to, why)?;
     write_index(repo, to)?;
     Ok(changed.into_iter().map(|change| change.path).collect())
 }
@@ -333,22 +396,10 @@ pub(crate) fn move_to(repo: &gix::Repository, to: ObjectId, why: &str) -> Result
 /// A file to write, or with `None` to remove, by path relative to the store.
 pub(crate) type Edit = (String, Option<Vec<u8>>);
 
-/// Commits `edits` on top of `HEAD`, as `git add <files> && git commit -m <message>`
-/// would, signed by `signer` when it can sign (`git commit -S`). The work tree is
-/// not touched. Returns whether the commit is signed.
-pub(crate) fn commit(
-    repo: &gix::Repository,
-    edits: &[Edit],
-    message: &str,
-    author: &Author,
-    signer: Option<&SecretIdentity>,
-) -> Result<bool, PassError> {
+/// The tree `base` (the empty tree, when `None`) becomes once `edits` are applied to it.
+pub(crate) fn edit_tree(repo: &gix::Repository, base: Option<ObjectId>, edits: &[Edit]) -> Result<ObjectId, PassError> {
     let failed = |e: &dyn std::fmt::Display| git_error("cannot commit", e);
-    let parent = head_commit(repo)?;
-    let base = match parent {
-        Some(parent) => tree_of(repo, parent)?,
-        None => ObjectId::empty_tree(repo.object_hash()),
-    };
+    let base = base.unwrap_or_else(|| ObjectId::empty_tree(repo.object_hash()));
     let mut editor = repo.edit_tree(base).map_err(|e| failed(&e))?;
     for (path, content) in edits {
         match content {
@@ -363,34 +414,37 @@ pub(crate) fn commit(
             }
         }
     }
-    let tree = editor.write().map_err(|e| failed(&e))?.detach();
+    Ok(editor.write().map_err(|e| failed(&e))?.detach())
+}
 
+/// Writes a commit, signed by `signer` as `git commit -S` would (a commit of this
+/// device is always signed: the owner takes no other). Moves no reference.
+pub(crate) fn write_commit(
+    repo: &gix::Repository,
+    tree: ObjectId,
+    parents: &[ObjectId],
+    message: &str,
+    author: &Author,
+    signer: &SecretIdentity,
+) -> Result<ObjectId, PassError> {
+    let failed = |e: &dyn std::fmt::Display| git_error("cannot commit", e);
     let signature = author.signature();
     let mut commit = gix::objs::Commit {
         tree,
-        parents: parent.into_iter().collect(),
+        parents: parents.iter().copied().collect(),
         author: signature.clone(),
         committer: signature,
         encoding: None,
         message: format!("{message}\n").into(),
         extra_headers: Vec::new(),
     };
-    let mut signed = false;
-    if let Some(signer) = signer {
-        let mut payload = Vec::new();
-        gix::objs::WriteTo::write_to(&commit, &mut payload).map_err(|e| failed(&e))?;
-        if let Some(armored) = signer.sign(&payload)? {
-            commit
-                .extra_headers
-                .push((BString::from("gpgsig"), BString::from(armored.trim_end())));
-            signed = true;
-        }
-    }
-    let id = repo.write_object(&commit).map_err(|e| failed(&e))?.detach();
-    let name = format!("refs/heads/{}", branch(repo)?);
-    set_reference(repo, &name, id, &format!("commit: {message}"))?;
-    write_index(repo, id)?;
-    Ok(signed)
+    let mut payload = Vec::new();
+    gix::objs::WriteTo::write_to(&commit, &mut payload).map_err(|e| failed(&e))?;
+    let armored = signer.sign(&payload)?;
+    commit
+        .extra_headers
+        .push((BString::from("gpgsig"), BString::from(armored.trim_end())));
+    Ok(repo.write_object(&commit).map_err(|e| failed(&e))?.detach())
 }
 
 /// The signature a commit carries, and the bytes it signs.
@@ -410,167 +464,12 @@ pub(crate) fn signature_of(repo: &gix::Repository, commit: ObjectId) -> Result<O
     }))
 }
 
-// MARK: the remote
-
-/// A remote, over one of the two transports.
-pub(crate) enum Remote {
-    Http(std::sync::Arc<HttpRemote>),
-    Ssh(SshRemote),
-}
-
-/// What a fetch found: the remote's branches are now under `refs/remotes/origin/`.
-pub(crate) struct Fetched {
-    /// The branch the remote's `HEAD` points to.
-    pub(crate) default_branch: Option<String>,
-    pub(crate) branches: Vec<String>,
-}
-
-fn fetch_with<T: Transport>(repo: &gix::Repository, url: &str, transport: T) -> Result<Fetched, gix::Error> {
-    use gix::protocol::handshake::Ref;
-    let refspec = format!("+refs/heads/*:refs/remotes/{REMOTE_NAME}/*");
-    let remote = repo
-        .remote_at(url)?
-        .with_fetch_tags(gix::remote::fetch::Tags::None)
-        .with_refspecs(Some(refspec.as_str()), Direction::Fetch)?;
-    let options = gix::remote::ref_map::Options {
-        // Ask for every reference: HEAD tells which branch is the main one.
-        prefix_from_spec_as_filter_on_remote: false,
-        ..Default::default()
-    };
-    let outcome = remote
-        .to_connection_with_transport(transport)
-        // Never the machine's credential helpers or a prompt: what we have is already in the transport.
-        .with_credentials(|_| Ok(None))
-        // Nor its git configuration: the transport is already set up.
-        .with_transport_options(Box::new(()))
-        .prepare_fetch(gix::progress::Discard, options)?
-        .receive(gix::progress::Discard, &AtomicBool::new(false))?;
-    let mut fetched = Fetched {
-        default_branch: None,
-        branches: Vec::new(),
-    };
-    for reference in &outcome.ref_map.remote_refs {
-        let (name, target) = match reference {
-            Ref::Symbolic {
-                full_ref_name, target, ..
-            }
-            | Ref::Unborn { full_ref_name, target } => (full_ref_name, Some(target)),
-            Ref::Direct { full_ref_name, .. } | Ref::Peeled { full_ref_name, .. } => (full_ref_name, None),
-        };
-        if let Some(branch) = name.to_str_lossy().strip_prefix("refs/heads/") {
-            fetched.branches.push(branch.to_string());
-        }
-        if name == "HEAD" {
-            fetched.default_branch = target
-                .and_then(|target| target.to_str().ok()?.strip_prefix("refs/heads/"))
-                .map(str::to_string);
-        }
-    }
-    Ok(fetched)
-}
-
-/// Fetches every branch of the remote into `refs/remotes/origin/`. Changes nothing else.
-pub(crate) fn fetch(repo: &gix::Repository, remote: &Remote) -> Result<Fetched, PassError> {
-    match remote {
-        Remote::Http(http) => {
-            let url = gix::url::parse(http.url.as_bytes().as_bstr()).map_err(|e| PassError::InvalidConfig {
-                message: format!("not a usable repository URL: {e}"),
-            })?;
-            let transport =
-                gix_transport::client::blocking_io::http::connect_http(GitHttp(http.clone()), url, Protocol::V2, false);
-            fetch_with(repo, &http.url, transport).map_err(|e| {
-                http.take_failure().unwrap_or_else(|| PassError::Network {
-                    message: format!("cannot fetch: {}", with_cause(&e)),
-                })
-            })
-        }
-        Remote::Ssh(ssh) => {
-            let (output, input) = ssh.exec("git-upload-pack")?;
-            let ending = output.outcome();
-            // Version 1: version 2 is asked for through an environment variable that sshd drops by default.
-            let transport = gix_transport::client::git::blocking_io::Connection::new(
-                output,
-                input,
-                Protocol::V1,
-                ssh.path(),
-                None::<(String, Option<u16>)>,
-                gix_transport::client::git::ConnectMode::Process,
-                false,
-            )
-            .custom_url(Some(ssh.url.as_str().into()));
-            fetch_with(repo, &ssh.url, transport).map_err(|e| {
-                ending.failure().unwrap_or_else(|| PassError::Network {
-                    message: format!("cannot fetch: {}", with_cause(&e)),
-                })
-            })
-        }
-    }
-}
-
-/// Clones into `dir`: fetches everything, and checks out the remote's main branch.
-pub(crate) fn clone(dir: &Path, remote: &Remote, author: &Author) -> Result<gix::Repository, PassError> {
-    let not_empty = std::fs::read_dir(dir)
-        .map(|mut items| items.next().is_some())
-        .unwrap_or(false);
-    if not_empty {
-        return Err(PassError::Io {
-            message: "there is already a store on this device: remove it first".into(),
-        });
-    }
-    std::fs::create_dir_all(dir).map_err(|e| PassError::Io {
-        message: format!("cannot create the store directory: {e}"),
-    })?;
-    let result = (|| {
-        let repo = init(dir, author)?;
-        let fetched = fetch(&repo, remote)?;
-        let branch = fetched
-            .default_branch
-            .filter(|branch| fetched.branches.contains(branch))
-            .or_else(|| {
-                ["main", "master"]
-                    .iter()
-                    .find(|name| fetched.branches.iter().any(|branch| branch == *name))
-                    .map(|name| name.to_string())
-            })
-            .ok_or_else(|| {
-                git_error(
-                    "nothing to clone",
-                    "the remote has no main branch yet: push the store to it from the computer first",
-                )
-            })?;
-        let tip =
-            remote_tip(&repo, &branch).ok_or_else(|| git_error("cannot clone", "the main branch did not arrive"))?;
-        // HEAD on the main branch, which does not exist yet: `move_to` creates it at the tip.
-        let head = gix::refs::transaction::RefEdit {
-            change: gix::refs::transaction::Change::Update {
-                log: Default::default(),
-                expected: PreviousValue::Any,
-                new: gix::refs::Target::Symbolic(
-                    format!("refs/heads/{branch}")
-                        .try_into()
-                        .map_err(|e| git_error("the remote's main branch has an unusable name", e))?,
-                ),
-            },
-            name: "HEAD".try_into().expect("a valid name"),
-            deref: false,
-        };
-        repo.edit_reference(head).map_err(|e| git_error("cannot set HEAD", e))?;
-        move_to(&repo, tip, "clone")?;
-        Ok(repo)
-    })();
-    if result.is_err() {
-        // Half a clone is not a store: the next attempt starts from nothing.
-        let _ = std::fs::remove_dir_all(dir);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn paths_from_the_remote_cannot_leave_the_store() {
+    fn paths_from_another_device_cannot_leave_the_store() {
         for good in [
             "a.gpg",
             "Email/work.gpg",
