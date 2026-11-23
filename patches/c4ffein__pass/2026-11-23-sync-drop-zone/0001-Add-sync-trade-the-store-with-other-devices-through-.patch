@@ -1,4 +1,4 @@
-From c9e420d97d21ce5e9e5a4578540a5897301805c7 Mon Sep 17 00:00:00 2001
+From 5e749449fedf32402d9a7da5de79a476b8642310 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 23 Nov 2026 14:44:02 +0000
 Subject: [PATCH] Add sync: trade the store with other devices through a drop
@@ -13,29 +13,38 @@ key (SHA-512) and encrypted to every device.
     pass sync setup device-name drop-zone own-key-fingerprint
     pass sync peer [--remove] device-name [key-fingerprint]
     pass sync push | fetch [device-name...]
-    pass sync log | diff | merge device-name
+    pass sync log | diff device-name
+    pass sync merge device-name [--mine name | --theirs name]...
 
-This side is the owner of the store. It takes a file only when it decrypts
-to no more than 256 MiB, carries one valid signature by the key configured
-for that device (not a SHA-1 one), and holds that device's reference alone
-with its full history; an older file served again is ignored. It merges a
-device's commits only as a fast-forward, only when each is signed by that
-device or by this one, and only when they change nothing but entries: no
-.gpg-id, nothing under .extensions/, no symlink.
+Receiving: a file is taken only when it decrypts to no more than 256 MiB,
+carries one valid signature by the key configured for that device (not a
+SHA-1 one), and holds that device's reference alone with its full history.
+Its tip must be a synced store: entries, .gpg-id files and the .gitattributes
+of "pass git init", nothing else; every .gpg-id line names a device, every
+entry is encrypted to devices only. An older file served again is ignored.
 
-The settings live in the store's git configuration (pass-sync.*).
-PASSWORD_STORE_GPG_OPTS applies to the gpg calls, as elsewhere.
+Merging: devices are equals. An empty store adopts another's; a store with
+nothing of its own moves forward; otherwise the two are merged, entry by
+entry, following an entry that was moved (the same bytes, or the same text
+when this device reads both). Where both sides did different things to one
+entry, or to one folder's readers, nothing is taken until --mine or --theirs
+says which stays. Then the entries that are not encrypted to the readers
+their .gpg-id names, and that this device reads, are re-encrypted, and the
+result is published.
+
+The settings live in the store's git configuration (pass-sync.*); setup also
+turns on signed commits. PASSWORD_STORE_GPG_OPTS applies to the gpg calls.
 
 Also exit quietly when whoever reads the output goes away (| grep -q),
 instead of a BrokenPipeError traceback.
 
-Tests: u0008-sync-tests.sh, the other device played with git and gpg alone.
+Tests: u0008-sync-tests.sh, two stores and a directory between them.
 ---
  Makefile                                      |   5 +-
- README.md                                     |  30 ++
- pass.py                                       | 413 ++++++++++++++++++
- .../additional-tests/u0008-sync-tests.sh      | 232 ++++++++++
- 4 files changed, 679 insertions(+), 1 deletion(-)
+ README.md                                     |  45 +
+ pass.py                                       | 795 ++++++++++++++++++
+ .../additional-tests/u0008-sync-tests.sh      | 310 +++++++
+ 4 files changed, 1154 insertions(+), 1 deletion(-)
  create mode 100755 test_tricks/additional-tests/u0008-sync-tests.sh
 
 diff --git a/Makefile b/Makefile
@@ -66,51 +75,66 @@ index 504f6af..d494654 100644
 +test-u0008-sync-tests: check-submodule
 +	./test_tricks/test-adapter.sh u0008-sync-tests.sh
 diff --git a/README.md b/README.md
-index 27d8c55..69dba60 100644
+index 27d8c55..f29ea73 100644
 --- a/README.md
 +++ b/README.md
-@@ -56,6 +56,36 @@ The `pass.py` script can be used as a drop-in replacement for the original `pass
+@@ -56,6 +56,51 @@ The `pass.py` script can be used as a drop-in replacement for the original `pass
  ./pass.py ls
  ```
  
 +## Sync
 +
-+Not in the original `pass`: `pass.py sync` trades the store with other devices (a phone) through a
-+*drop zone*, a directory every device can reach and nobody has to trust: a local path (a USB stick,
-+a synced folder) or `sftp://user@host[:port][/dir]`.
++Not in the original `pass`: `pass.py sync` trades the store with other devices (another computer,
++a phone) through a *drop zone*, a directory every device can reach and nobody has to trust: a
++local path (a USB stick, a synced folder) or `sftp://user@host[:port][/dir]`.
 +
 +Each device publishes one file there, `<device>.bundle.gpg`: a git bundle of its whole history,
 +signed with its OpenPGP key and encrypted to every device. The drop zone sees those files and
-+nothing else: no entry name, no history. This computer is the owner of the store: it takes another
-+device's commits only as a fast-forward, only when each is signed by that device, and only when
-+they change nothing but entries (never a `.gpg-id`, never an extension).
++nothing else: no entry name, no history. Devices are equals: each takes another's changes when you
++have looked at them, and merges them with its own.
 +
 +```bash
-+# Once: name this computer, say where the drop zone is and which key signs
++# Once, on each device: its name, where the drop zone is, which key signs, who the others are
 +./pass.py sync setup pc sftp://drop@example.org:2222 <own-key-fingerprint>
-+./pass.py sync peer phone <phone-key-fingerprint>     # its public key must be in gpg
++./pass.py sync peer laptop <laptop-key-fingerprint>   # its public key must be in gpg, and trusted
 +
 +./pass.py sync push            # publish the store
-+./pass.py sync fetch           # take what the other devices published
-+./pass.py sync log phone       # their commits, and who signed each
-+./pass.py sync diff phone      # the same, decrypted
-+./pass.py sync merge phone     # take them, then publish
++./pass.py sync fetch           # receive what the other devices published
++./pass.py sync log laptop      # what taking laptop's changes would do
++./pass.py sync diff laptop     # the same, decrypted
++./pass.py sync merge laptop    # take them, then publish
 +./pass.py sync                 # where everything stands
 +```
 +
++A device with no store yet does `sync setup` and `sync peer` in an empty directory, then `fetch`
++and `merge`: it adopts the other's store.
++
++What `merge` does:
++
++- An entry changed on one side only is taken. An entry **moved** on one side and changed on the
++  other ends with the new content under the new name.
++- Where both sides changed the same entry differently, nothing is taken until you say which to
++  keep: `sync merge laptop --mine name` or `--theirs name`.
++- Who reads a folder (`.gpg-id`) can be changed on any device, but **a reader is always a device**:
++  a `.gpg-id` naming any other key is neither published nor taken. A device that adds itself where
++  it cannot read has only asked: `sync log` shows the entries as `stale`, and taking the change
++  re-encrypts them. Two different changes to one folder's readers: `--mine folder/` or `--theirs folder/`.
++- Only entries and `.gpg-id` files travel. A store holding anything else in git (`.extensions/`,
++  a symbolic link, a note) is neither published nor taken.
++
 +`ssh` options (a key, a port in `~/.ssh/config`) apply as usual; more can be set with
-+`git config pass-sync.sftp-options "-i ~/.ssh/dropzone"` in the store. The store must be a git
-+repository (`pass git init`). The protocol, a drop zone server and a phone client live in
++`git config pass-sync.sftp-options "-i ~/.ssh/dropzone"` in the store. The protocol, a drop zone
++server, a phone client and the scenarios all three are tested with live in
 +[c4ffein-work/playground](https://github.com/c4ffein-work/playground), under `ios-apps/apps/pass`.
 +
  ## Testing
  
  The Python implementation is designed to be fully compatible with the original bash script and should pass all the tests in `submodules/password-store/tests/`. Additional tests have also been written in an automated way, see [the documentation about Claude Code](chat_history/00-INDEX.md)
 diff --git a/pass.py b/pass.py
-index 44b24d1..b5a1ebf 100755
+index 44b24d1..5063f27 100755
 --- a/pass.py
 +++ b/pass.py
-@@ -449,6 +449,17 @@ def cmd_usage():
+@@ -449,6 +449,20 @@ def cmd_usage():
      {EXECUTABLE_NAME} git git-command-args...
          If the password store is a git repository, execute a git command
          specified by git-command-args.
@@ -122,13 +146,16 @@ index 44b24d1..b5a1ebf 100755
 +        Publish the store to the drop zone, signed, and encrypted to every device.
 +    {EXECUTABLE_NAME} sync fetch [device-name...]
 +        Take what the other devices published, when it is signed by their key.
-+    {EXECUTABLE_NAME} sync [log | diff | merge] device-name
-+        Show the commits a device has that this store lacks, show them decrypted, or take them:
-+        only as a fast-forward, signed by that device, and changing nothing but entries.
++    {EXECUTABLE_NAME} sync [log | diff] device-name
++        Show what a device has that this store lacks, and what taking it would do; or show it decrypted.
++    {EXECUTABLE_NAME} sync merge device-name [--mine name | --theirs name]...
++        Take a device's changes, merging them with this store's: an entry is followed when it
++        moves, and where both sides changed the same thing differently, --mine or --theirs says
++        which to keep (an entry by its name, the readers of a folder by "folder/").
      {EXECUTABLE_NAME} help
          Show this text.
      {EXECUTABLE_NAME} version
-@@ -1613,6 +1624,402 @@ def cmd_git(argv):
+@@ -1613,6 +1627,781 @@ def cmd_git(argv):
      else:
          die("Error: the password store is not a git repository. Try \"pass git init\".")
  
@@ -138,13 +165,15 @@ index 44b24d1..b5a1ebf 100755
 +# path, or sftp://user@host[:port][/dir]. Each device publishes one file there,
 +# <device>.bundle.gpg: a git bundle of its whole history under the single reference
 +# refs/pass-sync/<device>, signed with the device's key and encrypted to every device.
-+# This computer is the owner of the store: it takes the other devices' commits only as a
-+# fast-forward, only when they are signed by a device, and only when they change entries.
++# Devices are equals: each takes another's changes when its user has looked at them, and merges.
++# Entries are followed through moves; who reads a folder (.gpg-id) can be changed by any device,
++# but a reader is always a device, and nothing but entries and .gpg-id files travels.
 +
 +SYNC_MAX_FILE_SIZE = 256 * 1024 * 1024
 +SYNC_DEVICE_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
-+# What a device that is not the owner may change: entries, and nothing hidden (.gpg-id, .extensions/...).
++# What a synced store holds: entries, readers files, and the .gitattributes of "pass git init".
 +SYNC_ENTRY_PATH = re.compile(r'(?:[^./][^/]*/)*[^./][^/]*\.gpg')
++SYNC_READERS_PATH = re.compile(r'(?:[^./][^/]*/)*\.gpg-id')
 +
 +def sync_git(*args, check=True, text=True, extra_env=None):
 +    """Run git on the store. Returns the completed process; dies on failure when check is set."""
@@ -204,6 +233,306 @@ index 44b24d1..b5a1ebf 100755
 +        known = ', '.join(sorted(config['peers'])) or 'none'
 +        die(f"No device named {name} (known: {known}). Try \"{EXECUTABLE_NAME} sync peer name key-fingerprint\".")
 +    return config['peers'][name]
++
++def sync_tree(commit):
++    """The files of a commit: path -> (mode, blob). Empty for no commit."""
++    if not commit:
++        return {}
++    files = {}
++    for line in sync_git('ls-tree', '-r', '-z', commit).stdout.split('\0'):
++        if line:
++            meta, path = line.split('\t', 1)
++            mode, _, blob = meta.split(' ')
++            files[path] = (mode, blob)
++    return files
++
++SYNC_BLOBS = {}
++
++def sync_blob(blob):
++    """The bytes of a git blob."""
++    if blob not in SYNC_BLOBS:
++        SYNC_BLOBS[blob] = sync_git('cat-file', 'blob', blob, text=False).stdout
++    return SYNC_BLOBS[blob]
++
++def sync_key_ids(data):
++    """The key ids an OpenPGP message is encrypted to, read from its first packets.
++    None when it is not something we can vouch for (not a message, or a packet version we do not know)."""
++    ids, at = [], 0
++    while at < len(data):
++        first = data[at]
++        if not first & 0x80:
++            return None
++        if first & 0x40:  # new format
++            tag = first & 0x3f
++            if at + 1 >= len(data):
++                return None
++            length = data[at + 1]
++            if length < 192:
++                start = at + 2
++            elif length < 224:
++                if at + 2 >= len(data):
++                    return None
++                length, start = ((length - 192) << 8) + data[at + 2] + 192, at + 3
++            elif length == 255:
++                length, start = int.from_bytes(data[at + 2:at + 6], 'big'), at + 6
++            else:  # partial lengths: only data packets have them, and those end the search
++                return ids if ids and tag in (18, 20) else None
++        else:  # old format
++            tag, kind = (first >> 2) & 0x0f, first & 0x03
++            if kind == 3:
++                return ids if ids and tag in (18, 20) else None
++            size = (1, 2, 4)[kind]
++            length, start = int.from_bytes(data[at + 1:at + 1 + size], 'big'), at + 1 + size
++        if tag in (18, 20):  # the encrypted data: every recipient has been seen
++            return ids or None
++        if tag != 1 or start + 9 > len(data) or data[start] != 3:
++            return None
++        ids.append(data[start + 1:start + 9].hex().upper())
++        at = start + length
++    return None
++
++def sync_devices(config):
++    """Everything about the devices' keys: {'names': fingerprint -> name, 'ids': encryption key id -> name}."""
++    if 'devices' not in config:
++        names = {config['key']: config['device']}
++        names.update({fingerprint: name for name, fingerprint in config['peers'].items()})
++        ids = {}
++        for fingerprint, name in names.items():
++            listing = subprocess.run([GPG, '--batch', '--with-colons', '--list-keys', fingerprint],
++                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
++            for line in listing.splitlines():
++                fields = line.split(':')
++                if fields[0] in ('pub', 'sub'):
++                    ids[fields[4]] = name
++        config['devices'] = {'names': names, 'ids': ids, 'lines': {}}
++    return config['devices']
++
++def sync_reader(config, line):
++    """The device a .gpg-id line names, or None when it names no key, several, or one that is no device's."""
++    devices = sync_devices(config)
++    if line not in devices['lines']:
++        listing = subprocess.run([GPG, '--batch', '--with-colons', '--list-keys', '--', line],
++                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
++        found, primary = [], False
++        for row in listing.splitlines():
++            fields = row.split(':')
++            if fields[0] in ('pub', 'sub'):
++                primary = fields[0] == 'pub'
++            elif fields[0] == 'fpr' and primary:
++                found.append(fields[9])
++                primary = False
++        devices['lines'][line] = devices['names'].get(found[0]) if len(found) == 1 else None
++    return devices['lines'][line]
++
++def sync_readers_of(config, files, path):
++    """Who should read what is at this path in these files: (sorted device names or None for a bad file, directory)."""
++    directory = os.path.dirname(path)
++    while True:
++        readers_file = f'{directory}/.gpg-id' if directory else '.gpg-id'
++        if readers_file in files:
++            lines = [line.split('#')[0].strip() for line in
++                     sync_blob(files[readers_file][1]).decode('utf-8', errors='replace').splitlines()]
++            names = [sync_reader(config, line) for line in lines if line]
++            return (None if None in names or not names else sorted(set(names))), directory
++        if not directory:
++            return None, ''
++        directory = os.path.dirname(directory)
++
++def sync_encrypted_to(config, blob):
++    """The devices an entry's file is encrypted to: sorted names, or None when one is no device (or it is no entry)."""
++    ids = sync_key_ids(sync_blob(blob))
++    devices = sync_devices(config)
++    if not ids or any(key_id not in devices['ids'] for key_id in ids):
++        return None
++    return sorted({devices['ids'][key_id] for key_id in ids})
++
++def sync_problems(config, files):
++    """Why these files cannot be a synced store: a list of sentences, empty when they can."""
++    problems = []
++    for path, (mode, blob) in sorted(files.items()):
++        if path == '.gitattributes' and mode == '100644':
++            # What "pass git init" writes, and nothing else: attributes can name filters.
++            if sync_blob(blob) != b'*.gpg diff=gpg\n':
++                problems.append(".gitattributes is not the one line of \"pass git init\"")
++        elif mode != '100644' or not (SYNC_ENTRY_PATH.fullmatch(path) or SYNC_READERS_PATH.fullmatch(path)):
++            problems.append(f"{path} is neither an entry nor a .gpg-id")
++        elif path.endswith('/.gpg-id') or path == '.gpg-id':
++            if sync_readers_of(config, files, os.path.join(os.path.dirname(path), 'x'))[0] is None:
++                problems.append(f"{path} names a reader that is not a device")
++        elif sync_encrypted_to(config, blob) is None:
++            problems.append(f"{path} is encrypted to a key that is no device's")
++    if files and '.gpg-id' not in files:
++        problems.append("there is no .gpg-id at the root")
++    return problems
++
++def sync_stale(config, files):
++    """The entries whose file is not encrypted to the readers their .gpg-id says: path -> (readers, directory)."""
++    stale = {}
++    for path, (_, blob) in files.items():
++        if SYNC_ENTRY_PATH.fullmatch(path):
++            readers, directory = sync_readers_of(config, files, path)
++            if readers is not None and sync_encrypted_to(config, blob) != readers:
++                stale[path] = (readers, directory)
++    return stale
++
++SYNC_PLAINTEXTS = {}
++
++def sync_plaintext(blob):
++    """What an entry's file says, or None when this device cannot read it."""
++    if blob not in SYNC_PLAINTEXTS:
++        result = subprocess.run([GPG] + PASSWORD_STORE_GPG_OPTS + ['--batch', '--quiet', '--yes', '--decrypt'],
++                                input=sync_blob(blob), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        SYNC_PLAINTEXTS[blob] = result.stdout if result.returncode == 0 else None
++    return SYNC_PLAINTEXTS[blob]
++
++def sync_same(one, other):
++    """Two versions of an entry are the same: the same bytes, or the same text for a device that reads both."""
++    if one == other:
++        return True
++    if one is None or other is None:
++        return False
++    text = sync_plaintext(one)
++    return text is not None and text == sync_plaintext(other)
++
++def sync_entry_name(path):
++    return path[:-4]
++
++def sync_moves(base, side):
++    """Entries of base that side has under another name: old path -> new path. One to one, in name order."""
++    gone = sorted(path for path in base if path not in side)
++    new = sorted(path for path in side if path not in base)
++    moves = {}
++    for old in gone:
++        for candidate in new:
++            if candidate not in moves.values() and sync_same(base[old], side[candidate]):
++                moves[old] = candidate
++                break
++    return moves
++
++def sync_plan(config, base_commit, mine_commit, theirs_commit, choices=None):
++    """What taking theirs into mine gives, both grown from base.
++    Returns (files: path -> blob, lines for the user, names that need a choice)."""
++    choices = choices or {}
++    trees = [sync_tree(commit) for commit in (base_commit, mine_commit, theirs_commit)]
++    entries = [{path: blob for path, (_, blob) in tree.items() if SYNC_ENTRY_PATH.fullmatch(path)} for tree in trees]
++    readers = [{path: blob for path, (_, blob) in tree.items() if SYNC_READERS_PATH.fullmatch(path)} for tree in trees]
++    base, mine, theirs = entries
++    moved_mine, moved_theirs = sync_moves(base, mine), sync_moves(base, theirs)
++    lines, conflicts = [], []
++    # path -> the versions that want to be there: (blob, what each side made of that entry).
++    # "What a side made of an entry" is (path, blob), or None when it has it no more (or never had it).
++    landing = {}
++
++    def land(path, blob, of_mine, of_theirs):
++        landing.setdefault(path, []).append((blob, {'mine': of_mine, 'theirs': of_theirs}))
++
++    def choose(name, of_mine, of_theirs):
++        """Lands what the chosen side made of the entry, or records that a choice is missing."""
++        conflicts.append(name)
++        chosen = {'mine': of_mine, 'theirs': of_theirs}.get(choices.get(name), of_mine)
++        if chosen:
++            land(chosen[0], chosen[1], chosen if chosen is of_mine else None, chosen if chosen is of_theirs else None)
++
++    # Entries that were there before.
++    for path, blob in base.items():
++        state = []
++        for side, moved in ((mine, moved_mine), (theirs, moved_theirs)):
++            now = moved.get(path, path)
++            state.append((now, side[now]) if now in side else None)
++        of_mine, of_theirs = state
++        touched_mine = of_mine is None or of_mine[0] != path or not sync_same(of_mine[1], blob)
++        touched_theirs = of_theirs is None or of_theirs[0] != path or not sync_same(of_theirs[1], blob)
++        if of_theirs is None:
++            lines.append(f"removed {sync_entry_name(path)}")
++        else:
++            if of_theirs[0] != path:
++                lines.append(f"moved {sync_entry_name(path)} -> {sync_entry_name(of_theirs[0])}")
++            if not sync_same(of_theirs[1], blob):
++                lines.append(f"changed {sync_entry_name(of_theirs[0])}")
++        name = sync_entry_name((of_mine or of_theirs or (path,))[0])
++        if not touched_theirs:
++            if of_mine:
++                land(of_mine[0], of_mine[1], of_mine, of_theirs)
++        elif not touched_mine:
++            if of_theirs:
++                land(of_theirs[0], of_theirs[1], of_mine, of_theirs)
++        elif of_mine is None and of_theirs is None:
++            pass
++        elif of_mine is None or of_theirs is None:
++            choose(name, of_mine, of_theirs)
++        else:
++            names = {of_mine[0], of_theirs[0]} - {path}
++            new_mine, new_theirs = not sync_same(of_mine[1], blob), not sync_same(of_theirs[1], blob)
++            if len(names) > 1 or (new_mine and new_theirs and not sync_same(of_mine[1], of_theirs[1])):
++                choose(name, of_mine, of_theirs)
++            else:
++                land(names.pop() if names else path, of_theirs[1] if new_theirs and not new_mine else of_mine[1],
++                     of_mine, of_theirs)
++
++    # Entries that are new.
++    new_mine = {path: blob for path, blob in mine.items() if path not in base and path not in moved_mine.values()}
++    new_theirs = {path: blob for path, blob in theirs.items() if path not in base and path not in moved_theirs.values()}
++    for path in sorted(new_theirs):
++        lines.append(f"added {sync_entry_name(path)}")
++    for path in sorted(set(new_mine) | set(new_theirs)):
++        if path in new_mine and path in new_theirs and sync_same(new_mine[path], new_theirs[path]):
++            land(path, new_mine[path], (path, new_mine[path]), (path, new_theirs[path]))
++        else:
++            if path in new_mine:
++                land(path, new_mine[path], (path, new_mine[path]), None)
++            if path in new_theirs:
++                land(path, new_theirs[path], None, (path, new_theirs[path]))
++
++    # Two different entries under one name: the chosen side's state of each, so that neither is lost
++    # (theirs moved nothing and added y, mine moved x to y: "theirs" is x back at x, and their y).
++    files, contested = {}, []
++    for path, wanting in landing.items():
++        if all(sync_same(blob, wanting[0][0]) for blob, _ in wanting):
++            files[path] = wanting[0][0]
++        else:
++            contested.append(path)
++    for path in contested:
++        name = sync_entry_name(path)
++        if name not in conflicts:
++            conflicts.append(name)
++        for _, made in landing[path]:
++            kept = made[choices.get(name, 'mine')]
++            if kept:
++                files[kept[0]] = kept[1]
++
++    # Readers files, whole.
++    readers_base, readers_mine, readers_theirs = readers
++    for path in sorted(set(readers_base) | set(readers_mine) | set(readers_theirs)):
++        was, of_mine, of_theirs = readers_base.get(path), readers_mine.get(path), readers_theirs.get(path)
++        directory = os.path.dirname(path) + '/'
++        if of_theirs != was:
++            names = sync_readers_of(config, trees[2], os.path.join(os.path.dirname(path), 'x'))[0] if of_theirs else None
++            lines.append(f"readers {directory}: {' '.join(names) if names else 'inherited' if not of_theirs else '?'}")
++        if of_mine == of_theirs or of_theirs == was:
++            kept = of_mine
++        elif of_mine == was:
++            kept = of_theirs
++        else:
++            conflicts.append(directory)
++            kept = of_theirs if choices.get(directory) == 'theirs' else of_mine
++        if kept:
++            files[path] = kept
++    if '.gitattributes' in trees[1] or '.gitattributes' in trees[2]:
++        files['.gitattributes'] = (trees[1].get('.gitattributes') or trees[2]['.gitattributes'])[1]
++
++    for path in sorted(sync_stale(config, trees[2])):
++        lines.append(f"stale {sync_entry_name(path)}")
++    lines += [f"conflict {name}" for name in conflicts]
++    return files, lines, conflicts
++
++def sync_base(tip):
++    """The last commit this store and a tip have in common, or None."""
++    if sync_git('rev-parse', '--verify', '--quiet', 'HEAD^{commit}', check=False).returncode != 0:
++        return None
++    return sync_git('merge-base', 'HEAD', tip, check=False).stdout.strip() or None
++
++def sync_head():
++    return sync_git('rev-parse', '--verify', '--quiet', 'HEAD^{commit}', check=False).stdout.strip() or None
 +
 +def sync_ref(device):
 +    return f'refs/pass-sync/{device}'
@@ -279,17 +608,13 @@ index 44b24d1..b5a1ebf 100755
 +                references.append((commit, name))
 +    return None, None  # no end of header: not a bundle
 +
-+def sync_changes(base, tip):
-+    """The files that differ between two commits: (status, mode after, path). No rename detection."""
-+    raw = sync_git('diff', '--raw', '-z', '--no-renames', '--no-abbrev', base, tip).stdout
-+    fields = raw.split('\0')
-+    return [(meta.split(' ')[4], meta.split(' ')[1], path) for meta, path in zip(fields[0::2], fields[1::2])]
-+
 +def sync_outstanding(config, name):
 +    """How a device's tip stands against the store: (tip, commits it has more, commits it lacks)."""
 +    tip = sync_tip(name)
 +    if not tip:
 +        return None, 0, 0
++    if not sync_head():
++        return tip, int(sync_git('rev-list', '--count', tip).stdout), 0
 +    ahead, behind = sync_git('rev-list', '--left-right', '--count', f'{tip}...HEAD').stdout.split()
 +    return tip, int(ahead), int(behind)
 +
@@ -298,17 +623,18 @@ index 44b24d1..b5a1ebf 100755
 +    if not tip:
 +        return f"{name}: nothing received yet"
 +    if ahead == 0:
-+        return f"{name}: has nothing this store lacks" + (f", is {behind} commit(s) behind" if behind else "")
-+    text = f"{name}: {ahead} commit(s) to take"
-+    if behind:
-+        text += f", but {behind} behind: publish with \"{EXECUTABLE_NAME} sync push\" and let it merge first"
-+    return text
++        return f"{name}: nothing to take" + (f" (it lacks {behind} commit(s) of this store)" if behind else "")
++    return f"{name}: {ahead} commit(s) to take"
 +
 +def cmd_sync_setup(argv):
 +    if len(argv) != 3:
 +        die(f"Usage: {EXECUTABLE_NAME} sync setup device-name drop-zone own-key-fingerprint")
 +    if not is_git_repository(PASSWORD_STORE_DIR):
-+        die("The password store is not a git repository. Try \"pass git init\".")
++        # A device that is about to adopt another's store starts from nothing.
++        if os.path.isdir(PASSWORD_STORE_DIR) and os.listdir(PASSWORD_STORE_DIR):
++            die("The password store is not a git repository. Try \"pass git init\".")
++        os.makedirs(PASSWORD_STORE_DIR, exist_ok=True)
++        subprocess.run(['git', '-C', PASSWORD_STORE_DIR, 'init', '--quiet'], check=True)
 +    name, url, fingerprint = sync_check_device_name(argv[0]), argv[1], sync_fingerprint(argv[2])
 +    sync_check_key(fingerprint, secret=True)
 +    if not url.startswith('sftp://'):
@@ -317,6 +643,9 @@ index 44b24d1..b5a1ebf 100755
 +            die(f"The drop zone {url} is not a directory (for a server: sftp://user@host[:port][/dir]).")
 +    for key, value in (('device', name), ('url', url), ('key', fingerprint)):
 +        sync_git('config', '--local', f'pass-sync.{key}', value)
++    # This device's commits say whose they are.
++    for key, value in (('user.signingkey', fingerprint), ('gpg.format', 'openpgp'), ('pass.signcommits', 'true')):
++        sync_git('config', '--local', key, value)
 +    print(f"This store is {name}, published to {url}, signed with {fingerprint}.")
 +
 +def cmd_sync_peer(argv):
@@ -348,11 +677,13 @@ index 44b24d1..b5a1ebf 100755
 +    print(f"This device: {config['device']} ({config['key']})")
 +    print(f"Drop zone: {config['url']}")
 +    published = sync_tip(config['device'])
-+    head = sync_git('rev-parse', 'HEAD').stdout.strip()
-+    print("Published: " + ("the current state" if published == head else
++    head = sync_head()
++    print("Published: " + ("the current state" if published and published == head else
 +                           "not yet" if not published else "an earlier state: \"sync push\" to publish"))
 +    for name in sorted(config['peers']):
 +        print(sync_describe(config, name))
++    for path in sorted(sync_stale(config, sync_tree(head))):
++        print(f"stale {sync_entry_name(path)}")
 +    if not config['peers']:
 +        print(f"No other device. Try \"{EXECUTABLE_NAME} sync peer name key-fingerprint\".")
 +
@@ -360,6 +691,12 @@ index 44b24d1..b5a1ebf 100755
 +    config = sync_config()
 +    name = config['device']
 +    sync_check_key(config['key'], secret=True)
++    if not sync_head():
++        die("The store is empty: nothing to publish.")
++    problems = sync_problems(config, sync_tree('HEAD'))
++    if problems:
++        die("This cannot be published, a synced store holds entries and .gpg-id files of devices only:\n  "
++            + "\n  ".join(problems))
 +    if sync_git('status', '--porcelain').stdout.strip():
 +        print("Note: the store has changes that are not committed. They are not published.", file=sys.stderr)
 +    sync_git('update-ref', sync_ref(name), 'HEAD')
@@ -422,9 +759,15 @@ index 44b24d1..b5a1ebf 100755
 +        return f"{sync_describe(config, name)} (nothing new since {published})"
 +    if held and sync_git('merge-base', '--is-ancestor', tip, held, check=False).returncode == 0:
 +        return f"{name}: IGNORED, an old file was served again (published {published})"
-+    fetched = sync_git('fetch', '--quiet', '--no-tags', bundle, f'+{sync_ref(name)}:{sync_ref(name)}', check=False)
++    fetched = sync_git('fetch', '--quiet', '--no-tags', bundle, f'+{sync_ref(name)}:refs/pass-sync-incoming/{name}',
++                       check=False)
 +    if fetched.returncode != 0:
 +        return f"{name}: REFUSED, its bundle is not complete: {fetched.stderr.strip()}"
++    sync_git('update-ref', '-d', f'refs/pass-sync-incoming/{name}')
++    problems = sync_problems(config, sync_tree(tip))
++    if problems:
++        return f"{name}: REFUSED, {'; '.join(problems)}"
++    sync_git('update-ref', sync_ref(name), tip)
 +    return f"{sync_describe(config, name)} (published {published})"
 +
 +def cmd_sync_fetch(argv):
@@ -441,10 +784,11 @@ index 44b24d1..b5a1ebf 100755
 +    if any('REFUSED' in account for account in accounts):
 +        sys.exit(1)
 +
-+def sync_signers(config, name, tip):
-+    """The commits a device has more than the store: (commit, subject, who signed it or None)."""
-+    devices = {config['key']: config['device'], sync_peer(config, name): name}
-+    log = sync_git('log', '--reverse', '--format=%H%x1f%G?%x1f%GP%x1f%s', f'HEAD..{tip}').stdout
++def sync_signers(config, tip):
++    """The commits of a tip that the store lacks: (commit, subject, the device that signed it or None)."""
++    devices = sync_devices(config)['names']
++    since = [f'HEAD..{tip}'] if sync_head() else [tip]
++    log = sync_git('log', '--reverse', '--format=%H%x1f%G?%x1f%GP%x1f%s', *since).stdout
 +    commits = []
 +    for line in log.splitlines():
 +        commit, state, fingerprint, subject = line.split('\x1f', 3)
@@ -457,18 +801,16 @@ index 44b24d1..b5a1ebf 100755
 +        die(f"Usage: {EXECUTABLE_NAME} sync log device-name")
 +    config = sync_config()
 +    name = argv[0]
-+    tip, ahead, _ = sync_outstanding(config, name) if sync_peer(config, name) else (None, 0, 0)
++    sync_peer(config, name)
++    tip, ahead, _ = sync_outstanding(config, name)
 +    if not ahead:
 +        print(sync_describe(config, name))
 +        return
-+    for commit, subject, signer in sync_signers(config, name, tip):
-+        print(f"{commit[:10]}  {('signed by ' + signer) if signer else 'NOT SIGNED BY A DEVICE':24}  {subject}")
++    for commit, subject, signer in sync_signers(config, tip):
++        print(f"{commit[:10]}  {('signed by ' + signer) if signer else 'not signed':18}  {subject}")
 +    print()
-+    letters = {'A': 'added', 'M': 'changed', 'D': 'removed', 'T': 'changed type'}
-+    for status, _, path in sync_changes('HEAD', tip):
-+        print(f"  {letters.get(status, status):8} {path[:-4] if path.endswith('.gpg') else path}")
-+    print()
-+    print(sync_describe(config, name))
++    _, lines, _ = sync_plan(config, sync_base(tip), sync_head(), tip)
++    print('\n'.join(lines))
 +
 +def cmd_sync_diff(argv):
 +    if len(argv) != 1:
@@ -488,35 +830,99 @@ index 44b24d1..b5a1ebf 100755
 +                        '-c', 'diff.pass-sync.binary=true',
 +                        '-c', 'diff.pass-sync.textconv=' + ' '.join(
 +                            [GPG] + PASSWORD_STORE_GPG_OPTS + ['--decrypt', '--quiet', '--yes', '--batch']),
-+                        'diff', '--no-renames', 'HEAD', tip], check=False)
++                        'diff', '--no-renames', sync_base(tip) or '4b825dc642cb6eb9a060e54bf8d69288fbee4904', tip],
++                       check=False)
 +    finally:
 +        shutil.rmtree(tmpdir, ignore_errors=True)
 +
++def sync_reencrypt(config):
++    """Re-encrypt, for the readers their .gpg-id names, the stale entries this device reads. Commits that."""
++    devices = sync_devices(config)
++    fingerprints = {name: fingerprint for fingerprint, name in devices['names'].items()}
++    files = sync_tree('HEAD')
++    done = set()
++    for path, (readers, directory) in sorted(sync_stale(config, files).items()):
++        text = sync_plaintext(files[path][1])
++        if text is None:
++            continue
++        command = [GPG] + PASSWORD_STORE_GPG_OPTS + ['--batch', '--yes', '--quiet', '--no-encrypt-to',
++                                                     '--compress-algo', 'none', '--trust-model', 'always', '--encrypt']
++        for reader in readers:
++            command += ['--recipient', fingerprints[reader]]
++        target = os.path.join(PASSWORD_STORE_DIR, path)
++        result = subprocess.run(command + ['--output', target], input=text, stderr=subprocess.PIPE)
++        if result.returncode != 0:
++            die(f"gpg could not re-encrypt {path}: {result.stderr.decode(errors='replace').strip()}")
++        sync_git('add', '--', path)
++        done.add(directory + '/')
++    if done:
++        sync_git('-c', 'gpg.format=openpgp', 'commit', '--quiet', f"-S{config['key']}", '-m',
++                 f"Reencrypt for the readers of {', '.join(sorted(done))}.")
++    return len(done)
++
 +def cmd_sync_merge(argv):
-+    if len(argv) != 1:
-+        die(f"Usage: {EXECUTABLE_NAME} sync merge device-name")
++    choices, names = {}, []
++    while argv:
++        argument = argv.pop(0)
++        if argument in ('--mine', '--theirs') and argv:
++            choices[argv.pop(0)] = argument[2:]
++        else:
++            names.append(argument)
++    if len(names) != 1:
++        die(f"Usage: {EXECUTABLE_NAME} sync merge device-name [--mine name | --theirs name]...")
 +    config = sync_config()
-+    name = argv[0]
++    name = names[0]
 +    sync_peer(config, name)
-+    tip, ahead, behind = sync_outstanding(config, name)
++    sync_check_key(config['key'], secret=True)
++    tip, ahead, _ = sync_outstanding(config, name)
 +    if not tip:
 +        die(f"Nothing received from {name} yet. Try \"{EXECUTABLE_NAME} sync fetch\".")
 +    if ahead == 0:
 +        print(sync_describe(config, name))
 +        return
-+    if behind:
-+        die(f"{name} has not merged this store's last {behind} commit(s): not a fast-forward. "
-+            f"Publish with \"{EXECUTABLE_NAME} sync push\", let {name} merge, then fetch again.")
 +    if sync_git('status', '--porcelain', '--untracked-files=no').stdout.strip():
 +        die("The store has changes that are not committed.")
-+    unsigned = [commit[:10] for commit, _, signer in sync_signers(config, name, tip) if not signer]
-+    if unsigned:
-+        die(f"Not signed by {name} or by this device: {', '.join(unsigned)}. Nothing was taken.")
-+    for status, mode, path in sync_changes('HEAD', tip):
-+        if not SYNC_ENTRY_PATH.fullmatch(path) or (status != 'D' and mode != '100644'):
-+            die(f"{name} changes {path}, which is not an entry: only this device does that. Nothing was taken.")
-+    sync_git('merge', '--quiet', '--ff-only', tip)
-+    print(f"Took {ahead} commit(s) from {name}.")
++    head, base = sync_head(), sync_base(tip)
++    problems = sync_problems(config, sync_tree(tip))
++    if problems:
++        die(f"{name}'s store is not one to take:\n  " + "\n  ".join(problems))
++    if head and not base:
++        die(f"{name}'s store and this one have nothing in common. Only an empty store adopts another.")
++
++    if not head:
++        if [entry for entry in os.listdir(PASSWORD_STORE_DIR) if entry != '.git']:
++            die("The store has no history but is not empty.")
++        sync_git('reset', '--quiet', '--hard', tip)
++        print(f"Adopted {name}'s store.")
++    elif base == head:
++        sync_git('merge', '--quiet', '--ff-only', tip)
++        print(f"Took {ahead} commit(s) from {name}.")
++    else:
++        files, _, conflicts = sync_plan(config, base, head, tip, choices)
++        missing = [conflict for conflict in conflicts if choices.get(conflict) not in ('mine', 'theirs')]
++        if missing:
++            die("Both sides changed these, differently. Nothing was taken. Say which to keep, for each, with "
++                "--mine name or --theirs name:\n  " + "\n  ".join(missing))
++        # The merged tree, written without touching the working tree; then moving to it is a fast-forward.
++        tmpdir = sync_tmpdir()
++        try:
++            index = {'GIT_INDEX_FILE': os.path.join(tmpdir, 'index')}
++            sync_git('read-tree', '--empty', extra_env=index)
++            listing = ''.join(f'100644 blob {blob}\t{path}\0' for path, blob in sorted(files.items()))
++            result = subprocess.run(['git', '-C', PASSWORD_STORE_DIR, 'update-index', '-z', '--index-info'],
++                                    input=listing.encode(), env=dict(os.environ, **index), stderr=subprocess.PIPE)
++            if result.returncode != 0:
++                die(f"git update-index failed: {result.stderr.decode(errors='replace').strip()}")
++            tree = sync_git('write-tree', extra_env=index).stdout.strip()
++        finally:
++            shutil.rmtree(tmpdir, ignore_errors=True)
++        merged = sync_git('-c', 'gpg.format=openpgp', 'commit-tree', tree, '-p', head, '-p', tip,
++                          f"-S{config['key']}", '-m', f"Merge the changes of {name}.").stdout.strip()
++        sync_git('merge', '--quiet', '--ff-only', merged)
++        print(f"Merged {ahead} commit(s) from {name}.")
++    count = sync_reencrypt(config)
++    if count:
++        print("Re-encrypted what was not encrypted for its readers.")
 +    cmd_sync_push([])
 +
 +def cmd_sync(argv):
@@ -531,7 +937,7 @@ index 44b24d1..b5a1ebf 100755
  def main():
      """Main function."""
      set_umask()
-@@ -1652,6 +2059,8 @@ def main():
+@@ -1652,6 +2441,8 @@ def main():
          cmd_copy_move("copy", sys.argv[2:])
      elif command == "git":
          cmd_git(sys.argv[2:])
@@ -540,7 +946,7 @@ index 44b24d1..b5a1ebf 100755
      else:
          # Not found - Use show command by default
          cmd_show([command] + sys.argv[2:])
-@@ -1667,3 +2076,7 @@ if __name__ == "__main__":
+@@ -1667,3 +2458,7 @@ if __name__ == "__main__":
      except KeyboardInterrupt:
          print("", file=sys.stderr)
          sys.exit(130)
@@ -550,239 +956,317 @@ index 44b24d1..b5a1ebf 100755
 +        sys.exit(141)
 diff --git a/test_tricks/additional-tests/u0008-sync-tests.sh b/test_tricks/additional-tests/u0008-sync-tests.sh
 new file mode 100755
-index 0000000..a29b3a3
+index 0000000..dda2e62
 --- /dev/null
 +++ b/test_tricks/additional-tests/u0008-sync-tests.sh
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,310 @@
 +#!/usr/bin/env bash
 +
-+test_description='Test sync: trading the store with another device through a drop zone'
++test_description='Test sync: two devices trading a store through a drop zone'
 +cd "$(dirname "$0")"
 +. ./setup.sh
 +
-+# This store is the device "pc", with KEY1. The other device, "phone", has KEY2 and is played
-+# here with git and gpg alone: what it publishes is what any implementation of it must publish.
-+DROP="$SHARNESS_TRASH_DIRECTORY/drop"
-+PHONE="$SHARNESS_TRASH_DIRECTORY/phone"
++# Two stores, "pc" (KEY1) and "laptop" (KEY2), and a directory between them as the drop zone.
++# Both keys are in the one test keyring, so each device reads everything: what a device that is
++# not a reader sees is played in the scenarios of c4ffein-work/playground, with a keyring each.
++STORES="$SHARNESS_TRASH_DIRECTORY"
++DROP="$STORES/drop"
 +
-+phone_git() {
-+	env -u GIT_DIR -u GIT_WORK_TREE git -C "$PHONE" "$@"
++on() {
++	local device="$1"
++	shift
++	PASSWORD_STORE_DIR="$STORES/$device" GIT_DIR="$STORES/$device/.git" GIT_WORK_TREE="$STORES/$device" "$@"
++}
++pc() { on pc "$PASS" "$@"; }
++laptop() { on laptop "$PASS" "$@"; }
++
++# trade: each publishes, each receives.
++trade() {
++	pc sync push >/dev/null && laptop sync push >/dev/null && pc sync fetch >/dev/null && laptop sync fetch >/dev/null
 +}
 +
-+# phone_publish [signing key [reference [recipient...]]]
-+phone_publish() {
-+	local key="${1:-$KEY2}" ref="${2:-refs/pass-sync/phone}"
-+	phone_git update-ref "$ref" HEAD &&
-+	phone_git bundle create --version=2 "$SHARNESS_TRASH_DIRECTORY/phone.bundle" "$ref" &&
-+	$GPG --batch --yes --quiet --trust-model always --compress-algo none --local-user "$key" \
-+		--sign --encrypt --recipient $KEY1 --recipient $KEY2 \
-+		--output "$DROP/phone.bundle.gpg" "$SHARNESS_TRASH_DIRECTORY/phone.bundle"
-+}
-+
-+# phone_take: start again from what pc published.
-+phone_take() {
-+	$GPG --batch --yes --quiet --output "$SHARNESS_TRASH_DIRECTORY/pc.bundle" --decrypt "$DROP/pc.bundle.gpg" &&
-+	phone_git fetch --quiet "$SHARNESS_TRASH_DIRECTORY/pc.bundle" "+refs/pass-sync/pc:refs/pass-sync/pc" &&
-+	phone_git checkout --quiet -B work refs/pass-sync/pc
-+}
-+
-+# phone_insert name content [commit options...]: an entry encrypted to KEY1, as the .gpg-id says.
-+phone_insert() {
-+	local name="$1" content="$2"
++# raw_publish device key [reference...]: what a device gone wrong would publish, past its own checks.
++raw_publish() {
++	local device="$1" key="$2"
 +	shift 2
-+	echo "$content" | $GPG --batch --yes --quiet --trust-model always --encrypt --recipient $KEY1 \
-+		--output "$PHONE/$name.gpg" &&
-+	phone_git add "$name.gpg" &&
-+	phone_git commit --quiet "${@:--S}" -m "Add given password for $name to store."
++	on "$device" git update-ref "refs/pass-sync/$device" HEAD &&
++	on "$device" git bundle create --version=2 "$STORES/raw.bundle" "${@:-refs/pass-sync/$device}" &&
++	$GPG --batch --yes --quiet --trust-model always --compress-algo none --digest-algo SHA512 --local-user "$key" \
++		--sign --encrypt --recipient $KEY1 --recipient $KEY2 --output "$DROP/$device.bundle.gpg" "$STORES/raw.bundle"
 +}
 +
-+head_of() {
-+	git rev-parse "${1:-HEAD}"
-+}
-+
-+test_expect_success 'Setup: a store in git, a drop zone, a phone' '
-+	"$PASS" init $KEY1 &&
-+	"$PASS" git init &&
-+	"$PASS" generate first 20 &&
-+	mkdir "$DROP" &&
-+	env -u GIT_DIR -u GIT_WORK_TREE git init --quiet "$PHONE" &&
-+	phone_git config user.signingkey $KEY2 &&
-+	phone_git config gpg.program $GPG
++test_expect_success 'Setup: a store on pc, nothing yet on laptop' '
++	mkdir "$DROP" "$STORES/pc" &&
++	pc init $KEY1 $KEY2 &&
++	pc git init &&
++	pc generate first 20
 +'
 +
 +test_expect_success 'Sync says what is missing before it is set up' '
-+	test_must_fail "$PASS" sync push 2>err &&
++	test_must_fail pc sync push 2>err &&
 +	grep -q "sync setup" err &&
-+	test_must_fail "$PASS" sync setup Pc "$DROP" $KEY1 &&
-+	test_must_fail "$PASS" sync setup pc "$DROP" 0123 &&
-+	test_must_fail "$PASS" sync setup pc "$DROP/missing" $KEY1 &&
-+	"$PASS" sync setup pc "$DROP" $KEY1 &&
-+	test_must_fail "$PASS" sync peer phone 0000000000000000000000000000000000000000 &&
-+	test_must_fail "$PASS" sync peer pc $KEY1 &&
-+	test_must_fail "$PASS" sync log phone &&
-+	"$PASS" sync peer phone "$(echo $KEY2 | tr A-F a-f | sed "s/..../& /g")" &&
-+	"$PASS" sync status >out &&
++	test_must_fail pc sync setup Pc "$DROP" $KEY1 &&
++	test_must_fail pc sync setup pc "$DROP" 0123 &&
++	test_must_fail pc sync setup pc "$DROP/missing" $KEY1 &&
++	pc sync setup pc "$DROP" $KEY1 &&
++	test_must_fail pc sync peer laptop 0000000000000000000000000000000000000000 &&
++	test_must_fail pc sync peer pc $KEY1 &&
++	test_must_fail pc sync log laptop &&
++	pc sync peer laptop "$(echo $KEY2 | tr A-F a-f | sed "s/..../& /g")" &&
++	pc sync status >out &&
 +	grep -q "Published: not yet" out &&
-+	grep -q "phone: nothing received yet" out
++	grep -q "laptop: nothing received yet" out &&
++	laptop sync setup laptop "$DROP" $KEY2 &&
++	laptop sync peer pc $KEY1 &&
++	test_must_fail laptop sync push
 +'
 +
-+test_expect_success 'Push publishes one signed file that holds one reference' '
-+	"$PASS" sync push &&
++test_expect_success 'Push publishes one signed file, and an empty store adopts it' '
++	pc sync push &&
 +	test "$(ls "$DROP")" = "pc.bundle.gpg" &&
 +	$GPG --batch --yes --quiet --status-fd 3 --output pc.bundle --decrypt "$DROP/pc.bundle.gpg" 3>status &&
 +	grep -q "VALIDSIG .* $KEY1\$" status &&
 +	grep -q "VALIDSIG [0-9A-F]* [-0-9]* [0-9]* [0-9]* [0-9]* [0-9]* [0-9]* 10 " status &&
 +	test "$(grep -c "ENC_TO" status)" = 2 &&
-+	test "$(env -u GIT_DIR -u GIT_WORK_TREE git bundle list-heads pc.bundle)" = "$(head_of) refs/pass-sync/pc" &&
-+	"$PASS" sync status | grep -q "Published: the current state"
++	test "$(git bundle list-heads pc.bundle | cut -d" " -f2)" = "refs/pass-sync/pc" &&
++	laptop sync fetch >out &&
++	grep -q "pc: [0-9]* commit(s) to take" out &&
++	laptop sync log pc >out &&
++	grep -q "^added first\$" out &&
++	grep -q "^readers /: laptop pc\$" out &&
++	laptop sync merge pc | grep -q "Adopted" &&
++	test "$(laptop show first)" = "$(pc show first)" &&
++	laptop sync merge pc | grep -q "nothing to take"
 +'
 +
-+test_expect_success 'Fetch, log, diff and merge take what the phone signed' '
-+	phone_take &&
-+	phone_insert from-phone "typed on the phone" &&
-+	phone_publish &&
-+	"$PASS" sync fetch >out &&
-+	grep -q "phone: 1 commit(s) to take" out &&
-+	test_must_fail "$PASS" show from-phone &&
-+	"$PASS" sync log phone >out &&
-+	grep -q "signed by phone .*Add given password for from-phone" out &&
-+	grep -q "added *from-phone\$" out &&
-+	"$PASS" sync diff phone | grep -q "^+typed on the phone" &&
-+	"$PASS" sync merge phone >out &&
-+	grep -q "Took 1 commit(s) from phone" out &&
-+	test "$("$PASS" show from-phone)" = "typed on the phone" &&
-+	test "$(head_of)" = "$(phone_git rev-parse HEAD)" &&
-+	test "$(head_of refs/pass-sync/pc)" = "$(head_of)" &&
-+	"$PASS" sync merge phone | grep -q "has nothing this store lacks"
++test_expect_success 'One side changed: the other moves forward' '
++	echo "typed on the laptop" | laptop insert -e from-laptop &&
++	trade &&
++	pc sync log laptop >out &&
++	grep -q "signed by laptop" out &&
++	grep -q "^added from-laptop\$" out &&
++	pc sync diff laptop | grep -q "^+typed on the laptop" &&
++	pc sync merge laptop | grep -q "Took 1 commit" &&
++	test "$(pc show from-laptop)" = "typed on the laptop"
 +'
 +
-+test_expect_success 'A commit that no device signed is not taken' '
-+	before=$(head_of) &&
-+	phone_insert unsigned "nobody vouches for this" --no-gpg-sign &&
-+	phone_publish &&
-+	"$PASS" sync fetch &&
-+	"$PASS" sync log phone | grep -q "NOT SIGNED BY A DEVICE" &&
-+	test_must_fail "$PASS" sync merge phone 2>err &&
-+	grep -q "Not signed by phone" err &&
-+	test "$(head_of)" = "$before" &&
-+	phone_take &&
-+	phone_insert signed-by-another "a key that is not a device" -S$KEY3 &&
-+	phone_publish &&
-+	"$PASS" sync fetch &&
-+	test_must_fail "$PASS" sync merge phone 2>err &&
-+	grep -q "Not signed by phone" err &&
-+	test "$(head_of)" = "$before"
++test_expect_success 'Both sides changed different entries: a merge, and no question' '
++	echo one | pc insert -e only-pc &&
++	echo two | laptop insert -e only-laptop &&
++	trade &&
++	pc sync merge laptop | grep -q "Merged 1 commit" &&
++	trade &&
++	laptop sync merge pc | grep -q "Took" &&
++	test "$(laptop show only-pc)" = one &&
++	test "$(pc show only-laptop)" = two &&
++	test "$(on pc git rev-parse HEAD)" = "$(on laptop git rev-parse HEAD)"
 +'
 +
-+test_expect_success 'A commit that changes who can read is not taken' '
-+	before=$(head_of) &&
-+	phone_take &&
-+	echo $KEY2 >>"$PHONE/.gpg-id" &&
-+	phone_git commit --quiet -S -am "Let the phone read everything." &&
-+	phone_publish &&
-+	"$PASS" sync fetch &&
-+	test_must_fail "$PASS" sync merge phone 2>err &&
-+	grep -q ".gpg-id, which is not an entry" err &&
-+	test "$(head_of)" = "$before" &&
-+	phone_take &&
-+	mkdir -p "$PHONE/.extensions" &&
-+	echo "#!/bin/sh" >"$PHONE/.extensions/x.bash" &&
-+	phone_git add .extensions &&
-+	phone_git commit --quiet -S -m "An extension." &&
-+	phone_publish &&
-+	"$PASS" sync fetch &&
-+	test_must_fail "$PASS" sync merge phone &&
-+	phone_take &&
-+	ln -s /etc/passwd "$PHONE/link.gpg" &&
-+	phone_git add link.gpg &&
-+	phone_git commit --quiet -S -m "A link dressed as an entry." &&
-+	phone_publish &&
-+	"$PASS" sync fetch &&
-+	test_must_fail "$PASS" sync merge phone &&
-+	test "$(head_of)" = "$before"
++test_expect_success 'Both sides changed the same entry: nothing is taken without a choice' '
++	echo "says pc" | pc insert -e -f first &&
++	echo "says laptop" | laptop insert -e -f first &&
++	trade &&
++	pc sync log laptop | grep -q "^conflict first\$" &&
++	before=$(on pc git rev-parse HEAD) &&
++	test_must_fail pc sync merge laptop 2>err &&
++	grep -q -- "--mine name or --theirs name" err &&
++	grep -q "^  first\$" err &&
++	test "$(on pc git rev-parse HEAD)" = "$before" &&
++	pc sync merge laptop --theirs first &&
++	test "$(pc show first)" = "says laptop" &&
++	trade &&
++	laptop sync merge pc &&
++	echo "pc again" | pc insert -e -f first &&
++	echo "laptop again" | laptop insert -e -f first &&
++	trade &&
++	pc sync merge laptop --mine first &&
++	trade &&
++	laptop sync merge pc &&
++	test "$(laptop show first)" = "pc again"
 +'
 +
-+test_expect_success 'Only a fast-forward is taken, and removing an entry is one' '
-+	phone_take &&
-+	phone_insert early "written before the store moved" &&
-+	phone_publish &&
-+	"$PASS" generate later 20 &&
-+	before=$(head_of) &&
-+	"$PASS" sync fetch >out &&
-+	grep -q "1 commit(s) to take, but 1 behind" out &&
-+	test_must_fail "$PASS" sync merge phone 2>err &&
-+	grep -q "not a fast-forward" err &&
-+	test "$(head_of)" = "$before" &&
-+	"$PASS" sync push &&
-+	old=$(phone_git rev-parse HEAD) &&
-+	phone_take &&
-+	phone_git merge --quiet -S --no-edit $old &&
-+	phone_git rm --quiet from-phone.gpg &&
-+	phone_git commit --quiet -S -m "Remove from-phone from store." &&
-+	phone_publish &&
-+	"$PASS" sync fetch &&
-+	"$PASS" sync merge phone &&
-+	test "$("$PASS" show early)" = "written before the store moved" &&
-+	test_must_fail "$PASS" show from-phone &&
-+	"$PASS" show later
++test_expect_success 'The same change made on both sides is no conflict' '
++	echo "agreed" | pc insert -e -f first &&
++	echo "agreed" | laptop insert -e -f first &&
++	trade &&
++	pc sync merge laptop &&
++	trade &&
++	laptop sync merge pc &&
++	test "$(laptop show first)" = agreed
 +'
 +
-+test_expect_success 'A file is refused unless the phone signed it and it holds its reference alone' '
-+	held=$(head_of refs/pass-sync/phone) &&
-+	phone_insert more "one more" &&
-+	phone_publish $KEY3 &&
-+	test_must_fail "$PASS" sync fetch >out &&
++test_expect_success 'An entry moved on one side and changed on the other is both' '
++	pc mv first moved/first &&
++	echo "changed where it was" | laptop insert -e -f first &&
++	trade &&
++	laptop sync log pc | grep -q "^moved first -> moved/first\$" &&
++	laptop sync merge pc &&
++	test "$(laptop show moved/first)" = "changed where it was" &&
++	test_must_fail laptop show first &&
++	trade &&
++	pc sync merge laptop &&
++	test "$(pc show moved/first)" = "changed where it was"
++'
++
++test_expect_success 'Two entries wanting one name: the chosen side keeps both as it has them' '
++	pc mv only-pc contested &&
++	echo "laptop put this here" | laptop insert -e contested &&
++	trade &&
++	pc sync log laptop | grep -q "^conflict contested\$" &&
++	test_must_fail pc sync merge laptop &&
++	pc sync merge laptop --theirs contested &&
++	test "$(pc show contested)" = "laptop put this here" &&
++	test "$(pc show only-pc)" = one &&
++	trade &&
++	laptop sync merge pc
++'
++
++test_expect_success 'Readers changed by a device that did not re-encrypt: taking it does' '
++	echo "work secret" | pc insert -e work/w1 &&
++	pc init -p work $KEY1 &&
++	trade &&
++	laptop sync merge pc &&
++	printf "%s\n%s\n" $KEY1 $KEY2 >"$STORES/laptop/work/.gpg-id" &&
++	on laptop git commit --quiet -am "Ask to read work." &&
++	laptop sync status | grep -q "^stale work/w1\$" &&
++	trade &&
++	pc sync log laptop >out &&
++	grep -q "^readers work/: laptop pc\$" out &&
++	grep -q "^stale work/w1\$" out &&
++	pc sync merge laptop | grep -q "Re-encrypted" &&
++	pc sync status >out &&
++	! grep -q "^stale" out &&
++	$GPG --batch --list-packets --list-only "$STORES/pc/work/w1.gpg" 2>&1 | grep -c "pubkey enc packet" >count &&
++	test "$(cat count)" = 2 &&
++	trade &&
++	laptop sync merge pc &&
++	test "$(laptop show work/w1)" = "work secret"
++'
++
++test_expect_success 'Readers changed on both sides, differently: a choice named by the folder' '
++	pc init -p work $KEY1 &&
++	printf "%s\n%s\n" $KEY2 $KEY1 >"$STORES/laptop/work/.gpg-id" &&
++	on laptop git commit --quiet -am "The same readers, the other way round." &&
++	trade &&
++	pc sync log laptop | grep -q "^conflict work/\$" &&
++	test_must_fail pc sync merge laptop &&
++	pc sync merge laptop --mine work/ &&
++	test "$(cat "$STORES/pc/work/.gpg-id")" = $KEY1 &&
++	trade &&
++	laptop sync merge pc &&
++	test "$(cat "$STORES/laptop/work/.gpg-id")" = $KEY1
++'
++
++test_expect_success 'A reader that is no device is neither published nor taken' '
++	held=$(on pc git rev-parse refs/pass-sync/laptop) &&
++	echo $KEY3 >>"$STORES/laptop/.gpg-id" &&
++	on laptop git commit --quiet -am "Let a stranger read everything." &&
++	test_must_fail laptop sync push 2>err &&
++	grep -q ".gpg-id names a reader that is not a device" err &&
++	raw_publish laptop $KEY2 &&
++	test_must_fail pc sync fetch >out &&
++	grep -q "laptop: REFUSED, .gpg-id names a reader that is not a device" out &&
++	test "$(on pc git rev-parse refs/pass-sync/laptop)" = "$held" &&
++	on laptop git reset --quiet --hard HEAD~1 &&
++	echo leak | $GPG --batch --yes --quiet --trust-model always --encrypt --recipient $KEY1 --recipient $KEY3 \
++		--output "$STORES/laptop/leak.gpg" &&
++	on laptop git add leak.gpg &&
++	on laptop git commit --quiet -m "An entry a stranger reads." &&
++	test_must_fail laptop sync push &&
++	raw_publish laptop $KEY2 &&
++	test_must_fail pc sync fetch >out &&
++	grep -q "leak.gpg is encrypted to a key that is no device" out &&
++	on laptop git reset --quiet --hard HEAD~1
++'
++
++test_expect_success 'What is not an entry is neither published nor taken' '
++	held=$(on pc git rev-parse refs/pass-sync/laptop) &&
++	for wrong in extension link note attributes; do
++		case $wrong in
++		extension) mkdir -p "$STORES/laptop/.extensions" && echo "#!/bin/sh" >"$STORES/laptop/.extensions/x.bash" &&
++			on laptop git add -f .extensions ;;
++		link) ln -s /etc/passwd "$STORES/laptop/link.gpg" && on laptop git add link.gpg ;;
++		note) echo text >"$STORES/laptop/README" && on laptop git add README ;;
++		attributes) echo "*.gpg diff=gpg filter=evil" >"$STORES/laptop/.gitattributes" &&
++			on laptop git add .gitattributes ;;
++		esac &&
++		on laptop git commit --quiet -m "Something that is no entry." &&
++		test_must_fail laptop sync push &&
++		raw_publish laptop $KEY2 &&
++		test_must_fail pc sync fetch >out &&
++		grep -q "laptop: REFUSED" out &&
++		on laptop git reset --quiet --hard HEAD~1 || return 1
++	done &&
++	test "$(on pc git rev-parse refs/pass-sync/laptop)" = "$held"
++'
++
++test_expect_success 'A file is refused unless its device signed it and it holds its reference alone' '
++	held=$(on pc git rev-parse refs/pass-sync/laptop) &&
++	echo more | laptop insert -e more &&
++	raw_publish laptop $KEY3 &&
++	test_must_fail pc sync fetch >out &&
 +	grep -q "REFUSED, its file is signed by $KEY3" out &&
-+	phone_publish $KEY2 refs/pass-sync/pc &&
-+	test_must_fail "$PASS" sync fetch >out &&
-+	grep -q "REFUSED, its bundle must hold refs/pass-sync/phone alone" out &&
-+	phone_git bundle create --version=2 "$SHARNESS_TRASH_DIRECTORY/partial.bundle" HEAD~1..work &&
-+	$GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --sign --encrypt --recipient $KEY1 \
-+		--output "$DROP/phone.bundle.gpg" "$SHARNESS_TRASH_DIRECTORY/partial.bundle" &&
-+	test_must_fail "$PASS" sync fetch >out &&
++	on laptop git branch -f second HEAD &&
++	raw_publish laptop $KEY2 refs/pass-sync/laptop refs/heads/second &&
++	test_must_fail pc sync fetch >out &&
++	grep -q "REFUSED, its bundle must hold refs/pass-sync/laptop alone" out &&
++	on laptop git bundle create --version=2 "$STORES/partial.bundle" HEAD~1..refs/pass-sync/laptop &&
++	$GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --digest-algo SHA512 --sign --encrypt \
++		--recipient $KEY1 --output "$DROP/laptop.bundle.gpg" "$STORES/partial.bundle" &&
++	test_must_fail pc sync fetch >out &&
 +	grep -q "REFUSED" out &&
-+	echo "not a bundle" | $GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --sign --encrypt \
-+		--recipient $KEY1 --output "$DROP/phone.bundle.gpg" &&
-+	test_must_fail "$PASS" sync fetch >out &&
++	on laptop git bundle create --version=2 "$STORES/whole.bundle" refs/pass-sync/laptop &&
++	$GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --digest-algo SHA1 --sign --encrypt \
++		--recipient $KEY1 --output "$DROP/laptop.bundle.gpg" "$STORES/whole.bundle" &&
++	test_must_fail pc sync fetch >out &&
++	grep -q "REFUSED" out &&
++	echo "not a bundle" | $GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --digest-algo SHA512 \
++		--sign --encrypt --recipient $KEY1 --output "$DROP/laptop.bundle.gpg" &&
++	test_must_fail pc sync fetch >out &&
 +	grep -q "REFUSED, its file is not a git bundle" out &&
 +	echo "not a bundle" | $GPG --batch --yes --quiet --trust-model always --encrypt --recipient $KEY1 \
-+		--output "$DROP/phone.bundle.gpg" &&
-+	test_must_fail "$PASS" sync fetch >out &&
++		--output "$DROP/laptop.bundle.gpg" &&
++	test_must_fail pc sync fetch >out &&
 +	grep -q "REFUSED, its file is signed by nobody" out &&
-+	phone_git bundle create --version=2 "$SHARNESS_TRASH_DIRECTORY/whole.bundle" refs/pass-sync/phone &&
-+	$GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --digest-algo SHA1 --sign --encrypt \
-+		--recipient $KEY1 --output "$DROP/phone.bundle.gpg" "$SHARNESS_TRASH_DIRECTORY/whole.bundle" &&
-+	test_must_fail "$PASS" sync fetch >out &&
-+	grep -q "REFUSED" out &&
-+	echo "noise" >"$DROP/phone.bundle.gpg" &&
-+	test_must_fail "$PASS" sync fetch >out &&
++	echo "noise" >"$DROP/laptop.bundle.gpg" &&
++	test_must_fail pc sync fetch >out &&
 +	grep -q "REFUSED, its file does not decrypt" out &&
-+	test "$(head_of refs/pass-sync/phone)" = "$held"
++	test "$(on pc git rev-parse refs/pass-sync/laptop)" = "$held"
 +'
 +
 +test_expect_success 'An old file served again is ignored, a missing one is not an error' '
-+	phone_publish &&
-+	"$PASS" sync fetch &&
-+	held=$(head_of refs/pass-sync/phone) &&
-+	cp "$DROP/phone.bundle.gpg" newest &&
-+	phone_git reset --quiet --hard HEAD~1 &&
-+	phone_publish &&
-+	"$PASS" sync fetch >out &&
++	laptop sync push &&
++	pc sync fetch &&
++	held=$(on pc git rev-parse refs/pass-sync/laptop) &&
++	cp "$DROP/laptop.bundle.gpg" newest &&
++	on laptop git reset --quiet --hard HEAD~1 &&
++	laptop sync push &&
++	pc sync fetch >out &&
 +	grep -q "IGNORED, an old file was served again" out &&
-+	test "$(head_of refs/pass-sync/phone)" = "$held" &&
-+	rm "$DROP/phone.bundle.gpg" &&
-+	"$PASS" sync fetch >out &&
-+	grep -q "phone: has published nothing" out
++	test "$(on pc git rev-parse refs/pass-sync/laptop)" = "$held" &&
++	rm "$DROP/laptop.bundle.gpg" &&
++	pc sync fetch >out &&
++	grep -q "laptop: has published nothing" out
++'
++
++test_expect_success 'Two stores with nothing in common do not merge' '
++	mkdir "$STORES/other" &&
++	on other "$PASS" init $KEY1 $KEY2 &&
++	on other "$PASS" git init &&
++	on other "$PASS" sync setup laptop "$DROP" $KEY2 &&
++	on other "$PASS" sync peer pc $KEY1 &&
++	on other "$PASS" sync push &&
++	pc sync fetch &&
++	test_must_fail pc sync merge laptop 2>err &&
++	grep -q "nothing in common" err
 +'
 +
 +test_expect_success 'A removed device is no longer published to, nor listened to' '
-+	cp newest "$DROP/phone.bundle.gpg" &&
-+	"$PASS" sync peer --remove phone &&
-+	test_must_fail git rev-parse --verify --quiet refs/pass-sync/phone &&
-+	test_must_fail "$PASS" sync fetch phone &&
-+	"$PASS" sync push &&
-+	$GPG --batch --yes --quiet --status-fd 3 --output /dev/null --decrypt "$DROP/pc.bundle.gpg" 3>status &&
-+	test "$(grep -c "ENC_TO" status)" = 1
++	pc sync peer --remove laptop &&
++	test_must_fail on pc git rev-parse --verify --quiet refs/pass-sync/laptop &&
++	test_must_fail pc sync fetch laptop &&
++	test_must_fail pc sync push 2>err &&
++	grep -q "names a reader that is not a device" err
 +'
 +
 +test_done
