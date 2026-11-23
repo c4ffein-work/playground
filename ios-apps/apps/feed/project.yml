@@ -1,0 +1,48 @@
+# XcodeGen spec: `make xcode APP=feed` (from ios-apps/) builds the Rust core and generates Feed.xcodeproj.
+# Before the first build on a device, change dev.cafeine (twice here) to an identifier of your own,
+# and set DEVELOPMENT_TEAM (or pick the team in Xcode > Signing & Capabilities).
+name: Feed
+options:
+  bundleIdPrefix: dev.cafeine
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+packages:
+  FeedKit:
+    path: Package
+targets:
+  Feed:
+    type: application
+    platform: iOS
+    sources: [App]
+    dependencies:
+      - package: FeedKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.cafeine.feed
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Feed
+        UILaunchScreen: {}
+        ITSAppUsesNonExemptEncryption: false
+        # The Rust core opens plain sockets: App Transport Security does not apply to it
+        # (it verifies https itself, against the Mozilla roots), the local network permission does.
+        NSLocalNetworkUsageDescription: Feed reads the feeds that are served on your network.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
