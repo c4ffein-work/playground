@@ -1,0 +1,36 @@
+[package]
+name = "pass-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "A password-store (the standard Unix `pass`: OpenPGP files in a git repository), exposed to Swift through UniFFI"
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+base64 = "0.22"
+# Pure Rust git. No worktree checkout, status or diff machinery: a store is small and flat, src/git.rs does it.
+gix = { version = "0.91", default-features = false, features = ["blocking-network-client", "index", "sha1"] }
+# `http-client` alone is the smart-HTTP protocol with no HTTP backend: ours is ureq (src/http.rs).
+gix-transport = { version = "0.63", default-features = false, features = ["http-client"] }
+# Pure Rust OpenPGP. No bzip2: pass writes uncompressed messages, gpg's default is zlib.
+pgp = { version = "0.21", default-features = false }
+pinned-http = { path = "../pinned-http" }
+rand = "0.8"
+# The generation of `rand` that russh and its key types are on.
+rand10 = { package = "rand", version = "0.10" }
+ring = "0.17"
+# Pure Rust SSH client, on ring. No RSA: the device key is Ed25519, and so is any current server's host key.
+russh = { version = "0.65", default-features = false, features = ["ring"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
+uniffi = "0.32"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+zeroize = "1.8"
+
+[dev-dependencies]
+rcgen = "0.14"
+# The stand-in for sshd (tests/support/sshd.rs).
+tokio = { version = "1", features = ["rt-multi-thread"] }
