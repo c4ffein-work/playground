@@ -136,7 +136,7 @@ pub(crate) fn write(root: &Path, relative: &str, content: &[u8]) -> Result<(), P
         std::fs::create_dir_all(parent).map_err(|e| io_error(&context, e))?;
     }
     let mut partial = path.clone().into_os_string();
-    partial.push(format!(".tmp.{}", pinned_http::random_hex(6)));
+    partial.push(format!(".tmp.{:012x}", rand::random::<u64>() & 0xffff_ffff_ffff));
     let partial = PathBuf::from(partial);
     std::fs::write(&partial, content)
         .and_then(|()| std::fs::rename(&partial, &path))
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn the_nearest_gpg_id_governs() {
-        let root = std::env::temp_dir().join(format!("pass-layout-{}", pinned_http::random_hex(8)));
+        let root = std::env::temp_dir().join(format!("pass-layout-{:016x}", rand::random::<u64>()));
         std::fs::create_dir_all(root.join("work/deep")).unwrap();
         assert!(matches!(governing_gpg_id(&root, "a"), Err(PassError::NotInitialized)));
         std::fs::write(root.join(".gpg-id"), "A").unwrap();
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn listing_and_search() {
-        let root = std::env::temp_dir().join(format!("pass-layout-{}", pinned_http::random_hex(8)));
+        let root = std::env::temp_dir().join(format!("pass-layout-{:016x}", rand::random::<u64>()));
         for file in [
             "bank.gpg",
             "Email/work.gpg",

@@ -35,6 +35,8 @@ public struct StoreNode: Identifiable, Equatable, Sendable {
     /// The whole path: `Email/work`. For an entry, its name in the store.
     public let path: String
     public let isFolder: Bool
+    /// An entry this device cannot decrypt: listed, by name only.
+    public let isLocked: Bool
     /// Folders first, then entries, each sorted without regard to case. Empty for an entry.
     public let children: [StoreNode]
 
@@ -48,7 +50,8 @@ public struct StoreNode: Identifiable, Equatable, Sendable {
 }
 
 /// The entries as a tree: `["Email/work", "bank"]` becomes a folder `Email` holding `work`, and `bank`.
-public func storeTree(_ names: [String]) -> [StoreNode] {
+/// `locked` are the entries this device cannot read.
+public func storeTree(_ names: [String], locked: Set<String> = []) -> [StoreNode] {
     func build(_ names: [(path: String, rest: Substring)], prefix: String) -> [StoreNode] {
         var folders: [String: [(path: String, rest: Substring)]] = [:]
         var entries: [StoreNode] = []
@@ -56,7 +59,8 @@ public func storeTree(_ names: [String]) -> [StoreNode] {
             if let slash = rest.firstIndex(of: "/") {
                 folders[String(rest[..<slash]), default: []].append((path, rest[rest.index(after: slash)...]))
             } else {
-                entries.append(StoreNode(name: String(rest), path: path, isFolder: false, children: []))
+                entries.append(StoreNode(
+                    name: String(rest), path: path, isFolder: false, isLocked: locked.contains(path), children: []))
             }
         }
         let byName: (StoreNode, StoreNode) -> Bool = {
@@ -64,7 +68,9 @@ public func storeTree(_ names: [String]) -> [StoreNode] {
             return order == .orderedSame ? $0.name < $1.name : order == .orderedAscending
         }
         let folderNodes = folders.map { name, below in
-            StoreNode(name: name, path: prefix + name, isFolder: true, children: build(below, prefix: prefix + name + "/"))
+            StoreNode(
+                name: name, path: prefix + name, isFolder: true, isLocked: false,
+                children: build(below, prefix: prefix + name + "/"))
         }
         return folderNodes.sorted(by: byName) + entries.sorted(by: byName)
     }
@@ -73,33 +79,52 @@ public func storeTree(_ names: [String]) -> [StoreNode] {
 
 /// One line saying where the device stands, for under the sync button.
 public func describe(_ state: SyncState) -> String {
-    guard state.isRepository else { return "Not synced: the store is not a git repository." }
-    var parts: [String] = []
-    if state.unmerged > 0 {
-        let waiting = state.unmerged - state.unpushed
-        if state.unpushed > 0 { parts.append("\(state.unpushed) change(s) to send") }
-        if waiting > 0 { parts.append("\(waiting) change(s) sent, waiting to be merged") }
+    guard state.hasStore else {
+        return state.updateWaiting ? "The owner's store has arrived: look at it to take it." : "No store yet: sync to receive the owner's."
     }
-    if state.behind > 0 { parts.append("\(state.behind) new change(s) on \(state.branch)") }
-    return parts.isEmpty ? "Up to date with \(state.branch)." : parts.joined(separator: ", ") + "."
+    var parts: [String] = []
+    if state.updateWaiting { parts.append("an update from the owner is waiting") }
+    if state.outstanding > 0 { parts.append("\(state.outstanding) change(s) of this device not taken by the owner yet") }
+    if state.unpublished { parts.append("not published yet") }
+    guard let first = parts.first else { return "In step with the owner." }
+    return first.prefix(1).uppercased() + first.dropFirst() + parts.dropFirst().map { ", " + $0 }.joined() + "."
+}
+
+/// Who can read something, in a few words: `pc, phone`, with what is no device's key told as such.
+public func describe(_ readers: [Reader]) -> String {
+    readers.map { $0.device ?? "unknown key \($0.id.suffix(8))" }.joined(separator: ", ")
+}
+
+/// What is wrong with who can read an entry, if anything: for a warning under "Readable by".
+public func warnings(for access: Access) -> [String] {
+    var warnings: [String] = []
+    if access.readers.contains(where: { $0.device == nil }) {
+        warnings.append("One of its readers is a key this device does not know: it cannot write here.")
+    }
+    if !access.matches {
+        warnings.append(
+            "The file is encrypted to \(access.encryptedTo.joined(separator: ", ")), not to the readers its folder lists: it was not encrypted again after they changed.")
+    }
+    return warnings
+}
+
+/// What an update does to an entry, in a word.
+public func describe(_ kind: ChangeKind) -> String {
+    switch kind {
+    case .added: return "added"
+    case .changed: return "changed"
+    case .removed: return "removed"
+    case .renamed(let from): return "renamed from \(from)"
+    }
 }
 
 /// The store, as `async` calls. Holds no secret: the identity is passed to what needs it.
 public final class PassService: Sendable {
     private let store: PassStore
 
-    /// Opens the store. Reads nothing yet.
+    /// Opens the store, which may not be there yet. Reads nothing.
     public init(config: StoreConfig) throws {
         store = try PassStore.open(config: config)
-    }
-
-    private init(store: PassStore) {
-        self.store = store
-    }
-
-    /// Clones the relay into the (empty or absent) directory of `config`.
-    public static func clone(config: StoreConfig, remote: Remote) async throws -> PassService {
-        try await offMain { PassService(store: try cloneStore(config: config, remote: remote)) }
     }
 
     public func entries() async throws -> [String] {
@@ -107,9 +132,20 @@ public final class PassService: Sendable {
         return try await offMain { try store.list() }
     }
 
-    public func recipientFiles() async throws -> [RecipientFile] {
+    /// The entries this device cannot decrypt.
+    public func unreadable() async throws -> [String] {
         let store = store
-        return try await offMain { try store.recipientFiles() }
+        return try await offMain { try store.unreadable() }
+    }
+
+    public func access(toEntry name: String) async throws -> Access {
+        let store = store
+        return try await offMain { try store.entryAccess(name: name) }
+    }
+
+    public func access(toFolder folder: String) async throws -> Access {
+        let store = store
+        return try await offMain { try store.folderAccess(folder: folder) }
     }
 
     public func show(_ name: String, identity: Identity) async throws -> Entry {
@@ -161,28 +197,47 @@ public final class PassService: Sendable {
         try await offMain { try store.rename(from: name, to: newName, overwrite: false, identity: identity) }
     }
 
+    /// The same, at once: it reads a few references of the local repository, nothing more.
+    public func currentState() throws -> SyncState {
+        try store.syncState()
+    }
+
     /// Where the device stands, from what it has: no network.
     public func syncState() async throws -> SyncState {
         let store = store
         return try await offMain { try store.syncState() }
     }
 
-    /// Takes the main branch (fast-forward only) and sends this device's commits to its own branch.
-    public func sync(_ remote: Remote) async throws -> SyncReport {
+    /// One visit to the drop zone: publishes this device's tip when it changed, and receives the owner's file.
+    public func sync(_ zone: DropZone, identity: Identity) async throws -> SyncReport {
         let store = store
-        return try await offMain { try store.sync(remote: remote) }
+        return try await offMain { try store.sync(zone: zone, identity: identity) }
     }
 
-    /// Takes the update that was shown, and no other.
-    public func accept(_ update: PendingUpdate) async throws -> PullOutcome {
+    /// What the owner published that has not been taken, described.
+    public func pendingUpdate() async throws -> PendingUpdate? {
         let store = store
-        return try await offMain { try store.acceptUpdate(commit: update.commit) }
+        return try await offMain { try store.pendingUpdate() }
     }
 
-    /// Gives up this device's unmerged changes. Returns how many commits were dropped.
-    public func discardLocalCommits(_ remote: Remote) async throws -> UInt32 {
+    /// An entry of the pending update, decrypted: before, here, and in the update.
+    public func versions(of name: String, identity: Identity) async throws -> EntryVersions {
         let store = store
-        return try await offMain { try store.discardLocalCommits(remote: remote) }
+        return try await offMain { try store.updateVersions(name: name, identity: identity) }
+    }
+
+    /// Takes the update that was shown, and no other. Returns the entries that changed.
+    public func accept(_ update: PendingUpdate, choices: [Choice], identity: Identity) async throws -> [String] {
+        let store = store
+        return try await offMain {
+            try store.acceptUpdate(commit: update.commit, choices: choices, identity: identity)
+        }
+    }
+
+    /// Gives up this device's commits the owner has not taken. Returns how many were dropped.
+    public func discardOutstanding() async throws -> UInt32 {
+        let store = store
+        return try await offMain { try store.discardOutstanding() }
     }
 }
 
@@ -191,12 +246,7 @@ public func unlockIdentity(secretKey: String, passphrase: String) async throws -
     try await offMain { try Identity.unlock(secretKey: secretKey, passphrase: passphrase) }
 }
 
-/// Reads the host key of an SSH server, to show its fingerprint before it is pinned.
+/// Reads the host key of a drop zone, to show its fingerprint before it is pinned.
 public func readHostKey(url: String) async throws -> HostKey {
     try await offMain { try fetchHostKey(url: url) }
-}
-
-/// Reads the certificate of an https server, to show its fingerprint before it is pinned.
-public func readCertificate(url: String) async throws -> CertificateFingerprint {
-    try await offMain { try fetchFingerprint(url: url, extraCaPem: nil) }
 }

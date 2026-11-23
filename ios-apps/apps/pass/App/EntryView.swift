@@ -9,6 +9,8 @@ struct EntryView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var entry: Entry?
+    /// Who can read it. Known without the key, and before anything is decrypted.
+    @State private var access: Access?
     @State private var revealed = false
     @State private var copied: String?
     @State private var editing = false
@@ -52,18 +54,29 @@ struct EntryView: View {
                             .textSelection(.enabled)
                     }
                 }
+            } else if access?.readable == false {
+                Section {
+                    Label("Not readable by this device", systemImage: "lock.slash")
+                } footer: {
+                    Text("It is encrypted to other keys than this device's. It can still be renamed or deleted here: the owner sees that before taking it.")
+                }
             } else {
                 ProgressView()
+            }
+            if let access {
+                AccessSection(access: access)
             }
         }
         .navigationTitle(name.split(separator: "/").last.map(String.init) ?? name)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             Menu {
-                Button {
-                    editing = true
-                } label: {
-                    Label("Edit", systemImage: "pencil")
+                if access?.readable != false {
+                    Button {
+                        editing = true
+                    } label: {
+                        Label("Edit", systemImage: "pencil")
+                    }
                 }
                 Button {
                     newName = name
@@ -120,8 +133,29 @@ struct EntryView: View {
     }
 
     private func load() async {
+        access = await model.access(toEntry: name)
+        // What is not for this device is not decrypted, and is shown as such rather than as an error.
+        guard access?.readable != false else { return }
         entry = await model.show(name)
         if entry == nil { dismiss() }
+    }
+}
+
+/// "Readable by: pc, phone", and what is wrong with that, if anything.
+struct AccessSection: View {
+    let access: Access
+
+    var body: some View {
+        Section {
+            LabeledContent("Readable by", value: describe(access.readers))
+            ForEach(warnings(for: access), id: \.self) { warning in
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+        } footer: {
+            Text("From \(access.gpgId.isEmpty ? "no .gpg-id" : access.gpgId): who can read is set on the computer, folder by folder.")
+        }
     }
 }
 

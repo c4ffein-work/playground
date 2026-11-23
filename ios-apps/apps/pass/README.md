@@ -1,218 +1,125 @@
 # Pass
 
 A phone client for a [password-store](https://www.passwordstore.org): the layout of `pass`
-(and of [pass.py](https://github.com/c4ffein/pass)), OpenPGP files in a git repository, synced through git.
+(and of [pass.py](https://github.com/c4ffein/pass)), OpenPGP files in a git repository.
 There is no `gpg` and no `git` on iOS: both are libraries here, in Rust.
+
+The store is managed on a computer. The phone is a **member** of its sync, as [SYNC.md](SYNC.md) defines it:
+the two never talk to each other, each leaves one signed and encrypted file in a
+[drop zone](dropzone/README.md) that understands none of it. Read those two for the protocol and the
+server; this file is about the phone.
 
 ## Status
 
 | Part | State |
 | :-- | :-- |
-| `crates/pass-core` (Rust) | Tested on Linux against the real `gpg` 2.4, `git`, `git-shell`, `git http-backend` and `pass.py`, both ways |
-| `apps/pass/Package` (Swift, no UI: settings, secrets, app state) | Tested on Linux through the generated bindings, against a relay served by `git http-backend`; what it pushes is then checked with `git`, `gpg` and `pass.py`. The keychain code is Apple-only and has not been compiled |
+| `crates/pass-core` (Rust) | Tested on Linux against the real `gpg` 2.4, `git`, OpenSSH (`sshd` + `internal-sftp`, through `dropzone/entrypoint.sh`) and `pass.py`, including its own `pass sync` |
+| `apps/pass/Package` (Swift, no UI: settings, secrets, app state) | Tested on Linux through the generated bindings, against two real drop zones fed by `pass sync push`; what it publishes is then taken by `pass sync fetch`/`log`/`merge`. The keychain code is Apple-only and has not been compiled |
 | `apps/pass/App`, `project.yml` | **Written without a Mac: syntax-checked only, never compiled or run** |
-| The Rust core for `aarch64-apple-ios` | **Never built.** Every dependency is pure Rust except `ring` (which companion already ships), but nobody has compiled this set for iOS yet: see "Not verified" |
-| SSH against OpenSSH | **Not tested**: there is no `ssh`/`sshd` where this was written. The SSH tests run against a stand-in server (russh on both ends) that executes the real `git-shell` and the real `update` hook |
+| The Rust core for `aarch64-apple-ios` | **Never built.** Every dependency is pure Rust except `ring` (which companion already ships), but nobody has compiled this set for iOS yet |
 
-## How it syncs
+## Setting a phone up
 
-The store has one owner and one place where git is *managed*: the computer. The phone never merges and
-never writes to the main branch.
-
-```
- computer (pass, gpg, git) ──push main──▶  relay  ◀──fetch main (fast-forward only)── phone
-                           ◀─fetch devices/phone─  (bare repo)  ◀──push devices/phone────────
-```
-
-- **Relay**: a bare repository on a machine of yours, reached over SSH. It sees only what git sees
-  (see the threat model). `https` with a token works too, for a hosting service.
-- **The phone commits locally**, with the messages `pass` writes (`Add given password for x to store.`,
-  `Edit password for x using pass-ios.`, `Rename a to b.`...), each commit signed with the OpenPGP key,
-  and pushes them to **its own branch**, `devices/<name>`, fast-forward only.
-- **The phone takes `main` by fast-forward only.** Once you have merged its branch on the computer, its
-  commits are in `main` and it simply moves forward.
-- If `main` moved while the phone has unmerged changes, the two have **diverged**: the phone says so,
-  takes nothing, and keeps working and pushing to its branch. It resolves itself when you merge. The
-  other way out is on the phone: *Discard this device's changes* (back to `main`, and its branch on the
-  relay is moved back too; the one push that is not forward-only).
-- **A change to any `.gpg-id` coming from the relay is never taken silently**: the sync stops and shows
-  which recipients were added or removed, and whether the `.gpg-id.sig` and the last commit are signed
-  by a key the phone knows. Encrypting needs no secret, so anyone who can write to the repository can
-  add themselves as a recipient: this is the check that matters.
-
-Merge with a real merge (or a fast-forward). After a rebase or a squash the phone's commits are not in
-`main` and it stays diverged until its changes are discarded.
-
-### Setting the relay up
-
-On the relay machine, an account that can only do git:
-
-```sh
-sudo adduser --disabled-password --gecos '' pass-relay
-sudo -u pass-relay git init --bare --initial-branch=main /home/pass-relay/store.git
-sudo -u pass-relay install -m 755 apps/pass/relay/update /home/pass-relay/store.git/hooks/update
-```
-
-`/home/pass-relay/.ssh/authorized_keys`, one line per key, each forced into `git-shell`
-(use its full path if `command -v git-shell` is not in the account's `PATH`):
-
-```
-command="exec git-shell -c \"$SSH_ORIGINAL_COMMAND\"",restrict ssh-ed25519 AAAA... laptop
-command="PASS_DEVICE=phone exec git-shell -c \"$SSH_ORIGINAL_COMMAND\"",restrict ssh-ed25519 AAAA... pass on phone
-```
-
-The phone's line is shown by the app once it has made its key (Settings → This device's key), ready to
-send to the computer. `PASS_DEVICE` is what the [`update` hook](relay/update) reads: a key that carries
-it can move `refs/heads/devices/<that name>` and nothing else, and cannot delete it. A key without it
-(yours) can push anything. `restrict` turns off forwarding, ptys and the rest.
-
-On the computer:
-
-```sh
-cd ~/.password-store            # a store with `pass git init` done
-git remote add relay pass-relay@relay.example:store.git
-git push relay main
-```
-
-On the phone: import the key, enter `pass-relay@relay.example:store.git`, read the relay's host key
-and compare it with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` run on the relay, clone.
-
-### Reviewing the phone's changes on the computer
-
-`pass git init` configured a `gpg` diff driver (`.gitattributes` + `diff.gpg.textconv`), so git shows
-entries decrypted:
-
-```sh
-cd ~/.password-store
-git fetch relay
-git log --show-signature main..relay/devices/phone      # who signed what
-git log -p main..relay/devices/phone                    # the changes, decrypted
-git diff --stat main...relay/devices/phone -- '*.gpg-id' '*.gpg-id.sig'   # must print nothing
-git merge --verify-signatures relay/devices/phone       # refuses an unsigned or badly signed commit
-git push relay main
-```
-
-(Plain `git`, not `pass git`: in pass.py as it is today `pass git <anything but init>` does not find the
-repository. See "Seen in pass.py" below.) The signatures are by your own OpenPGP key, the one the phone
-holds, so `gpg` on the computer verifies them with nothing to import. To make the reverse check possible
-(phone setting *Only take signed updates*), sign on the computer too: `git config commit.gpgsign true`.
+1. **On the phone, make its key** (Settings → OpenPGP key → *Make this device's key*): Ed25519 to sign,
+   Curve25519 to decrypt, generated here, so its private half never exists anywhere else. Importing a key
+   made elsewhere is still possible. Send the public key to the computer.
+2. **On the phone, make its SSH key**, and give its public line to the drop zone (`DROPZONE_KEY_PHONE`).
+3. **On the computer**: `gpg --import` the phone's public key, compare its fingerprint with the one the
+   phone shows, then
+   ```sh
+   pass sync setup pc sftp://drop@your-server:2222 <your-fingerprint>
+   pass sync peer phone <phone-fingerprint>
+   pass init <your-fingerprint> <phone-fingerprint>   # where the phone should read; -p <folder> for one folder
+   pass sync push
+   ```
+4. **On the phone**: the drop zone's address, *Read the server's host key* and compare it with what the
+   drop zone printed when it started; add the computer as a device (its public key, marked as the owner),
+   comparing its fingerprint too. Then *Sync*: the owner's store arrives, is shown, and is taken when you accept.
 
 ## What the app does
 
 - **Browse and search** the store as folders; each word typed narrows the list. Listing needs no key.
+- **Who can read what** is always in sight, because different folders can be shared with different sets of
+  devices (a `.gpg-id` per directory): a folder shows its readers by device name; an entry says
+  *Readable by: pc, phone*, and warns when one of them is a key that is no device's, or when the file is not
+  actually encrypted to the readers its folder lists (a `.gpg-id` changed and the file was not encrypted
+  again). **Entries this device cannot read are listed, locked**: the name, nothing else.
 - **Read an entry**: the first line is the password, `name: value` lines are fields, `otpauth://` lines
   give time-based codes (RFC 6238). Tap to copy: the clipboard entry is local to the device (no Universal
   Clipboard) and expires (45 s by default).
-- **Write**: add, edit, generate (new, or in place as `pass generate -i`), rename/move, delete. Entries are
-  encrypted to the recipients of the governing `.gpg-id`, all of them or not at all; moving an entry under
-  another `.gpg-id` re-encrypts it.
-- **Unlock** with the key's passphrase, typed each time or kept in the keychain behind Face ID. Locks
-  after 2 minutes without use, and at once when the app leaves the screen.
-- **Sync** with one button (also while locked: it needs no key).
+- **Write entries, and only entries**: add, edit, generate (new, or in place as `pass generate -i`),
+  rename/move, delete, each a commit with the message `pass` would write, signed by the phone's key. An
+  entry is encrypted to every reader of its folder or not written at all: when one of them is a key the
+  phone does not have (no device's), it refuses and says which. The phone has no way to change a `.gpg-id`
+  or anything that is not a `*.gpg` file.
+- **Sync** is one button: it publishes the phone's history when it changed, and fetches what the owner
+  published. Every change made on the phone is published right away when the drop zone is reachable.
+- **The owner's update is never applied by itself.** It is checked (signed by the owner's key, the one
+  reference, complete), kept aside, and shown: how long ago it was signed, the commits and who signed each,
+  the entries added, changed, renamed and removed with both versions decrypted on demand, each `.gpg-id`
+  before and after by device name, whose readers each entry gains, and what is not an entry. *Accept* or *Later*.
+- **Accepting** moves forward to the owner's tip, or, when the phone has changes the owner has not taken,
+  merges whole files in a signed merge commit: an entry changed on one side keeps that side's version; changed
+  on both, you choose *Mine* or *The owner's* having seen both; the rest is the owner's. Then it publishes, and
+  `pass sync merge phone` on the computer is a fast-forward.
+- **Drop this device's changes**: back to the owner's history as last accepted.
+- **Unlock** with the key's passphrase, typed each time or kept in the keychain behind Face ID. Locks after
+  2 minutes without use, and at once when the app leaves the screen. Everything that touches the drop zone
+  needs the key (the files are encrypted to it and signed with it): there is no sync while locked.
 
-Not there: an AutoFill extension (below), directories in rename/delete, `pass init` (recipients are managed
-on the computer), QR codes, a key generated on the phone.
+Not there: an AutoFill extension (below), directories in rename/delete, reading the other members' files
+(only the owner's is fetched), a history browser.
 
-## Research: which libraries, and why
+## How it is built
 
 Read in the crates' own sources (November 2026: `gix` 0.91, `pgp` 0.21.1, `russh` 0.65.4), not from memory.
 
-### OpenPGP: rPGP (`pgp`), not Sequoia
+- **OpenPGP: rPGP (`pgp`)**, pure Rust. It reads what GnuPG writes for RSA and ed25519/cv25519 keys, including
+  GnuPG's own OCB packet (type 20) and its default compression, and writes what `gpg` reads: entries
+  (encrypted), commits (detached signatures, `git verify-commit` accepts them), published files
+  (`--sign --encrypt`, uncompressed), and keys (`gpg --import` takes the phone's). **Sequoia was rejected**:
+  no OCB for packet 20, and its mature backends are C.
+- **Git: gitoxide (`gix`)** for the object database, references, the index and reading a bundle's pack
+  (`gix-pack`). No network code is left: git never touches a socket here. Written in the crate, small:
+  commits, the whole-file merge, moving the work tree (paths that would leave the store or enter `.git` are
+  refused, symbolic links are not written), and reading and writing **bundles**
+  ([`bundle.rs`](../../crates/pass-core/src/bundle.rs): a header and a pack of whole objects; `git bundle
+  verify` and `git fetch` take them, and `git bundle create`'s are read, deltas included).
+- **Transport: SFTP, hand-written over `russh`** ([`sftp.rs`](../../crates/pass-core/src/sftp.rs), about
+  250 lines, no new crate): the six requests a drop zone needs, one at a time, with the 256 MiB limit
+  checked on the size the server announces and again on what it sends, and publishing by
+  `posix-rename@openssh.com` (remove-then-rename without it). `russh` is pure Rust on `ring`; the host key is
+  pinned by its SHA-256 fingerprint, the device key is Ed25519. **Tested against OpenSSH 9.6.**
+- **`git2` (libgit2) rejected** as before: C, and nothing here needs it anymore.
 
-- **rPGP** is pure Rust (RustCrypto). It decrypts what GnuPG writes for RSA and for ed25519/cv25519 keys,
-  **including GnuPG's own OCB packet (type 20, "LibrePGP")**, which GnuPG 2.4 uses by default between
-  keys it generated; rPGP has it behind `DecryptionOptions::enable_gnupg_aead()`. Tested here with
-  `gpg --force-ocb`, compressed, armored, and `pass`'s own `--compress-algo=none`.
-- It writes PKESK v3 + SEIPD v1 (AES-256), uncompressed: what every `gpg` reads. Tested: `gpg -d` and
-  `pass.py show` read what the phone wrote, to one and to several recipients.
-- **Sequoia rejected** for two reasons: it does not implement packet 20 with OCB (its status page lists OCB
-  as unsupported), so a store written by a recent GnuPG may simply not open; and its mature crypto backends
-  are C (Nettle, OpenSSL), the pure-Rust one being the least used.
-- Built without `bzip2`: an entry compressed with `--compress-algo=bzip2` will not open. Zip and zlib do.
-
-### Git: gitoxide (`gix`) for everything it has, the rest written here
-
-- `gix` is pure Rust (zlib-rs, sha1 with collision detection) and has: the object database, references,
-  the index, tree editing, commits, and **fetch** (protocol v1/v2, pack indexing).
-- **It has no push.** `gix::push` in 0.91 is one configuration enum; nothing in `gix-protocol` speaks
-  `receive-pack`. Push is therefore written in [`crates/pass-core/src/push.rs`](../../crates/pass-core/src/push.rs),
-  about 300 lines: read the advertisement, check the fast-forward, build a pack of whole (undeltified)
-  objects, send one ref update, read `report-status`. Tested against the real `git receive-pack`, over
-  both transports, including a hook's refusal.
-- **Its SSH transport runs the `ssh` program**, and its file transport runs `git-upload-pack`: neither exists
-  on iOS. Its HTTP transport wants curl or reqwest. So the transports are ours:
-  - **HTTP(S)**: `gix-transport` with the `http-client` feature alone is the smart-HTTP protocol with no
-    backend; [`http.rs`](../../crates/pass-core/src/http.rs) implements its `Http` trait on `ureq` and the
-    `pinned-http` agents. **No second TLS stack**: the same rustls + ring as the rest of the workspace,
-    with the same certificate pinning (or the public CAs, for a hosting service).
-  - **SSH**: [`ssh.rs`](../../crates/pass-core/src/ssh.rs) uses **russh** (pure Rust, built on `ring`, no
-    aws-lc, no RSA) to run `git-upload-pack` / `git-receive-pack` on the server and hands the streams to
-    gitoxide. Host key pinned by SHA-256 fingerprint; device key Ed25519, generated on the phone.
-    `ssh-rs` (smaller, blocking) was rejected: it has no host key verification at all.
-- Checkout and fast-forward are also written here ([`git.rs`](../../crates/pass-core/src/git.rs)) instead of
-  enabling gix's worktree features: a store is a few hundred small files, and what comes from the remote is
-  untrusted (paths that leave the directory or enter `.git` are refused, symbolic links are not written).
-- **`git2` (libgit2) rejected**: it has push and SSH, but through C: libgit2 + libssh2 + OpenSSL to
-  cross-compile for iOS, and a second TLS stack. That is the fallback if the pure-Rust route fails on a Mac.
-
-### Commit signing: OpenPGP, done; SSH signatures, not
-
-The phone signs its commits with the OpenPGP key it already holds (a detached signature in `gpgsig`,
-as `git commit -S`). `git verify-commit`, `git log --show-signature` and `git merge --verify-signatures`
-accept them: tested. If the imported key has no signing part (`gpg --export-secret-subkeys` of a key whose
-primary signs), commits are simply not signed and the review has to do without.
-Signing with the SSH device key (`gpg.format=ssh`) would be possible with the same libraries but could
-not be checked here (no `ssh-keygen`), so it is not built.
-
-### Weight
-
-`Cargo.lock` went from 159 to 503 packages (+344) on the base this was built on: `gix` brings 107 (53 of
-them `gix-*`), `pgp` 145, `russh` 122 (with tokio), with overlaps. `pgp` and `russh` are on two different
-generations of the RustCrypto crates, so many small crates are there twice. The only native code is
-`ring`'s, already in the workspace. Dropping SSH would remove russh and tokio; nothing else is optional.
-
-### Open
-
-1. **The iOS build.** See "Not verified".
-2. **SSH against a real OpenSSH server**, and whether its default key exchange and ciphers match russh's
-   `ring` set (they should: curve25519, chacha20-poly1305, aes-gcm). An RSA-only host key will not work.
-3. **Push memory**: the pack is built in memory, whole objects. Fine for password entries, wrong for a store
-   holding large attachments.
-4. rPGP and russh have had less review than GnuPG and OpenSSH. They are the price of no C.
+**Weight.** The workspace without pass locks 165 packages; with it, 498 (it was 507 with the relay design).
+`pass-core`'s own tree went from 388 to 340 packages: gone are `gix-transport`, `gix-protocol` and their
+kin, `ureq`, `rustls`, `pinned-http` and `base64` as direct dependencies. What remains is three big
+trees: `pgp` (145), `russh` with tokio (122), `gix` (92), `pgp` and `russh` being on two different
+generations of the RustCrypto crates. The only native code is `ring`'s.
 
 ## Security model
 
-**On the phone**
-- The OpenPGP secret key is imported once, armored, and kept in the keychain *as exported* (still protected
-  by its passphrase), `WhenUnlockedThisDeviceOnly`: not in backups, not in iCloud Keychain, not on a new
-  phone. It is never written to the store directory or anywhere else.
-- The passphrase is either typed at each unlock and kept nowhere, or kept in the keychain behind Face ID
+The protocol's own guarantees and limits are in [SYNC.md](SYNC.md) ("What this gives, and what it does not").
+On the phone:
+
+- **The OpenPGP secret key** is made here or imported once, and kept in the keychain still protected by its
+  passphrase, `WhenUnlockedThisDeviceOnly`: not in backups, not in iCloud Keychain, not on a new phone. It is
+  never written to the store directory or anywhere else. Erasing the app's data destroys a key made here:
+  the owner then removes that device, as SYNC.md says.
+- **The passphrase** is either typed at each unlock and kept nowhere, or kept in the keychain behind Face ID
   (`biometryCurrentSet`: no passcode fallback, void when the enrolled faces change).
 - Unlocking takes the passphrase off the key once and holds the unlocked key in memory; locking drops it
-  (rPGP zeroes its secret numbers on drop). Decrypted entries exist only in memory, are never written to
-  disk, and the Rust buffers that held them are zeroed. **Limits**: a `String` handed to Swift is a copy the
-  runtime frees without zeroing, and SwiftUI may keep text it displayed. Zeroing is best-effort, not a guarantee.
-- The SSH key is made on the phone and never leaves it. The store directory holds only ciphertext and git history.
-
-**The relay** (anyone who can read or write the repository, including whoever hosts it)
-- **Sees**: entry and folder names, how many there are, when each changed and from which device, the whole
-  history, the recipients (`.gpg-id`), ciphertext sizes. Names are metadata `pass` does not hide.
-- **Cannot**: read an entry.
-- **Can**: refuse service; serve an old `main` (rollback) or drop commits; delete entries; **plant an entry**
-  or replace one (encrypted to you: it will decrypt, with content of their choosing, e.g. a wrong URL);
-  **add a recipient** so that what you write next is readable by them.
-- **What stands against it**: recipient changes are shown before use; with `PASSWORD_STORE_SIGNING_KEY`
-  fingerprints set in the app, a `.gpg-id` is only used when its `.gpg-id.sig` is from one of them (as `pass`
-  does); with *Only take signed updates*, the phone refuses any update whose last commit is not signed by a
-  key of the store, which closes planting and deletion. Rollback to an older *signed* state is not detected.
-  On the computer, `--verify-signatures` does the same for what the phone sends.
-- A stolen phone key (SSH) lets someone push to `devices/phone` only, and you review that branch before merging.
-
-**If the secret key cannot be exported** (hardware token), or you would rather not put it on a phone: make a
-key for the phone, add it as a second recipient on the computer (`pass init <your-id> <phone-id>`, which
-re-encrypts everything), and import that one here. The phone then needs your public key too (Settings →
-Recipients). Revoking the phone means `pass init <your-id>` again, **and changing every password**: the phone
-key could read everything up to that point, and the git history keeps the old ciphertexts.
+  (rPGP zeroes its secret numbers on drop). Decrypted entries exist only in memory and are never written to
+  disk. **Limits**: a `String` handed to Swift is a copy the runtime frees without zeroing, and SwiftUI may
+  keep text it displayed. Zeroing is best-effort, not a guarantee.
+- **The SSH key** is made on the phone and only opens the drop zone, which holds nothing readable.
+- **What comes from the drop zone is not trusted**: a file is only used when it decrypts and is signed by the
+  owner's key as configured on the phone, and even then nothing is applied before it is shown. Anything else
+  (unsigned, signed by another device or a stranger, the wrong reference, several, an incomplete or damaged
+  bundle, a truncated or oversized file) is refused and changes nothing; an older file served again is
+  recognised and ignored. Devices and their keys only ever come from the phone's own settings.
+- **What the review cannot tell you**: whether an entry's *content* is right. It shows it; you read it.
 
 ## An AutoFill extension, later
 
@@ -220,59 +127,69 @@ Not built. It would take: a Credential Provider extension target (`ASCredentialP
 the AutoFill entitlement; an app group and a shared keychain access group, so the extension can open the
 store directory and the key (today both are the app's alone, and `storeDirectory` would move to the group
 container); an index from entry to site (the `url:` field or the entry name), pushed to
-`ASCredentialIdentityStore` after each sync without decrypting more than needed; and care with memory, an
-extension having far less of it than the app. `PassKit` is already free of UI, so the extension would
-reuse it as it is. No sync from the extension: read-only.
+`ASCredentialIdentityStore` after each accepted update without decrypting more than needed; and care with
+memory, an extension having far less of it than the app. `PassKit` is already free of UI, so the extension
+would reuse it as it is. Read-only: no sync from the extension.
 
 ## What is tested
 
-`cargo test -p pass-core` (19 tests, nothing outside the repo): names that cannot leave the store, `.gpg-id`
-lookup, entry parsing, password generation, RFC 6238 vectors, SSH URLs and quoting, the push wire format,
-paths from a remote that would leave the store.
+`cargo test -p pass-core` (20 tests, nothing outside the repo): names that cannot leave the store, `.gpg-id`
+lookup, entry parsing, password generation, RFC 6238 vectors, drop zone URLs, SFTP framing, bundle headers,
+the three-way rule, paths from another device that would leave the store.
 
-`cargo test -p pass-core -- --ignored` (10 tests, real tools, throwaway keys and repositories):
+`cargo test -p pass-core -- --ignored` (14 tests; real tools, throwaway keys, repositories and drop zones;
+the sync ones need root, OpenSSH and an account named `drop`, as `dropzone/test.sh` does):
 - a store made by `gpg` + `pass.py` is read, for an RSA key and for an ed25519/cv25519 key; so are files
   `gpg` writes on its own (compressed, OCB, armored);
 - what is written here is read by `gpg -d` and `pass.py`, the history reads like pass's, `git fsck` and
   `git status` are clean, `git verify-commit` accepts the signatures;
-- several recipients, a `.gpg-id` per directory, re-encryption on move, refusal when a public key is missing;
-- wrong passphrase, a key the entry is not for, subkeys-only exports, a key with no passphrase;
-- a signed `.gpg-id` (`PASSWORD_STORE_SIGNING_KEY`): tampered, signed by someone else, unsigned;
-- the whole cycle, once over HTTP (`git http-backend`) and once over SSH (stand-in sshd → `git-shell`):
-  clone, laptop pushes → phone fast-forwards, phone edits → pushes its branch → laptop reviews decrypted
-  diffs and signatures, merges with `--verify-signatures`, pushes → phone fast-forwards onto the merge;
-  divergence reported; discard; a new recipient held for review and accepted;
-- the relay's refusals: the `update` hook rejects a push to another branch; and the phone's: wrong host key,
-  unknown device key, a rewritten device branch, unsigned or foreign-signed updates when signatures are required;
-- https with a pinned self-signed certificate and Basic auth: wrong token, wrong pin, no trust, token over http.
+- a root `.gpg-id` and subfolders with other sets: who can read each folder and entry by device name, locked
+  entries, a mismatch between a `.gpg-id` and the files under it, re-encryption on move, the refusal to
+  write for a reader whose key is not here;
+- keys: wrong passphrase, subkeys-only exports (read, but no write: they cannot sign), a key made on the
+  phone that `gpg` imports, encrypts to and verifies;
+- the sync, the computer played by hand with `git bundle`, `gpg --sign --encrypt` (with and without
+  compression) and OpenSSH's `sftp`, exactly as SYNC.md says: first setup; phone edits → publishes → the
+  computer checks the signature, `git bundle verify`, the single reference, the commit signatures, that only
+  entries are touched, fast-forwards, republishes → the phone is level; different entries changed on both
+  sides merge by themselves; the same entry changed on both (and changed/removed, both ways) needs a choice,
+  and each choice gives the right result on both machines; a change of recipients is in the review data by
+  directory and by entry; dropping outstanding changes;
+- the refusals: a file signed by an unknown key, by another device, unsigned, not for this device, not
+  OpenPGP at all; a bundle with two references, the wrong one, a branch, prerequisites, a hole in its
+  history, cut short; the right file truncated or with a bit flipped; over 256 MiB; an old file again;
+  a lost file. And of the server: another host key than the pinned one, an SSH key it does not know;
+- the same round trips with the computer's side done by **`pass sync` itself** (`setup`, `peer`, `push`,
+  `fetch`, `log`, `diff`, `merge`).
 
-`apps/pass/swift-test.sh` (18 tests): settings, the tree, the model's stages, lock timeout and clipboard
-expiry with a fake clock, and end to end through the bindings against the relay; then the script itself
-checks the pushed branch with `git`, `gpg` and `pass.py`.
+`apps/pass/swift-test.sh` (19 tests, needs root for the drop zones): settings, the tree with locked entries,
+who-can-read wording, making and unlocking a key, the lock timeout with a fake clock, devices and their one
+owner; then end to end: review and first accept, publish and drop, and a merge with a choice whose result
+`pass sync merge` takes on the computer.
 
-Both need `PASS_PY=/path/to/pass.py` (default `../clones/pass/pass.py` beside `ios-apps`), `gpg`, `git`, `python3`.
+All need `PASS_PY=/path/to/pass.py` (default `../clones/pass/pass.py` beside `ios-apps`).
 
 ## Not verified
 
 - **Cross-compiling for iOS** (`make apple`): never done. Watch `ring` (works for companion), `russh`,
   `tokio`'s `net` on iOS, and the size of the static library.
 - **The SwiftUI views and the keychain/Face ID code**: parsed, never compiled.
-- **OpenSSH** on the other end (see above), and `git-shell`'s place in `PATH` on your relay.
-- A real hosting service over https (GitHub and the like): the protocol is the same one `git http-backend`
-  speaks, but none was contacted.
-- Old keys: a recipient whose self-signatures rPGP rejects (SHA-1 era) cannot be imported as a public key.
-  Your own secret key is not checked that way and should still work.
-- Big stores, slow networks, interrupted transfers (a fetch that fails leaves the store as it was; a commit
-  whose file write fails afterwards would leave the directory behind `HEAD`).
+- **The drop zone's Docker image** (see its README), and an SSH server other than OpenSSH. An RSA-only
+  host key will not work (the build has no RSA).
+- Old keys: a device whose key has SHA-1 self-signatures cannot be added (rPGP rejects them), and rPGP
+  refuses a published file whose signature uses SHA-1 (see below).
+- Big stores: a published file is the whole history, built and read in memory. Fine for thousands of
+  entries; not for a store holding large attachments.
+- A commit whose files could not all be written afterwards would leave the directory behind `HEAD`.
 
-## Seen in pass.py
+## Found on the way
 
-Not touched (read-only here), but found while testing against it:
-- `pass git <cmd>` other than `init` always fails with "not a git repository": `cmd_git` calls
-  `set_git_dir(os.path.join(PASSWORD_STORE_DIR, "/"))`, and joining with `"/"` gives `/`.
-- `pass generate` draws from `random.choice` (Mersenne Twister), not from `secrets`/`os.urandom`.
-- `pass insert` (without `-m`) and `generate` store the password with no final newline, `init` writes
-  `.gpg-id` without one, and `show` prints one newline too many; the original `pass` does none of these.
-  Harmless for reading, but the two tools produce different bytes for the same input.
-- The `diff.gpg.textconv` command saved by `pass git init` includes whatever `PASSWORD_STORE_GPG_OPTS` held
-  at that moment.
+- **gpg signs with SHA-1 when a recipient's key lists no digest preference.** A key made by rPGP's defaults
+  has none, so `gpg --sign --encrypt -r phone` signed with SHA-1, which rPGP (rightly) refuses for Ed25519.
+  The key the phone makes now carries preferences (SHA-512/384/256, AES, zlib), and the tests cover it; a key
+  from another tool could bring the problem back. `--digest-algo SHA512` on the publishing side would close it.
+- A merge keeps this device's version of an entry as it was encrypted. If the owner's update also changed
+  the readers of that folder, that entry is still encrypted to the old ones: the app shows the mismatch on
+  the entry, and `pass init` on the computer encrypts it again.
+- In pass.py: `pass git <cmd>` other than `init` does not find the repository; `pass generate` draws from
+  `random.choice`, not a CSPRNG; `pass sync` does not pass `PASSWORD_STORE_GPG_OPTS` to gpg.

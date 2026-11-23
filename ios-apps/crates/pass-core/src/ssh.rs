@@ -1,6 +1,6 @@
-//! git over SSH with no `ssh` program: `russh` (pure Rust, on `ring`) runs
-//! `git-upload-pack` / `git-receive-pack` on the server and hands their input and
-//! output over as blocking streams.
+//! SSH with no `ssh` program: `russh` (pure Rust, on `ring`) opens a session,
+//! starts a subsystem in it (SFTP: see sftp.rs) and hands its input and output over
+//! as blocking streams.
 //!
 //! The server is known by its host key, pinned by SHA-256 fingerprint as OpenSSH
 //! prints it (`SHA256:...`): there is no known_hosts file and no trust on first use
@@ -36,69 +36,47 @@ fn network(context: &str, e: impl std::fmt::Display) -> PassError {
     }
 }
 
-/// Where an SSH remote is.
+/// Where a drop zone is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Target {
     pub(crate) user: String,
     pub(crate) host: String,
     pub(crate) port: u16,
-    /// As given to `git-upload-pack` on the server.
-    pub(crate) path: String,
 }
 
-/// Reads `ssh://user@host[:port]/path` or the scp form `user@host:path`.
+/// Reads `sftp://user@host[:port]`. There is no path: a drop zone is one directory, the one the session starts in.
 pub(crate) fn parse_url(url: &str) -> Result<Target, PassError> {
-    let bad = || invalid("the repository is ssh://user@host[:port]/path or user@host:path");
+    let bad = || invalid("the drop zone is sftp://user@host[:port], as its README gives it");
     let url = url.trim();
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(invalid("the repository URL holds a space or a control character"));
+        return Err(invalid("the drop zone URL holds a space or a control character"));
     }
-    let (authority, path) = match url.strip_prefix("ssh://") {
-        Some(rest) => {
-            let (authority, path) = rest.split_once('/').ok_or_else(bad)?;
-            // `ssh://host/~/store.git` is relative to the home directory, as git reads it.
-            let path = match path.strip_prefix("~/") {
-                Some(relative) => relative.to_string(),
-                None => format!("/{path}"),
-            };
-            (authority, path)
-        }
-        None if url.contains("://") => return Err(bad()),
-        None => {
-            let (authority, path) = url.split_once(':').ok_or_else(bad)?;
-            (authority, path.to_string())
-        }
-    };
+    let rest = url.strip_prefix("sftp://").ok_or_else(bad)?;
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.contains('/') {
+        return Err(bad());
+    }
     let (user, host_port) = authority.split_once('@').ok_or_else(bad)?;
     let (host, port) = if let Some(v6) = host_port.strip_prefix('[') {
         let (host, after) = v6.split_once(']').ok_or_else(bad)?;
         (host, after.strip_prefix(':'))
-    } else if url.starts_with("ssh://") {
+    } else {
         match host_port.rsplit_once(':') {
             Some((host, port)) => (host, Some(port)),
             None => (host_port, None),
         }
-    } else {
-        (host_port, None)
     };
     let port = match port {
         None | Some("") => 22,
         Some(port) => port.parse().map_err(|_| bad())?,
     };
-    // A host or a path starting with `-` would be read as an option by something down the line.
-    if user.is_empty()
-        || host.is_empty()
-        || host.starts_with('-')
-        || path.trim_matches('/').is_empty()
-        || path.starts_with('-')
-    {
+    if user.is_empty() || user.contains(':') || host.is_empty() || host.starts_with('-') {
         return Err(bad());
     }
     Ok(Target {
         user: user.to_string(),
         host: host.to_string(),
         port,
-        path,
     })
 }
 
@@ -226,9 +204,8 @@ fn parse_private_key(text: &str) -> Result<PrivateKey, PassError> {
     Ok(key)
 }
 
-/// A git remote over SSH.
+/// An SSH server, and who this device is to it.
 pub(crate) struct SshRemote {
-    pub(crate) url: String,
     target: Target,
     key: Arc<PrivateKey>,
     host_key: String,
@@ -324,29 +301,20 @@ impl Outcome {
     }
 }
 
-fn quote(path: &str) -> String {
-    format!("'{}'", path.replace('\'', "'\\''"))
-}
-
 impl SshRemote {
     /// Validates everything. Connects to nothing.
     pub(crate) fn new(url: &str, private_key: &str, host_key: &str) -> Result<Self, PassError> {
         Ok(Self {
-            url: url.trim().to_string(),
             target: parse_url(url)?,
             key: Arc::new(parse_private_key(private_key)?),
             host_key: normalize_fingerprint(host_key)?,
         })
     }
 
-    pub(crate) fn path(&self) -> &str {
-        &self.target.path
-    }
-
-    /// Runs `<program> '<path>'` on the server (`git-upload-pack`, `git-receive-pack`)
-    /// and returns once it is running, or with the reason it could not.
-    pub(crate) fn exec(&self, program: &str) -> Result<(Output, Input), PassError> {
-        let command = format!("{program} {}", quote(&self.target.path));
+    /// Opens a session and starts the subsystem `name` (`sftp`) in it. Returns once it
+    /// is running, or with the reason it could not.
+    pub(crate) fn subsystem(&self, name: &str) -> Result<(Output, Input), PassError> {
+        let command = name.to_string();
         let (target, key, pinned) = (self.target.clone(), self.key.clone(), self.host_key.clone());
         let (chunk_sender, chunks) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
         let (sender, input) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -415,9 +383,9 @@ async fn session(
         .await
         .map_err(|e| network("cannot open a session", e))?;
     channel
-        .exec(true, command)
+        .request_subsystem(true, command)
         .await
-        .map_err(|e| network("cannot run git on the server", e))?;
+        .map_err(|e| network("the server does not do SFTP", e))?;
     let _ = started.try_send(Ok(()));
 
     let (mut output, writer) = channel.split();
@@ -467,56 +435,41 @@ mod tests {
 
     #[test]
     fn urls() {
-        let target = |user: &str, host: &str, port: u16, path: &str| Target {
+        let target = |user: &str, host: &str, port: u16| Target {
             user: user.into(),
             host: host.into(),
             port,
-            path: path.into(),
         };
         assert_eq!(
-            parse_url("ssh://git@relay.example:2222/srv/store.git").unwrap(),
-            target("git", "relay.example", 2222, "/srv/store.git")
+            parse_url("sftp://drop@zone.example:2222").unwrap(),
+            target("drop", "zone.example", 2222)
         );
         assert_eq!(
-            parse_url(" ssh://git@relay.example/~/store.git ").unwrap(),
-            target("git", "relay.example", 22, "store.git")
+            parse_url(" sftp://drop@zone.example/ ").unwrap(),
+            target("drop", "zone.example", 22)
         );
         assert_eq!(
-            parse_url("git@relay.example:store.git").unwrap(),
-            target("git", "relay.example", 22, "store.git")
-        );
-        assert_eq!(
-            parse_url("git@10.0.0.2:/srv/store.git").unwrap(),
-            target("git", "10.0.0.2", 22, "/srv/store.git")
-        );
-        assert_eq!(
-            parse_url("ssh://git@[::1]:2200/store.git").unwrap(),
-            target("git", "::1", 2200, "/store.git")
+            parse_url("sftp://drop@[::1]:2200").unwrap(),
+            target("drop", "::1", 2200)
         );
         for bad in [
             "",
-            "relay.example:store.git", // no user: there is no ~/.ssh/config to find one in
-            "ssh://relay.example/store.git",
-            "ssh://git@relay.example",
-            "ssh://git@relay.example/",
-            "ssh://git@relay.example:port/store.git",
-            "ssh://git@-oProxyCommand=x/store.git",
-            "git@relay.example:-x",
-            "git@relay.example:store dir.git",
-            "https://relay.example/store.git",
-            "git@:store.git",
+            "sftp://zone.example", // no user: there is no ~/.ssh/config to find one in
+            "sftp://drop@zone.example/some/path",
+            "sftp://drop@zone.example:port",
+            "sftp://drop@-oProxyCommand=x",
+            "sftp://drop:secret@zone.example",
+            "sftp://@zone.example",
+            "sftp://drop@",
+            "ssh://drop@zone.example",
+            "drop@zone.example:store",
+            "https://zone.example",
         ] {
             assert!(
                 matches!(parse_url(bad), Err(PassError::InvalidConfig { .. })),
                 "{bad:?}"
             );
         }
-    }
-
-    #[test]
-    fn paths_are_quoted_for_the_remote_shell() {
-        assert_eq!(quote("/srv/store.git"), "'/srv/store.git'");
-        assert_eq!(quote("it's; rm -rf ~"), "'it'\\''s; rm -rf ~'");
     }
 
     #[test]
@@ -546,6 +499,6 @@ mod tests {
             generate_key("x").unwrap().fingerprint
         );
         assert!(matches!(public_key_of("nope"), Err(PassError::InvalidKey { .. })));
-        assert!(SshRemote::new("git@h:store.git", &key.private_key, "SHA256:abc").is_ok());
+        assert!(SshRemote::new("sftp://drop@h", &key.private_key, "SHA256:abc").is_ok());
     }
 }

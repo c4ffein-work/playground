@@ -2,28 +2,30 @@
 //! (<https://www.passwordstore.org>), OpenPGP files in a git repository, with
 //! neither `gpg` nor `git`. Exposed to Swift through UniFFI.
 //!
+//! This is the **member** side of the sync protocol of `apps/pass/SYNC.md`: the
+//! store is managed on a computer (the owner), and each device publishes its whole
+//! history as one signed and encrypted git bundle in a drop zone that understands
+//! none of it. Nothing of the owner's is taken before it has been shown and
+//! accepted; this device only ever changes entries (`*.gpg`), in signed commits.
+//!
 //! Three things are kept apart:
 //! - the store, a directory ([`PassStore`]): listing it needs no key;
-//! - the identity, a secret key and its passphrase held in memory ([`Identity`]):
-//!   reading an entry and changing the store need it, dropping it locks the store;
-//! - the remote ([`Remote`]), given to each call that goes on the network.
-//!
-//! Sync never merges. This device commits its changes on its copy of the main
-//! branch and pushes them to a branch of its own, `devices/<name>`; it takes the
-//! main branch back only by fast-forward, once whoever keeps the store has merged
-//! them. A change of recipients coming from the remote is shown before it is used.
+//! - the identity, a secret key held unlocked in memory ([`Identity`]): reading an
+//!   entry, changing the store and syncing need it, dropping it locks the store;
+//! - the drop zone ([`DropZone`]), given to the call that goes on the network.
 //!
 //! Every call blocks: call them off the main thread. Nothing decrypted is ever
 //! written to disk; the secret key is never written at all.
 
+mod bundle;
 mod crypto;
 mod git;
-mod http;
 mod layout;
 mod otp;
-mod push;
+mod sftp;
 mod ssh;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +38,10 @@ uniffi::setup_scaffolding!();
 
 /// What the phone calls itself where `pass` names the editor: `Edit password for x using pass-ios.`
 const EDITOR: &str = "pass-ios";
+/// A reader refuses a published file over this size (SYNC.md).
+const MAX_PUBLISHED_FILE: u64 = 256 * 1024 * 1024;
+/// How many commits of an update are described: the screen that shows them is not a git log.
+const MAX_LISTED_COMMITS: usize = 200;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum PassError {
@@ -45,20 +51,18 @@ pub enum PassError {
     NotFound { name: String },
     #[error("an entry already exists for {name}")]
     AlreadyExists { name: String },
-    #[error("the store has no .gpg-id: run `pass init <gpg-id>` on the computer first")]
+    #[error("the store has no .gpg-id here: the owner sets who can read what, with `pass init`")]
     NotInitialized,
-    #[error("no public key on this device for the recipient {id}: import it before writing here")]
+    #[error("no public key on this device for the recipient {id}: only the devices of the sync are known here")]
     UnknownRecipient { id: String },
-    #[error("{message}")]
-    UntrustedRecipients { message: String },
-    #[error("{message}")]
-    UntrustedUpdate { message: String },
     #[error("{message}")]
     InvalidKey { message: String },
     #[error("wrong passphrase")]
     WrongPassphrase,
     #[error("this entry is not encrypted to the key on this device")]
     NotForThisKey,
+    #[error("this device's key cannot sign (its signing part is not here): the owner would refuse what it publishes")]
+    CannotSign,
     #[error("{message}")]
     Crypto { message: String },
     #[error("{message}")]
@@ -67,80 +71,62 @@ pub enum PassError {
     InvalidConfig { message: String },
     #[error("{message}")]
     Network { message: String },
-    #[error("the server's certificate is not the pinned one (pinned {pinned}, served {served})")]
-    PinMismatch { pinned: String, served: String },
-    #[error("the server's host key is not the pinned one (pinned {pinned}, served {served})")]
+    #[error("the drop zone's host key is not the pinned one (pinned {pinned}, served {served})")]
     HostKeyMismatch { pinned: String, served: String },
-    #[error("the server refused this device's key or token")]
+    #[error("the drop zone refused this device's SSH key")]
     Unauthorized,
-    #[error("this device has {ahead} change(s) that are not merged, and the store has {behind} new one(s): merge the device's branch on the computer, or discard the device's changes")]
-    Diverged { ahead: u32, behind: u32 },
-    #[error("the remote refused the push: {message}")]
-    PushRejected { message: String },
-    #[error("the store on this device is not a git repository")]
-    NotARepository,
+    #[error("the published file is refused: {message}")]
+    UntrustedFile { message: String },
+    #[error("the published bundle is refused: {message}")]
+    BadBundle { message: String },
+    #[error("the published file is refused: it is over 256 MiB")]
+    TooLarge,
+    #[error("both sides changed {}: choose which version to keep", names.join(", "))]
+    ChoiceRequired { names: Vec<String> },
+    #[error("this is not the update that was last received: look at it again")]
+    StaleUpdate,
+    #[error("there is no store on this device yet: sync to receive the owner's")]
+    NoStore,
     #[error("{message}")]
     Git { message: String },
     #[error("{message}")]
     Io { message: String },
 }
 
-/// How an https server is trusted.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
-pub enum TlsTrust {
-    /// Chain and hostname against the public roots, as a browser: for a hosting service,
-    /// whose certificate cannot be pinned.
-    PublicCa,
-    /// The pinned certificate, which must also verify against the public roots,
-    /// or against `extra_ca_pem` when given.
-    PinnedWithCa {
-        sha256: String,
-        extra_ca_pem: Option<String>,
-    },
-    /// The pinned certificate alone: for a self-signed one.
-    PinnedOnly { sha256: String },
+/// Another device of the sync, as this one is told about it. Nothing received can add one.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Peer {
+    /// `[a-z0-9][a-z0-9-]{0,31}`: names its file in the drop zone.
+    pub name: String,
+    /// 40 hex digits: the fingerprint of its OpenPGP key.
+    pub fingerprint: String,
+    /// That key, armored (`gpg --export --armor <fingerprint>`).
+    pub public_key: String,
+    /// The computer where the store is managed. Exactly one.
+    pub is_owner: bool,
 }
 
-/// Where the store is synced with, and as whom.
-#[derive(Debug, Clone, uniffi::Enum)]
-pub enum Remote {
-    /// `ssh://user@host[:port]/path` or `user@host:path`.
-    Ssh {
-        url: String,
-        /// This device's key, in OpenSSH format, with no passphrase (see [`generate_device_key`]).
-        private_key: String,
-        /// `SHA256:...`: the only host key accepted (see [`fetch_host_key`]).
-        host_key: String,
-    },
-    /// `https://host[:port]/path`, or `http://` with no credentials.
-    Http {
-        url: String,
-        /// `git` when there is a password and no user name.
-        username: Option<String>,
-        /// A password or an access token. Only ever sent over https.
-        password: Option<String>,
-        /// Required with https, refused with http.
-        trust: Option<TlsTrust>,
-    },
+/// Where the devices leave their files for each other.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DropZone {
+    /// `sftp://user@host[:port]`.
+    pub url: String,
+    /// This device's SSH key, in OpenSSH format, with no passphrase (see [`generate_device_key`]).
+    pub private_key: String,
+    /// `SHA256:...`: the only host key accepted (see [`fetch_host_key`]).
+    pub host_key: String,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct StoreConfig {
-    /// The store: created by [`clone_store`], or any `pass` directory.
+    /// Where the store is, or will be once the owner's has been received.
     pub directory: String,
-    /// The public keys of everyone the store is encrypted to, this device's own
-    /// included (see [`public_key_of`]): armored, one or several per string.
-    pub public_keys: Vec<String>,
-    /// As `PASSWORD_STORE_SIGNING_KEY`: fingerprints. When not empty, a `.gpg-id` is
-    /// only used with a valid `.gpg-id.sig` from one of these keys.
-    pub signing_keys: Vec<String>,
-    /// Only take updates of the main branch whose last commit is signed by one of `public_keys`.
-    pub require_signed_updates: bool,
-    /// Who this device's commits are by.
-    pub author_name: String,
-    pub author_email: String,
-    /// Names this device's branch on the remote: `devices/<device>`.
+    /// This device's name.
     pub device: String,
+    /// This device's OpenPGP public key, armored (see [`public_key_of`]).
+    pub public_key: String,
+    /// The other devices. One of them is the owner.
+    pub peers: Vec<Peer>,
 }
 
 /// A public or a secret OpenPGP key, described.
@@ -154,6 +140,16 @@ pub struct KeyInfo {
     pub is_secret: bool,
     /// A secret key protected by a passphrase.
     pub needs_passphrase: bool,
+}
+
+/// An OpenPGP key made on this device.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GeneratedKey {
+    /// Armored, protected by the passphrase: for the keychain, and nowhere else.
+    pub secret_key: String,
+    /// Armored: for the owner to import (`gpg --import`) and add as a recipient.
+    pub public_key: String,
+    pub fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -184,12 +180,12 @@ pub struct OtpCode {
     pub remaining: u32,
 }
 
-/// An SSH key for this device.
+/// An SSH key for this device: it lets it into the drop zone, and does nothing else.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DeviceKey {
     /// OpenSSH format: for the keychain. Empty when only the public half was asked for.
     pub private_key: String,
-    /// `ssh-ed25519 AAAA... comment`: a line for the server's `authorized_keys`.
+    /// `ssh-ed25519 AAAA... comment`: what the drop zone is given (`DROPZONE_KEY_<NAME>`).
     pub public_key: String,
     pub fingerprint: String,
 }
@@ -198,28 +194,30 @@ pub struct DeviceKey {
 pub struct HostKey {
     /// `ssh-ed25519`...
     pub algorithm: String,
-    /// `SHA256:...`, as `ssh-keygen -lf` prints it: what to pin.
+    /// `SHA256:...`, as the drop zone prints it when it starts: what to pin.
     pub fingerprint: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct CertificateFingerprint {
-    /// SHA-256 of the leaf certificate, lowercase hex: what to pin.
-    pub sha256: String,
-    /// `PinnedWithCa` will work. When false, only `PinnedOnly` will.
-    pub chain_valid: bool,
-}
-
-/// Whether something is signed by a key this device knows.
+/// Whether a commit is signed by a device this one knows.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum SignatureStatus {
     Unsigned,
-    /// Signed by the key with this fingerprint, one of the store's public keys.
+    /// Signed by the key of this device (by name).
     Valid {
-        fingerprint: String,
+        device: String,
     },
     /// Signed, but by no key this device has, or the signature does not verify.
     Invalid,
+}
+
+/// A line of a `.gpg-id`: someone who can read what is under it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Reader {
+    /// The line itself: a fingerprint, a key id, an email.
+    pub id: String,
+    /// The device whose key it is. `None` for a key that is no device's: this device
+    /// does not know it, and cannot write for it.
+    pub device: Option<String>,
 }
 
 /// A `.gpg-id` file: who a directory of the store is encrypted to.
@@ -227,11 +225,9 @@ pub enum SignatureStatus {
 pub struct RecipientFile {
     /// `.gpg-id`, `work/.gpg-id`.
     pub path: String,
-    pub ids: Vec<String>,
-    /// The ids with no public key on this device: nothing can be written under this file until they are imported.
+    pub readers: Vec<Reader>,
+    /// The ids that are no device's key: this device cannot write under this file.
     pub unknown: Vec<String>,
-    /// Of the `.gpg-id.sig` next to it.
-    pub signature: SignatureStatus,
 }
 
 /// A `.gpg-id` that an update adds, changes or removes.
@@ -239,76 +235,167 @@ pub struct RecipientFile {
 pub struct RecipientChange {
     pub path: String,
     /// Empty when the file is new.
-    pub before: Vec<String>,
+    pub before: Vec<Reader>,
     /// Empty when the file is removed.
-    pub after: Vec<String>,
-    /// Of the `.gpg-id.sig` that comes with the new file.
-    pub signature: SignatureStatus,
+    pub after: Vec<Reader>,
 }
 
-/// What the main branch of the remote has that this device has not taken yet.
+/// Who can read an entry, or what is put in a folder.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct PendingUpdate {
-    /// The commit it leads to: what to give to [`PassStore::accept_update`].
-    pub commit: String,
-    pub commits: u32,
-    /// The entries added, changed or removed.
-    pub changed: Vec<String>,
-    /// To be shown and agreed to before the update is taken: whoever can write to the
-    /// remote can add a recipient, and from then on every entry written here would
-    /// be readable by them.
-    pub recipient_changes: Vec<RecipientChange>,
-    /// Of the last commit.
+pub struct Access {
+    /// The `.gpg-id` that governs it: `.gpg-id`, `team/.gpg-id`. Empty when there is none.
+    pub gpg_id: String,
+    /// Its lines: who the store says can read this.
+    pub readers: Vec<Reader>,
+    /// This device is one of them.
+    pub listed: bool,
+    /// For an existing entry: who the file is actually encrypted to (device names, or
+    /// `key <id>` for a key that is no device's). Empty for a folder.
+    pub encrypted_to: Vec<String>,
+    /// This device can decrypt it: for an entry, by what the file is encrypted to; for a folder, `listed`.
+    pub readable: bool,
+    /// For an existing entry: the file is encrypted to exactly the readers of its `.gpg-id`.
+    /// False when the `.gpg-id` changed and the file was not encrypted again. True for a folder.
+    pub matches: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CommitInfo {
+    pub id: String,
+    /// The first line of its message.
+    pub subject: String,
+    /// `Name <email>`.
+    pub author: String,
+    /// Seconds since 1970.
+    pub time: i64,
     pub signature: SignatureStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
-pub enum PullOutcome {
-    /// Nothing new on the main branch.
-    UpToDate,
-    FastForwarded {
-        commits: u32,
-        changed: Vec<String>,
-    },
-    /// The update changes who the store is encrypted to. Nothing was taken: show it,
-    /// then [`PassStore::accept_update`] or leave it.
-    NeedsReview {
-        update: PendingUpdate,
-    },
-    /// The main branch has moved and this device has changes that are not in it.
-    /// Nothing was taken. It resolves itself once the device's branch is merged on
-    /// the computer; the other way out is [`PassStore::discard_local_commits`].
-    Diverged {
-        unmerged: u32,
-        behind: u32,
+pub enum ChangeKind {
+    Added,
+    Changed,
+    Removed,
+    /// The same content under another name: `name` is the new one.
+    Renamed {
+        from: String,
     },
 }
 
-/// Where this device stands, from what it knows without the network.
+/// What an update does to one entry.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct SyncState {
-    pub is_repository: bool,
-    /// The main branch: `main`.
-    pub branch: String,
-    /// This device's branch on the remote: `devices/phone`.
-    pub device_branch: String,
-    /// The first line of the last commit, and when it was made (seconds since 1970).
-    pub last_subject: String,
-    pub last_time: i64,
-    /// Commits made here that are not in the main branch as last fetched.
-    pub unmerged: u32,
-    /// Of those, the ones not pushed to the device's branch yet.
-    pub unpushed: u32,
-    /// Commits of the main branch, as last fetched, that are not here.
-    pub behind: u32,
+pub struct EntryChange {
+    pub name: String,
+    pub kind: ChangeKind,
+    /// Who the entry was encrypted to and who it is now (device names, or key ids for
+    /// keys that are no device's). Both empty when that does not change.
+    pub readers_before: Vec<String>,
+    pub readers_after: Vec<String>,
+    /// This device changed it too, to something else: accepting needs a choice for it.
+    pub conflict: bool,
+}
+
+/// What the owner has published that this device has not taken.
+/// Nothing of it is in the store until [`PassStore::accept_update`].
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PendingUpdate {
+    /// The owner's tip: what to give to [`PassStore::accept_update`].
+    pub commit: String,
+    /// When the owner signed the file, seconds since 1970.
+    pub published_at: i64,
+    /// The owner's commits that are not here, newest first (at most 200 of them).
+    pub commits: Vec<CommitInfo>,
+    pub commit_count: u32,
+    /// The entries it adds, changes, renames or removes. See [`PassStore::update_versions`] for their content.
+    pub entries: Vec<EntryChange>,
+    /// The `.gpg-id` files it adds, changes or removes: who can read which directory.
+    pub recipient_changes: Vec<RecipientChange>,
+    /// Anything else it changes (`.gitattributes`, `.extensions/`...).
+    pub other_files: Vec<String>,
+    /// This device's commits that the owner does not have. Not zero: accepting merges.
+    pub outstanding: u32,
+}
+
+/// One version of an entry, read for a review.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum EntryVersion {
+    /// There is no such entry on that side.
+    Absent,
+    /// It is not encrypted to this device's key, or does not decrypt.
+    Unreadable {
+        reason: String,
+    },
+    Content {
+        text: String,
+    },
+}
+
+/// An entry as an update finds it and as it leaves it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct EntryVersions {
+    /// Before the owner's changes: where the two histories last agreed.
+    pub before: EntryVersion,
+    /// On this device now.
+    pub mine: EntryVersion,
+    /// In the update.
+    pub theirs: EntryVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Side {
+    /// This device's version (which may be: removed).
+    Mine,
+    /// The owner's.
+    Theirs,
+}
+
+/// Which version to keep of an entry both sides changed.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Choice {
+    pub name: String,
+    pub keep: Side,
+}
+
+/// What looking at the owner's file gave.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum FetchOutcome {
+    /// The owner has published nothing yet (or the drop zone lost it).
+    NothingPublished,
+    /// The same tip as last time.
+    Unchanged,
+    /// A new tip was received and stored. `update` is what remains to be accepted;
+    /// `None` when this device already has everything in it.
+    Received { update: Option<PendingUpdate> },
+    /// A valid file, but older than the one already received: served again, and ignored.
+    Stale { published_at: i64 },
+    /// Not a file this device takes (wrong signer, wrong reference, incomplete, damaged, too big...). Nothing changed.
+    Refused { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SyncReport {
-    pub pull: PullOutcome,
-    /// Commits sent to the device's branch.
-    pub pushed: u32,
+    /// Whether this device's tip was sent (it is, whenever it is not what was last published).
+    pub published: bool,
+    pub fetch: FetchOutcome,
     pub state: SyncState,
+}
+
+/// Where this device stands, from what it has: no network.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SyncState {
+    /// The owner's store has been received and accepted once.
+    pub has_store: bool,
+    /// Commits made here that the owner has not published back.
+    pub outstanding: u32,
+    /// The tip of this device is not the one it last published.
+    pub unpublished: bool,
+    /// An update of the owner's is waiting to be looked at.
+    pub update_waiting: bool,
+    /// When the owner signed the last file received, seconds since 1970. 0 when none was.
+    pub owner_published_at: i64,
+    /// The first line of the last commit, and when it was made.
+    pub last_subject: String,
+    pub last_time: i64,
 }
 
 fn hex_fingerprint(text: &str) -> String {
@@ -318,7 +405,20 @@ fn hex_fingerprint(text: &str) -> String {
         .collect()
 }
 
-/// A secret key, unlocked: what reading an entry and changing the store need.
+/// A device name, as SYNC.md defines it.
+fn is_device_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    let ok = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    name.len() <= 32 && bytes.next().is_some_and(ok) && bytes.all(|b| ok(b) || b == b'-')
+}
+
+/// Whether a path of the repository is an entry: the only kind of file a member may change.
+fn entry_name(path: &str) -> Option<&str> {
+    path.strip_suffix(".gpg")
+        .filter(|name| layout::clean_name(name).is_ok_and(|clean| clean == *name))
+}
+
+/// A secret key, unlocked: what reading an entry, changing the store and syncing need.
 /// Lives in memory only; dropping the last reference to it locks the store.
 #[derive(uniffi::Object)]
 pub struct Identity {
@@ -327,8 +427,7 @@ pub struct Identity {
 
 #[uniffi::export]
 impl Identity {
-    /// Parses the armored secret key (`gpg --export-secret-keys --armor <id>`) and
-    /// checks that the passphrase opens it. Nothing is stored.
+    /// Parses the armored secret key and checks that the passphrase opens it. Nothing is stored.
     #[uniffi::constructor]
     pub fn unlock(secret_key: String, passphrase: String) -> Result<Arc<Self>, PassError> {
         let (secret_key, passphrase) = (Zeroizing::new(secret_key), Zeroizing::new(passphrase));
@@ -338,7 +437,7 @@ impl Identity {
         }))
     }
 
-    /// The public half, armored: what goes in [`StoreConfig::public_keys`].
+    /// The public half, armored.
     pub fn public_key(&self) -> Result<String, PassError> {
         self.inner.public_key_armored()
     }
@@ -347,9 +446,9 @@ impl Identity {
         self.inner.certificate().fingerprint()
     }
 
-    /// Whether this device's commits will be signed: the key has a signing part with its secret here.
+    /// Whether this key can sign: it must, to change the store or publish anything.
     pub fn can_sign(&self) -> bool {
-        matches!(self.inner.sign(b"probe"), Ok(Some(_)))
+        self.inner.can_sign()
     }
 }
 
@@ -380,7 +479,28 @@ pub fn public_key_of(secret_key: String) -> Result<String, PassError> {
     crypto::public_key_armored(&crypto::parse_secret_key(secret_key.as_bytes())?)
 }
 
-/// A new SSH key for this device. `comment` ends its `authorized_keys` line: name the device.
+/// Makes this device's OpenPGP key, here: its private half then never exists anywhere
+/// else. Ed25519 to sign, Curve25519 to decrypt, as `gpg` makes them today.
+/// `user_id` is `Name <email>` or just a name; an empty `passphrase` leaves the key unprotected.
+#[uniffi::export]
+pub fn generate_openpgp_key(user_id: String, passphrase: String) -> Result<GeneratedKey, PassError> {
+    let passphrase = Zeroizing::new(passphrase);
+    let user_id = user_id.trim();
+    if user_id.is_empty() || user_id.chars().any(char::is_control) {
+        return Err(PassError::InvalidKey {
+            message: "the key needs a name: it is how the owner will recognise it".into(),
+        });
+    }
+    let secret_key = crypto::generate_secret_key(user_id, &passphrase)?;
+    let parsed = crypto::parse_secret_key(secret_key.as_bytes())?;
+    Ok(GeneratedKey {
+        public_key: crypto::public_key_armored(&parsed)?,
+        fingerprint: crypto::certificate_of(&parsed).fingerprint(),
+        secret_key: secret_key.to_string(),
+    })
+}
+
+/// A new SSH key for this device. `comment` ends its public line: name the device.
 #[uniffi::export]
 pub fn generate_device_key(comment: String) -> Result<DeviceKey, PassError> {
     ssh::generate_key(&comment)
@@ -392,26 +512,12 @@ pub fn device_public_key(private_key: String) -> Result<DeviceKey, PassError> {
     ssh::public_key_of(&private_key)
 }
 
-/// Reads the host key an SSH server presents, authenticating nothing. It is not
-/// trusted by this call: show the fingerprint, and have it compared with the one
-/// read on the server (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`) before pinning it.
+/// Reads the host key a drop zone presents, authenticating nothing. It is not trusted
+/// by this call: show the fingerprint, and have it compared with the one the drop zone
+/// printed when it started (`docker logs pass-dropzone`) before pinning it.
 #[uniffi::export]
 pub fn fetch_host_key(url: String) -> Result<HostKey, PassError> {
     ssh::fetch_host_key(&url)
-}
-
-/// Reads the certificate an https server presents, sending it nothing. Not trusted
-/// by this call either: compare its fingerprint before pinning it.
-#[uniffi::export]
-pub fn fetch_fingerprint(url: String, extra_ca_pem: Option<String>) -> Result<CertificateFingerprint, PassError> {
-    let found = pinned_http::fetch_fingerprint(&url, extra_ca_pem.as_deref()).map_err(|e| match e {
-        pinned_http::Error::Connect(_) | pinned_http::Error::Tls(_) => PassError::Network { message: e.to_string() },
-        _ => PassError::InvalidConfig { message: e.to_string() },
-    })?;
-    Ok(CertificateFingerprint {
-        sha256: found.sha256,
-        chain_valid: found.chain_valid,
-    })
 }
 
 /// The one-time password of an `otpauth://totp/` line at `unix_time` (seconds since 1970).
@@ -427,141 +533,248 @@ pub fn error_message(error: PassError) -> String {
     error.to_string()
 }
 
-fn remote_of(remote: &Remote) -> Result<git::Remote, PassError> {
-    Ok(match remote {
-        Remote::Ssh {
-            url,
-            private_key,
-            host_key,
-        } => git::Remote::Ssh(ssh::SshRemote::new(url, private_key, host_key)?),
-        Remote::Http {
-            url,
-            username,
-            password,
-            trust,
-        } => git::Remote::Http(http::HttpRemote::new(
-            url,
-            username.as_deref(),
-            password.as_deref(),
-            trust.as_ref(),
-        )?),
-    })
+/// A device and its key.
+struct Device {
+    name: String,
+    certificate: Certificate,
 }
 
-/// A branch name made of a device name: `devices/<name>`, with nothing git would refuse.
-fn device_branch(device: &str) -> Result<String, PassError> {
-    let name: String = device
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let name = name.trim_matches('-');
-    if name.is_empty() {
-        return Err(PassError::InvalidConfig {
-            message: "the device needs a name: it names its branch on the remote".into(),
-        });
+/// The entries of the three sides of an update, and what a whole-file merge makes of them.
+struct ThreeWay {
+    base: std::collections::BTreeMap<String, ObjectId>,
+    ours: std::collections::BTreeMap<String, ObjectId>,
+    theirs: std::collections::BTreeMap<String, ObjectId>,
+}
+
+impl ThreeWay {
+    /// Changed on both sides, to different things (one of them may be: removed).
+    fn is_conflict(&self, path: &str) -> bool {
+        let (base, ours, theirs) = (self.base.get(path), self.ours.get(path), self.theirs.get(path));
+        ours != base && theirs != base && ours != theirs
     }
-    Ok(format!("devices/{}", name.to_ascii_lowercase()))
 }
 
 /// A password store on this device.
 #[derive(uniffi::Object)]
 pub struct PassStore {
     root: PathBuf,
-    certificates: Vec<Certificate>,
-    signing_keys: Vec<String>,
-    require_signed_updates: bool,
+    me: Device,
+    /// The other devices, the owner first.
+    peers: Vec<Device>,
     author: git::Author,
-    device_branch: String,
     /// One change or one sync at a time.
     busy: Mutex<()>,
 }
 
 impl PassStore {
     fn new(config: StoreConfig) -> Result<Self, PassError> {
-        let invalid = |message: &str| PassError::InvalidConfig {
-            message: message.to_string(),
-        };
+        let invalid = |message: String| PassError::InvalidConfig { message };
         if config.directory.is_empty() {
-            return Err(invalid("no store directory"));
+            return Err(invalid("no store directory".into()));
         }
-        let mut certificates = Vec::new();
-        for text in &config.public_keys {
-            certificates.extend(Certificate::parse(text.as_bytes())?);
-        }
-        let author = git::Author {
-            name: config.author_name.trim().to_string(),
-            email: config.author_email.trim().to_string(),
+        let check_name = |name: &str| {
+            if is_device_name(name) {
+                Ok(())
+            } else {
+                Err(invalid(format!(
+                    "{name:?} is not a device name: lowercase letters, digits and hyphens, 32 at most, not starting with a hyphen"
+                )))
+            }
         };
-        let unusable = |text: &str| text.is_empty() || text.contains(['<', '>', '\n']);
-        if unusable(&author.name) || unusable(&author.email) {
-            return Err(invalid("commits need an author name and email, with no < > in them"));
+        check_name(&config.device)?;
+        let single = |text: &str, whose: &str| -> Result<Certificate, PassError> {
+            let mut certificates = Certificate::parse(text.as_bytes())?;
+            if certificates.len() != 1 {
+                return Err(invalid(format!(
+                    "the public key of {whose} holds several keys: give the one"
+                )));
+            }
+            Ok(certificates.remove(0))
+        };
+        let me = Device {
+            certificate: single(&config.public_key, &config.device)?,
+            name: config.device,
+        };
+        let mut owner = None;
+        let mut members = Vec::new();
+        for peer in config.peers {
+            check_name(&peer.name)?;
+            if peer.name == me.name || members.iter().chain(&owner).any(|d: &Device| d.name == peer.name) {
+                return Err(invalid(format!("two devices are named {}", peer.name)));
+            }
+            let certificate = single(&peer.public_key, &peer.name)?;
+            // The fingerprint is what was compared by eye: the key must be that one.
+            if certificate.fingerprint() != hex_fingerprint(&peer.fingerprint) {
+                return Err(invalid(format!(
+                    "the public key given for {} is not the one with its fingerprint (it is {})",
+                    peer.name,
+                    certificate.fingerprint()
+                )));
+            }
+            let device = Device {
+                name: peer.name,
+                certificate,
+            };
+            if !peer.is_owner {
+                members.push(device);
+            } else if owner.replace(device).is_some() {
+                return Err(invalid(
+                    "two devices are marked as the owner: there is exactly one".into(),
+                ));
+            }
         }
+        let owner = owner.ok_or_else(|| invalid("no device is marked as the owner: there is exactly one".into()))?;
+        let author = git::Author {
+            email: format!("{}@pass-sync.invalid", me.name),
+            name: me.name.clone(),
+        };
+        let mut peers = vec![owner];
+        peers.extend(members);
         Ok(Self {
             root: PathBuf::from(config.directory),
-            certificates,
-            signing_keys: config.signing_keys.iter().map(|key| hex_fingerprint(key)).collect(),
-            require_signed_updates: config.require_signed_updates,
+            me,
+            peers,
             author,
-            device_branch: device_branch(&config.device)?,
             busy: Mutex::new(()),
         })
     }
 
-    fn repository(&self) -> Result<gix::Repository, PassError> {
-        git::open(&self.root, &self.author)?.ok_or(PassError::NotARepository)
+    fn owner(&self) -> &Device {
+        &self.peers[0]
     }
 
-    /// Who signed `data`, among the store's public keys.
-    fn signature_status(&self, signature: Option<&[u8]>, data: &[u8]) -> SignatureStatus {
-        let Some(signature) = signature else {
-            return SignatureStatus::Unsigned;
-        };
-        match self.certificates.iter().find(|c| c.verifies(signature, data)) {
-            Some(certificate) => SignatureStatus::Valid {
-                fingerprint: certificate.fingerprint(),
+    fn devices(&self) -> impl Iterator<Item = &Device> {
+        std::iter::once(&self.me).chain(&self.peers)
+    }
+
+    /// Where the tip last received from a device is kept: `refs/pass-sync/<name>`.
+    fn reference_of(&self, device: &Device) -> String {
+        format!("refs/pass-sync/{}", device.name)
+    }
+
+    fn owner_reference(&self) -> String {
+        self.reference_of(self.owner())
+    }
+
+    /// Only the owner's updates may change who can read, and anything that is not an entry.
+    fn may_change_non_entries(&self, device: &Device) -> bool {
+        device.name == self.owner().name
+    }
+
+    fn my_reference(&self) -> String {
+        format!("refs/pass-sync/{}", self.me.name)
+    }
+
+    /// The identity must be this device's: the key the others know it by.
+    fn check(&self, identity: &Identity) -> Result<(), PassError> {
+        if identity.fingerprint() == self.me.certificate.fingerprint() {
+            Ok(())
+        } else {
+            Err(PassError::InvalidKey {
+                message: "the unlocked key is not the one this device is set up with".into(),
+            })
+        }
+    }
+
+    /// The repository, once there is a store in it.
+    fn repository(&self) -> Result<gix::Repository, PassError> {
+        let repo = git::open(&self.root, &self.author)?.ok_or(PassError::NoStore)?;
+        if git::head_commit(&repo)?.is_none() {
+            return Err(PassError::NoStore);
+        }
+        Ok(repo)
+    }
+
+    /// Who signed `data`, among the devices.
+    fn signature_status(&self, signature: &[u8], data: &[u8]) -> SignatureStatus {
+        match self
+            .devices()
+            .find(|device| device.certificate.verifies(signature, data))
+        {
+            Some(device) => SignatureStatus::Valid {
+                device: device.name.clone(),
             },
             None => SignatureStatus::Invalid,
         }
     }
 
-    /// The ids of a `.gpg-id` given by path, refused when `signing_keys` is set and
-    /// its `.gpg-id.sig` is not from one of them: what `pass` does with `PASSWORD_STORE_SIGNING_KEY`.
-    fn trusted_ids(&self, gpg_id: &str) -> Result<Vec<String>, PassError> {
+    fn ids_of(&self, gpg_id: &str) -> Result<Vec<String>, PassError> {
         let content = layout::read(&self.root, gpg_id)?;
-        if !self.signing_keys.is_empty() {
-            let signature = std::fs::read(self.root.join(format!("{gpg_id}.sig"))).ok();
-            let signed_by_one_of_them = match self.signature_status(signature.as_deref(), &content) {
-                SignatureStatus::Valid { fingerprint } => self.signing_keys.contains(&fingerprint),
-                _ => false,
-            };
-            if !signed_by_one_of_them {
-                return Err(PassError::UntrustedRecipients {
-                    message: format!("{gpg_id} is not signed by one of the store's signing keys: it is not used"),
-                });
+        Ok(layout::parse_gpg_id(&String::from_utf8_lossy(&content)))
+    }
+
+    /// The device a line of a `.gpg-id` designates, if it is one.
+    fn device_of(&self, id: &str) -> Option<&Device> {
+        self.devices().find(|device| device.certificate.matches(id))
+    }
+
+    fn readers_of(&self, ids: Vec<String>) -> Vec<Reader> {
+        ids.into_iter()
+            .map(|id| Reader {
+                device: self.device_of(&id).map(|device| device.name.clone()),
+                id,
+            })
+            .collect()
+    }
+
+    /// Who can read `name`: an entry, existing or not. `file` is its encrypted content when it exists.
+    fn access_of(&self, name: &str, file: Option<&[u8]>) -> Result<Access, PassError> {
+        let gpg_id = match layout::governing_gpg_id(&self.root, name) {
+            Ok(gpg_id) => gpg_id,
+            Err(PassError::NotInitialized) => String::new(),
+            Err(e) => return Err(e),
+        };
+        let readers = if gpg_id.is_empty() {
+            Vec::new()
+        } else {
+            self.readers_of(self.ids_of(&gpg_id)?)
+        };
+        let listed = readers
+            .iter()
+            .any(|reader| reader.device.as_deref() == Some(self.me.name.as_str()));
+        let Some(file) = file else {
+            return Ok(Access {
+                gpg_id,
+                readers,
+                listed,
+                encrypted_to: Vec::new(),
+                readable: listed,
+                matches: true,
+            });
+        };
+        let key_ids = crypto::recipient_key_ids(file).unwrap_or_default();
+        // What the `.gpg-id` asks for, as far as this device can tell: the keys of the devices among
+        // its readers. A reader that is no device has a key this cannot name, only count.
+        let mut wanted = BTreeSet::new();
+        for reader in &readers {
+            if let Some(device) = self.device_of(&reader.id) {
+                wanted.insert(device.certificate.encryption_key_id()?);
             }
         }
-        Ok(layout::parse_gpg_id(&String::from_utf8_lossy(&content)))
+        let unknown = readers.iter().filter(|reader| reader.device.is_none()).count();
+        let matches = wanted.iter().all(|key_id| key_ids.contains(key_id)) && key_ids.len() == wanted.len() + unknown;
+        Ok(Access {
+            gpg_id,
+            readers,
+            listed,
+            encrypted_to: self.readers(file),
+            readable: key_ids.iter().any(|key_id| self.me.certificate.has_key_id(key_id)),
+            matches,
+        })
     }
 
     /// The public keys an entry is to be encrypted to. All of them or an error:
     /// an entry is never written for fewer readers than the store says.
     fn recipients_of(&self, name: &str) -> Result<Vec<&Certificate>, PassError> {
-        let ids = self.trusted_ids(&layout::governing_gpg_id(&self.root, name)?)?;
+        let ids = self.ids_of(&layout::governing_gpg_id(&self.root, name)?)?;
         if ids.is_empty() {
             return Err(PassError::NotInitialized);
         }
         let mut recipients: Vec<&Certificate> = Vec::new();
         for id in ids {
             let certificate = self
-                .certificates
-                .iter()
+                .devices()
+                .map(|device| &device.certificate)
                 .find(|certificate| certificate.matches(&id))
                 .ok_or(PassError::UnknownRecipient { id })?;
             if !recipients
@@ -572,6 +785,22 @@ impl PassStore {
             }
         }
         Ok(recipients)
+    }
+
+    /// Who an encrypted file can be read by: device names, or key ids for keys that are no device's.
+    fn readers(&self, ciphertext: &[u8]) -> Vec<String> {
+        let mut readers: Vec<String> = crypto::recipient_key_ids(ciphertext)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|key_id| {
+                self.devices()
+                    .find(|device| device.certificate.has_key_id(&key_id))
+                    .map(|device| device.name.clone())
+                    .unwrap_or(format!("key {key_id}"))
+            })
+            .collect();
+        readers.sort();
+        readers
     }
 
     fn exists(&self, name: &str) -> bool {
@@ -591,164 +820,324 @@ impl PassStore {
         crypto::encrypt(content.as_bytes(), &self.recipients_of(name)?)
     }
 
-    /// Commits the edits (when the store is a repository), then writes them to the directory.
+    /// Commits the edits (signed), then moves the directory to that commit.
+    /// Only ever called with entry files: a member changes nothing else.
     fn apply(&self, edits: Vec<git::Edit>, message: &str, identity: &Identity) -> Result<(), PassError> {
-        if let Some(repo) = git::open(&self.root, &self.author)? {
-            git::commit(&repo, &edits, message, &self.author, Some(&identity.inner))?;
-        }
-        for (path, content) in &edits {
-            match content {
-                Some(content) => layout::write(&self.root, path, content)?,
-                None => layout::remove(&self.root, path)?,
-            }
-        }
+        self.check(identity)?;
+        debug_assert!(edits.iter().all(|(path, _)| entry_name(path).is_some()));
+        let repo = self.repository()?;
+        let head = git::head_commit(&repo)?.ok_or(PassError::NoStore)?;
+        let tree = git::edit_tree(&repo, Some(git::tree_of(&repo, head)?), &edits)?;
+        let commit = git::write_commit(&repo, tree, &[head], message, &self.author, &identity.inner)?;
+        git::move_to(&repo, commit, &format!("commit: {message}"))?;
         Ok(())
     }
 
+    fn published_at_file(&self) -> PathBuf {
+        self.root.join(".git").join("pass-sync-published-at")
+    }
+
+    fn owner_published_at(&self) -> i64 {
+        std::fs::read_to_string(self.published_at_file())
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
     fn state_of(&self, repo: &gix::Repository) -> Result<SyncState, PassError> {
-        let branch = git::branch(repo)?;
         let head = git::head_commit(repo)?;
-        let main = git::remote_tip(repo, &branch);
-        let device = git::remote_tip(repo, &self.device_branch);
-        let (unmerged, behind) = git::ahead_behind(repo, head, main)?;
-        let unpushed = match head {
-            Some(head) if unmerged > 0 => {
-                let mut local = git::ancestors(repo, head)?;
-                for tip in [main, device].into_iter().flatten() {
-                    for commit in git::ancestors(repo, tip)? {
-                        local.remove(&commit);
-                    }
-                }
-                local.len() as u32
-            }
+        let owner = git::reference(repo, &self.owner_reference());
+        let outstanding = match (head, owner) {
+            (Some(head), Some(owner)) => git::commits_since(repo, Some(owner), head)?.len() as u32,
             _ => 0,
         };
-        let (last_subject, last_time) = match head {
-            Some(head) => git::summary(repo, head)?,
-            None => (String::new(), 0),
+        let update_waiting = match (head, owner) {
+            (_, None) => false,
+            (None, Some(_)) => true,
+            (Some(head), Some(owner)) => !git::ancestors(repo, head)?.contains(&owner),
         };
+        let last = head.map(|head| git::summary(repo, head)).transpose()?;
         Ok(SyncState {
-            is_repository: true,
-            branch,
-            device_branch: self.device_branch.clone(),
-            last_subject,
-            last_time,
-            unmerged,
-            unpushed,
-            behind,
+            has_store: head.is_some(),
+            outstanding,
+            unpublished: head.is_some() && head != git::reference(repo, &self.my_reference()),
+            update_waiting,
+            owner_published_at: self.owner_published_at(),
+            last_subject: last.as_ref().map(|last| last.subject.clone()).unwrap_or_default(),
+            last_time: last.map(|last| last.time).unwrap_or(0),
         })
     }
 
-    fn commit_signature(&self, repo: &gix::Repository, commit: ObjectId) -> Result<SignatureStatus, PassError> {
-        Ok(match git::signature_of(repo, commit)? {
-            Some(found) => self.signature_status(Some(&found.signature), &found.signed),
-            None => SignatureStatus::Unsigned,
-        })
-    }
-
-    /// What taking the main branch up to `to` would change.
-    fn describe_update(
+    /// The three sides of what `from` published and is not here: where the histories last agreed,
+    /// here, and theirs. `None` when there is nothing to take.
+    #[allow(clippy::type_complexity)]
+    fn update_sides(
         &self,
         repo: &gix::Repository,
-        from: Option<ObjectId>,
-        to: ObjectId,
-    ) -> Result<PendingUpdate, PassError> {
-        let (_, commits) = git::ahead_behind(repo, from, Some(to))?;
-        let changes = git::changes(repo, from, to)?;
-        let after_files = git::files(repo, to)?;
-        let ids = |blob: Option<ObjectId>| -> Result<Vec<String>, PassError> {
+        from: &Device,
+    ) -> Result<Option<(Option<ObjectId>, Option<ObjectId>, ObjectId)>, PassError> {
+        let head = git::head_commit(repo)?;
+        let Some(theirs) = git::reference(repo, &self.reference_of(from)) else {
+            return Ok(None);
+        };
+        let base = match head {
+            None => None,
+            Some(head) if git::ancestors(repo, head)?.contains(&theirs) => return Ok(None),
+            Some(head) => git::merge_base(repo, head, theirs)?,
+        };
+        Ok(Some((base, head, theirs)))
+    }
+
+    fn three_way(
+        &self,
+        repo: &gix::Repository,
+        base: Option<ObjectId>,
+        ours: Option<ObjectId>,
+        theirs: ObjectId,
+    ) -> Result<ThreeWay, PassError> {
+        Ok(ThreeWay {
+            base: git::files_at(repo, base)?,
+            ours: git::files_at(repo, ours)?,
+            theirs: git::files(repo, theirs)?,
+        })
+    }
+
+    /// What taking the tip `from` published would do, for the review.
+    fn describe_update(&self, repo: &gix::Repository, from: &Device) -> Result<Option<PendingUpdate>, PassError> {
+        let Some((base, head, theirs)) = self.update_sides(repo, from)? else {
+            return Ok(None);
+        };
+        let sides = self.three_way(repo, base, head, theirs)?;
+        let new_commits = git::commits_since(repo, head, theirs)?;
+        let mut commits = Vec::new();
+        for id in new_commits.iter().take(MAX_LISTED_COMMITS) {
+            let summary = git::summary(repo, *id)?;
+            commits.push(CommitInfo {
+                id: id.to_string(),
+                subject: summary.subject,
+                author: summary.author,
+                time: summary.time,
+                signature: match git::signature_of(repo, *id)? {
+                    Some(found) => self.signature_status(&found.signature, &found.signed),
+                    None => SignatureStatus::Unsigned,
+                },
+            });
+        }
+        let ids = |blob: Option<ObjectId>| -> Result<Vec<Reader>, PassError> {
             Ok(match blob {
-                Some(blob) => layout::parse_gpg_id(&String::from_utf8_lossy(&git::blob(repo, blob)?)),
+                Some(blob) => self.readers_of(layout::parse_gpg_id(&String::from_utf8_lossy(&git::blob(repo, blob)?))),
                 None => Vec::new(),
             })
         };
-        let mut update = PendingUpdate {
-            commit: to.to_string(),
-            commits,
-            changed: Vec::new(),
-            recipient_changes: Vec::new(),
-            signature: self.commit_signature(repo, to)?,
+        let readers = |blob: Option<ObjectId>| -> Result<Vec<String>, PassError> {
+            Ok(match blob {
+                Some(blob) => self.readers(&git::blob(repo, blob)?),
+                None => Vec::new(),
+            })
         };
+
+        let mut update = PendingUpdate {
+            commit: theirs.to_string(),
+            published_at: self.owner_published_at(),
+            commits,
+            commit_count: new_commits.len() as u32,
+            entries: Vec::new(),
+            recipient_changes: Vec::new(),
+            other_files: Vec::new(),
+            outstanding: match head {
+                Some(head) => git::commits_since(repo, Some(theirs), head)?.len() as u32,
+                None => 0,
+            },
+        };
+        let changes = git::changes(repo, base, theirs)?;
+        // The same content gone from one name and come under another is a rename.
+        let mut renamed_from: std::collections::BTreeMap<String, String> = Default::default();
+        let mut renamed_away = BTreeSet::new();
+        for added in changes
+            .iter()
+            .filter(|c| c.before.is_none() && entry_name(&c.path).is_some())
+        {
+            let source = changes.iter().find(|removed| {
+                removed.after.is_none()
+                    && removed.before == added.after
+                    && entry_name(&removed.path).is_some()
+                    && !renamed_away.contains(&removed.path)
+            });
+            if let Some(source) = source {
+                renamed_away.insert(source.path.clone());
+                renamed_from.insert(added.path.clone(), source.path.clone());
+            }
+        }
         for change in changes {
-            let file_name = change.path.rsplit('/').next().unwrap_or("");
-            if file_name == layout::GPG_ID {
-                let signature = match (change.after, after_files.get(&format!("{}.sig", change.path))) {
-                    (Some(content), Some(signature)) => {
-                        self.signature_status(Some(&git::blob(repo, *signature)?), &git::blob(repo, content)?)
-                    }
-                    _ => SignatureStatus::Unsigned,
-                };
+            if change.path.rsplit('/').next() == Some(layout::GPG_ID) {
                 update.recipient_changes.push(RecipientChange {
                     before: ids(change.before)?,
                     after: ids(change.after)?,
                     path: change.path,
-                    signature,
                 });
-            } else if let Some(name) = change.path.strip_suffix(".gpg") {
-                if layout::clean_name(name).is_ok() {
-                    update.changed.push(name.to_string());
-                }
+                continue;
             }
+            let Some(name) = entry_name(&change.path) else {
+                update.other_files.push(change.path);
+                continue;
+            };
+            // A rename is told once, under the new name; unless this device changed the old one.
+            if renamed_away.contains(&change.path) && !sides.is_conflict(&change.path) {
+                continue;
+            }
+            let kind = match (&change.before, &change.after, renamed_from.get(&change.path)) {
+                (_, None, _) => ChangeKind::Removed,
+                (None, Some(_), Some(from)) => ChangeKind::Renamed {
+                    from: entry_name(from).unwrap_or(from).to_string(),
+                },
+                (None, Some(_), None) => ChangeKind::Added,
+                (Some(_), Some(_), _) => ChangeKind::Changed,
+            };
+            let (mut readers_before, mut readers_after) = (readers(change.before)?, readers(change.after)?);
+            if change.after.is_none() || (change.before.is_some() && readers_before == readers_after) {
+                readers_before.clear();
+                readers_after.clear();
+            }
+            update.entries.push(EntryChange {
+                name: name.to_string(),
+                kind,
+                readers_before,
+                readers_after,
+                conflict: sides.is_conflict(&change.path),
+            });
         }
-        Ok(update)
+        Ok(Some(update))
     }
 
-    /// Takes the main branch as last fetched, when that is a fast-forward and nothing in it needs to be seen first.
-    fn take_main(&self, repo: &gix::Repository) -> Result<PullOutcome, PassError> {
-        let head = git::head_commit(repo)?;
-        let Some(main) = git::remote_tip(repo, &git::branch(repo)?) else {
-            return Ok(PullOutcome::UpToDate);
+    /// Takes the file of the device `from` out of what the drop zone served, when it is one to take.
+    fn receive(
+        &self,
+        repo: &gix::Repository,
+        file: Option<Vec<u8>>,
+        from: &Device,
+        identity: &Identity,
+    ) -> Result<FetchOutcome, PassError> {
+        let Some(file) = file else {
+            return Ok(FetchOutcome::NothingPublished);
         };
-        let (unmerged, behind) = git::ahead_behind(repo, head, Some(main))?;
-        if behind == 0 {
-            return Ok(PullOutcome::UpToDate);
+        let owner = from;
+        let reference = self.reference_of(from);
+        // 1. It decrypts, and is signed by the owner's key.
+        let (bundle, published_at) = identity
+            .inner
+            .open_sealed(&file, &owner.certificate, MAX_PUBLISHED_FILE)?;
+        // 2. One reference, the owner's.
+        let header = bundle::read_header(&bundle, &reference)?;
+        let held = git::reference(repo, &reference);
+        if held == Some(header.tip) {
+            return Ok(FetchOutcome::Unchanged);
         }
-        if unmerged > 0 {
-            return Ok(PullOutcome::Diverged { unmerged, behind });
+        if let Some(held) = held {
+            if git::ancestors(repo, held)?.contains(&header.tip) {
+                return Ok(FetchOutcome::Stale { published_at });
+            }
         }
-        let update = self.describe_update(repo, head, main)?;
-        if !update.recipient_changes.is_empty() {
-            return Ok(PullOutcome::NeedsReview { update });
-        }
-        self.fast_forward(repo, main, &update)?;
-        Ok(PullOutcome::FastForwarded {
-            commits: update.commits,
-            changed: update.changed,
+        // 3. Complete. Its objects are in the repository after this, and nothing else has changed.
+        bundle::unpack(repo.git_dir(), &bundle, &header, || {
+            git::open(&self.root, &self.author)?.ok_or(PassError::NoStore)
+        })?;
+        let repo = git::open(&self.root, &self.author)?.ok_or(PassError::NoStore)?;
+        git::set_reference(&repo, &reference, header.tip, "pass sync: received")?;
+        std::fs::write(self.published_at_file(), published_at.to_string()).map_err(|e| PassError::Io {
+            message: format!("cannot note when the owner published: {e}"),
+        })?;
+        Ok(FetchOutcome::Received {
+            update: self.describe_update(&repo, from)?,
         })
     }
 
-    fn fast_forward(&self, repo: &gix::Repository, to: ObjectId, update: &PendingUpdate) -> Result<(), PassError> {
-        if self.require_signed_updates && !matches!(update.signature, SignatureStatus::Valid { .. }) {
-            return Err(PassError::UntrustedUpdate {
-                message: format!(
-                    "the last commit of the update ({}) is not signed by a key of this store: it is not taken",
-                    &update.commit[..update.commit.len().min(8)]
-                ),
-            });
-        }
-        git::move_to(repo, to, "pull: fast-forward")?;
-        Ok(())
+    /// The file this device publishes: its whole history, signed, for every device.
+    fn sealed_bundle(&self, repo: &gix::Repository, tip: ObjectId, identity: &Identity) -> Result<Vec<u8>, PassError> {
+        let bundle = bundle::write(repo, tip, &self.my_reference())?;
+        let recipients: Vec<&Certificate> = self.devices().map(|device| &device.certificate).collect();
+        identity.inner.seal(bundle, &recipients)
     }
 
-    /// Sends this device's unmerged commits to its branch. Returns how many were new there.
-    fn push_device_branch(&self, repo: &gix::Repository, remote: &git::Remote, force: bool) -> Result<u32, PassError> {
-        let state = self.state_of(repo)?;
-        let Some(head) = git::head_commit(repo)? else {
-            return Ok(0);
+    /// Merges the tip `theirs`, published by `from`, into this device's line at `head`:
+    /// a signed merge commit, which is returned. Entries are merged as whole files, the
+    /// user's `choices` deciding where both sides changed one. What is not an entry is
+    /// taken from `from` when it is the owner, and left as it is here otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn merge(
+        &self,
+        repo: &gix::Repository,
+        sides: &ThreeWay,
+        head: ObjectId,
+        theirs: ObjectId,
+        from: &Device,
+        choices: &[Choice],
+        identity: &Identity,
+    ) -> Result<ObjectId, PassError> {
+        // The tree the merge starts from decides whose non-entries stay.
+        let from_theirs = self.may_change_non_entries(from);
+        let (start, started_with) = if from_theirs {
+            (theirs, &sides.theirs)
+        } else {
+            (head, &sides.ours)
         };
-        let on_remote = git::remote_tip(repo, &self.device_branch);
-        if !force && (state.unmerged == 0 || on_remote == Some(head)) {
-            return Ok(0);
+        let mut edits: Vec<git::Edit> = Vec::new();
+        let mut undecided = Vec::new();
+        let paths: BTreeSet<&String> = sides
+            .base
+            .keys()
+            .chain(sides.ours.keys())
+            .chain(sides.theirs.keys())
+            .collect();
+        for path in paths {
+            let Some(name) = entry_name(path) else { continue };
+            let keep_mine = if sides.is_conflict(path) {
+                match choices.iter().find(|choice| choice.name == name) {
+                    Some(choice) => choice.keep == Side::Mine,
+                    None => {
+                        undecided.push(name.to_string());
+                        continue;
+                    }
+                }
+            } else {
+                // Changed here only: here wins. Otherwise theirs, changed or not.
+                sides.theirs.get(path) == sides.base.get(path)
+            };
+            let kept = if keep_mine {
+                sides.ours.get(path)
+            } else {
+                sides.theirs.get(path)
+            };
+            // Only what differs from the starting tree is written.
+            if kept != started_with.get(path) {
+                let content = kept.map(|blob| git::blob(repo, *blob)).transpose()?;
+                edits.push((path.clone(), content));
+            }
         }
-        let pushed = push::push(repo, remote, head, &self.device_branch, force)?;
-        git::set_remote_tip(repo, &self.device_branch, head)?;
-        Ok(if pushed { state.unpushed } else { 0 })
+        if !undecided.is_empty() {
+            return Err(PassError::ChoiceRequired { names: undecided });
+        }
+        let tree = git::edit_tree(repo, Some(git::tree_of(repo, start)?), &edits)?;
+        let message = format!("Merge the changes of {} into those of {}.", from.name, self.me.name);
+        git::write_commit(repo, tree, &[head, theirs], &message, &self.author, &identity.inner)
+    }
+
+    fn version(&self, repo: &gix::Repository, blob: Option<&ObjectId>, identity: &Identity) -> EntryVersion {
+        let Some(blob) = blob else {
+            return EntryVersion::Absent;
+        };
+        let decrypted = git::blob(repo, *blob).and_then(|ciphertext| identity.inner.decrypt(&ciphertext));
+        match decrypted {
+            Ok(content) => EntryVersion::Content {
+                text: String::from_utf8_lossy(&content).into_owned(),
+            },
+            Err(e) => EntryVersion::Unreadable { reason: e.to_string() },
+        }
     }
 }
 
 #[uniffi::export]
 impl PassStore {
-    /// Opens the store at `config.directory`. Reads nothing yet.
+    /// Opens the store at `config.directory`, which may not exist yet. Reads nothing.
     #[uniffi::constructor]
     pub fn open(config: StoreConfig) -> Result<Arc<Self>, PassError> {
         Self::new(config).map(Arc::new)
@@ -767,8 +1156,8 @@ impl PassStore {
         Ok(layout::search(&self.list()?, &query))
     }
 
-    /// Every `.gpg-id` of the store, with what this device knows of its recipients.
-    /// To show after a clone, before anything is written.
+    /// Every `.gpg-id` of the store, and the recipients in it that are no device's key.
+    /// Read-only: who can read what is the owner's to set.
     pub fn recipient_files(&self) -> Result<Vec<RecipientFile>, PassError> {
         fn walk(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) {
             let Ok(items) = std::fs::read_dir(dir) else { return };
@@ -788,17 +1177,14 @@ impl PassStore {
         paths.sort();
         let mut files = Vec::new();
         for path in paths {
-            let content = layout::read(&self.root, &path)?;
-            let signature = std::fs::read(self.root.join(format!("{path}.sig"))).ok();
-            let ids = layout::parse_gpg_id(&String::from_utf8_lossy(&content));
+            let readers = self.readers_of(self.ids_of(&path)?);
             files.push(RecipientFile {
-                unknown: ids
+                unknown: readers
                     .iter()
-                    .filter(|id| !self.certificates.iter().any(|certificate| certificate.matches(id)))
-                    .cloned()
+                    .filter(|reader| reader.device.is_none())
+                    .map(|reader| reader.id.clone())
                     .collect(),
-                signature: self.signature_status(signature.as_deref(), &content),
-                ids,
+                readers,
                 path,
             });
         }
@@ -808,7 +1194,46 @@ impl PassStore {
     /// The ids an entry (existing or not) is encrypted to: the lines of the `.gpg-id` that governs it.
     pub fn recipients(&self, name: String) -> Result<Vec<String>, PassError> {
         let name = layout::clean_name(&name)?;
-        self.trusted_ids(&layout::governing_gpg_id(&self.root, &name)?)
+        self.ids_of(&layout::governing_gpg_id(&self.root, &name)?)
+    }
+
+    /// Who can read an entry: the readers its `.gpg-id` lists, who the file is really
+    /// encrypted to, and whether this device is among them. Needs no key.
+    pub fn entry_access(&self, name: String) -> Result<Access, PassError> {
+        let name = layout::clean_name(&name)?;
+        if !self.exists(&name) {
+            return Err(PassError::NotFound { name });
+        }
+        let file = layout::read(&self.root, &layout::file_of(&name))?;
+        self.access_of(&name, Some(&file))
+    }
+
+    /// Who can read what is put in a folder (`""` for the top of the store): the readers
+    /// of the `.gpg-id` that governs it. To write there, this device needs every one of them to be a device.
+    pub fn folder_access(&self, folder: String) -> Result<Access, PassError> {
+        let folder = folder.trim_matches('/');
+        let inside = if folder.is_empty() {
+            "entry".to_string()
+        } else {
+            format!("{}/entry", layout::clean_name(folder)?)
+        };
+        self.access_of(&inside, None)
+    }
+
+    /// The entries this device cannot decrypt: not encrypted to its key. Needs no key itself.
+    pub fn unreadable(&self) -> Result<Vec<String>, PassError> {
+        let mut locked = Vec::new();
+        for name in self.list()? {
+            let file = layout::read(&self.root, &layout::file_of(&name))?;
+            let for_me = crypto::recipient_key_ids(&file)
+                .unwrap_or_default()
+                .iter()
+                .any(|key_id| self.me.certificate.has_key_id(key_id));
+            if !for_me {
+                locked.push(name);
+            }
+        }
+        Ok(locked)
     }
 
     /// Decrypts an entry. Nothing is written anywhere.
@@ -948,110 +1373,138 @@ impl PassStore {
         match git::open(&self.root, &self.author)? {
             Some(repo) => self.state_of(&repo),
             None => Ok(SyncState {
-                is_repository: false,
-                branch: String::new(),
-                device_branch: self.device_branch.clone(),
+                has_store: false,
+                outstanding: 0,
+                unpublished: false,
+                update_waiting: false,
+                owner_published_at: 0,
                 last_subject: String::new(),
                 last_time: 0,
-                unmerged: 0,
-                unpushed: 0,
-                behind: 0,
             }),
         }
     }
 
-    /// Fetches, and takes the main branch when that is a fast-forward and it does
-    /// not change who the store is encrypted to. Never merges: see [`PullOutcome`].
-    pub fn pull(&self, remote: Remote) -> Result<PullOutcome, PassError> {
+    /// One visit to the drop zone: publishes this device's tip when it is not the one
+    /// last published, then looks at the owner's file. What the owner published is
+    /// received (checked, and kept aside) but never applied: see [`Self::pending_update`].
+    pub fn sync(&self, zone: DropZone, identity: Arc<Identity>) -> Result<SyncReport, PassError> {
         let _busy = self.busy.lock().unwrap();
-        let repo = self.repository()?;
-        git::fetch(&repo, &remote_of(&remote)?)?;
-        self.take_main(&repo)
-    }
+        self.check(&identity)?;
+        let remote = ssh::SshRemote::new(&zone.url, &zone.private_key, &zone.host_key)?;
+        let repo = git::open_or_init(&self.root, &self.author)?;
+        let mut sftp = sftp::Sftp::connect(&remote)?;
 
-    /// Takes an update that [`PullOutcome::NeedsReview`] showed, exactly that one:
-    /// `commit` is [`PendingUpdate::commit`]. No network: what was agreed to is what is taken.
-    pub fn accept_update(&self, commit: String) -> Result<PullOutcome, PassError> {
-        let _busy = self.busy.lock().unwrap();
-        let repo = self.repository()?;
-        let stale = || {
-            git::git_error(
-                "cannot take this update",
-                "it is not the one that was fetched last: pull again",
-            )
+        let mut published = false;
+        if let Some(head) = git::head_commit(&repo)? {
+            if git::reference(&repo, &self.my_reference()) != Some(head) {
+                let file = self.sealed_bundle(&repo, head, &identity)?;
+                sftp.publish(&format!("{}.bundle.gpg", self.me.name), &file)?;
+                git::set_reference(&repo, &self.my_reference(), head, "pass sync: published")?;
+                published = true;
+            }
+        }
+
+        let name = format!("{}.bundle.gpg", self.owner().name);
+        let fetch = match sftp.download(&name, MAX_PUBLISHED_FILE) {
+            Ok(file) => self.receive(&repo, file, self.owner(), &identity),
+            Err(e) => Err(e),
         };
-        let to = ObjectId::from_hex(commit.as_bytes()).map_err(|_| stale())?;
-        let head = git::head_commit(&repo)?;
-        if git::remote_tip(&repo, &git::branch(&repo)?) != Some(to) {
-            return Err(stale());
-        }
-        let (unmerged, behind) = git::ahead_behind(&repo, head, Some(to))?;
-        if unmerged > 0 {
-            return Err(PassError::Diverged {
-                ahead: unmerged,
-                behind,
-            });
-        }
-        let update = self.describe_update(&repo, head, to)?;
-        self.fast_forward(&repo, to, &update)?;
-        Ok(PullOutcome::FastForwarded {
-            commits: update.commits,
-            changed: update.changed,
-        })
-    }
-
-    /// Sends this device's commits to its own branch on the remote, `devices/<device>`,
-    /// forward only. Never to the main branch. Returns how many commits were new there.
-    pub fn push(&self, remote: Remote) -> Result<u32, PassError> {
-        let _busy = self.busy.lock().unwrap();
-        let repo = self.repository()?;
-        self.push_device_branch(&repo, &remote_of(&remote)?, false)
-    }
-
-    /// Pull, then push: one call for the sync button.
-    pub fn sync(&self, remote: Remote) -> Result<SyncReport, PassError> {
-        let _busy = self.busy.lock().unwrap();
-        let repo = self.repository()?;
-        let remote = remote_of(&remote)?;
-        git::fetch(&repo, &remote)?;
-        let pull = self.take_main(&repo)?;
-        let pushed = self.push_device_branch(&repo, &remote, false)?;
+        // What makes a file not one to take is told, not thrown: the rest of the sync happened.
+        let fetch = match fetch {
+            Ok(outcome) => outcome,
+            Err(e @ (PassError::UntrustedFile { .. } | PassError::BadBundle { .. } | PassError::TooLarge)) => {
+                FetchOutcome::Refused { reason: e.to_string() }
+            }
+            Err(e) => return Err(e),
+        };
+        let repo = git::open(&self.root, &self.author)?.ok_or(PassError::NoStore)?;
         Ok(SyncReport {
-            pull,
-            pushed,
+            published,
+            fetch,
             state: self.state_of(&repo)?,
         })
     }
 
-    /// Gives up the changes made on this device that are not merged: the store goes
-    /// back to the main branch as the remote has it now, and the device's branch on
-    /// the remote is moved there too (the one push that is not forward only).
-    /// Returns how many commits were dropped. An update that changes the recipients is
-    /// not taken this way: it is refused, to be reviewed with a pull first.
-    pub fn discard_local_commits(&self, remote: Remote) -> Result<u32, PassError> {
+    /// What the owner has published that is not in the store yet, described. `None` when there is nothing to take.
+    pub fn pending_update(&self) -> Result<Option<PendingUpdate>, PassError> {
+        match git::open(&self.root, &self.author)? {
+            Some(repo) => self.describe_update(&repo, self.owner()),
+            None => Ok(None),
+        }
+    }
+
+    /// An entry of the pending update, decrypted: before the owner's changes, on this
+    /// device, and in the update. `name` is an [`EntryChange::name`] (or its `from`).
+    pub fn update_versions(&self, name: String, identity: Arc<Identity>) -> Result<EntryVersions, PassError> {
+        let path = layout::file_of(&layout::clean_name(&name)?);
+        let repo = git::open(&self.root, &self.author)?.ok_or(PassError::NoStore)?;
+        let (base, head, theirs) = self.update_sides(&repo, self.owner())?.ok_or(PassError::StaleUpdate)?;
+        let sides = self.three_way(&repo, base, head, theirs)?;
+        Ok(EntryVersions {
+            before: self.version(&repo, sides.base.get(&path), &identity),
+            mine: self.version(&repo, sides.ours.get(&path), &identity),
+            theirs: self.version(&repo, sides.theirs.get(&path), &identity),
+        })
+    }
+
+    /// Takes the update that was shown: `commit` is [`PendingUpdate::commit`], and it must
+    /// still be the one waiting. No network. Returns the entries that changed here.
+    ///
+    /// With no commit of this device outstanding, the store moves forward to the owner's
+    /// tip. Otherwise the owner's tip is merged, in a signed merge commit: an entry changed
+    /// on one side only keeps that side's version; changed on both, it needs a [`Choice`]
+    /// (`ChoiceRequired` names the ones that are missing); everything that is not an entry
+    /// is the owner's.
+    pub fn accept_update(
+        &self,
+        commit: String,
+        choices: Vec<Choice>,
+        identity: Arc<Identity>,
+    ) -> Result<Vec<String>, PassError> {
+        let _busy = self.busy.lock().unwrap();
+        self.check(&identity)?;
+        let repo = git::open(&self.root, &self.author)?.ok_or(PassError::NoStore)?;
+        let (base, head, theirs) = self.update_sides(&repo, self.owner())?.ok_or(PassError::StaleUpdate)?;
+        if ObjectId::from_hex(commit.as_bytes()).ok() != Some(theirs) {
+            return Err(PassError::StaleUpdate);
+        }
+        let outstanding = match head {
+            Some(head) => git::commits_since(&repo, Some(theirs), head)?,
+            None => Vec::new(),
+        };
+        let target = match head {
+            Some(head) if !outstanding.is_empty() => {
+                let sides = self.three_way(&repo, base, Some(head), theirs)?;
+                self.merge(&repo, &sides, head, theirs, self.owner(), &choices, &identity)?
+            }
+            _ => theirs,
+        };
+        let changed = git::move_to(&repo, target, "pass sync: accepted the owner's update")?;
+        Ok(changed
+            .iter()
+            .filter_map(|path| entry_name(path))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Gives up the commits of this device that the owner has not taken: the store goes
+    /// back to the owner's history as it was last accepted. Returns how many were
+    /// dropped. No network: sync afterwards, to publish where this device now stands.
+    pub fn discard_outstanding(&self) -> Result<u32, PassError> {
         let _busy = self.busy.lock().unwrap();
         let repo = self.repository()?;
-        let remote = remote_of(&remote)?;
-        git::fetch(&repo, &remote)?;
-        let head = git::head_commit(&repo)?;
-        let main = git::remote_tip(&repo, &git::branch(&repo)?)
-            .ok_or_else(|| git::git_error("cannot discard", "the remote has no main branch"))?;
-        let (unmerged, _) = git::ahead_behind(&repo, head, Some(main))?;
-        if unmerged == 0 {
+        let head = git::head_commit(&repo)?.ok_or(PassError::NoStore)?;
+        let Some(owner) = git::reference(&repo, &self.owner_reference()) else {
             return Ok(0);
+        };
+        // Not the owner's tip itself when an update is waiting: that one has not been accepted.
+        let target = git::merge_base(&repo, head, owner)?
+            .ok_or_else(|| git::git_error("cannot go back", "this device shares no history with the owner"))?;
+        let dropped = git::commits_since(&repo, Some(target), head)?.len() as u32;
+        if dropped > 0 {
+            git::move_to(&repo, target, "pass sync: dropped this device's changes")?;
         }
-        // This device never writes a .gpg-id: any difference there is what the main branch brings.
-        let update = self.describe_update(&repo, head, main)?;
-        if !update.recipient_changes.is_empty() {
-            return Err(PassError::UntrustedRecipients {
-                message: "the main branch changes who the store is encrypted to: this cannot be taken while discarding. Have this device's branch merged on the computer instead".into(),
-            });
-        }
-        self.fast_forward(&repo, main, &update)?;
-        if git::remote_tip(&repo, &self.device_branch).is_some() {
-            self.push_device_branch(&repo, &remote, true)?;
-        }
-        Ok(unmerged)
+        Ok(dropped)
     }
 }
 
@@ -1064,26 +1517,37 @@ fn with_final_newline(content: String) -> Zeroizing<String> {
     content
 }
 
-/// Clones the remote into `config.directory`, which must be empty or absent, and
-/// opens the store. Look at [`PassStore::recipient_files`] before writing to it.
-#[uniffi::export]
-pub fn clone_store(config: StoreConfig, remote: Remote) -> Result<Arc<PassStore>, PassError> {
-    let store = PassStore::new(config)?;
-    git::clone(&store.root, &remote_of(&remote)?, &store.author)?;
-    Ok(Arc::new(store))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn device_branches() {
-        assert_eq!(device_branch("phone").unwrap(), "devices/phone");
-        assert_eq!(device_branch(" Alice's iPhone ").unwrap(), "devices/alice-s-iphone");
-        assert_eq!(device_branch("a/../b").unwrap(), "devices/a----b");
-        assert!(device_branch("").is_err());
-        assert!(device_branch(" ..//.. ").is_err());
+    fn device_names() {
+        for good in ["pc", "phone", "0", "alices-iphone-15", &"a".repeat(32)] {
+            assert!(is_device_name(good), "{good:?}");
+        }
+        for bad in ["", "-phone", "Phone", "my phone", "a/b", "../x", "é", &"a".repeat(33)] {
+            assert!(!is_device_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_entries_are_a_members_to_change() {
+        assert_eq!(entry_name("bank.gpg"), Some("bank"));
+        assert_eq!(entry_name("Email/work.gpg"), Some("Email/work"));
+        for not_an_entry in [
+            ".gpg-id",
+            "work/.gpg-id",
+            ".gpg-id.sig",
+            ".gitattributes",
+            ".extensions/hook.bash",
+            ".extensions/x.gpg",
+            "notes.txt",
+            ".gpg",
+            "a/.hidden.gpg",
+        ] {
+            assert_eq!(entry_name(not_an_entry), None, "{not_an_entry}");
+        }
     }
 
     #[test]
@@ -1092,34 +1556,53 @@ mod tests {
             error_message(PassError::NotFound { name: "bank".into() }),
             "bank is not in the password store"
         );
-        assert!(error_message(PassError::Diverged { ahead: 2, behind: 1 }).contains("2 change(s)"));
+        assert_eq!(
+            error_message(PassError::ChoiceRequired {
+                names: vec!["bank".into(), "wifi".into()]
+            }),
+            "both sides changed bank, wifi: choose which version to keep"
+        );
     }
 
     #[test]
-    fn a_store_needs_an_author_and_a_device() {
-        let config = |author: &str, device: &str| StoreConfig {
-            directory: "/nowhere".into(),
-            public_keys: vec![],
-            signing_keys: vec![],
-            require_signed_updates: false,
-            author_name: author.into(),
-            author_email: "phone@example.org".into(),
-            device: device.into(),
+    fn a_whole_file_merge() {
+        let id = |n: u8| ObjectId::from_hex(format!("{n:040x}").as_bytes()).unwrap();
+        let side = |files: &[(&str, u8)]| files.iter().map(|(path, n)| (path.to_string(), id(*n))).collect();
+        let sides = ThreeWay {
+            base: side(&[
+                ("same", 1),
+                ("mine", 1),
+                ("theirs", 1),
+                ("both", 1),
+                ("agreed", 1),
+                ("gone-here", 1),
+                ("gone-there", 1),
+            ]),
+            ours: side(&[
+                ("same", 1),
+                ("mine", 2),
+                ("theirs", 1),
+                ("both", 2),
+                ("agreed", 4),
+                ("gone-there", 2),
+                ("new-here", 5),
+            ]),
+            theirs: side(&[
+                ("same", 1),
+                ("mine", 1),
+                ("theirs", 3),
+                ("both", 3),
+                ("agreed", 4),
+                ("gone-here", 3),
+                ("new-there", 6),
+            ]),
         };
-        let store = PassStore::open(config("Alice", "phone")).unwrap();
-        assert_eq!(store.list().unwrap(), Vec::<String>::new());
-        assert!(!store.sync_state().unwrap().is_repository);
-        assert!(matches!(
-            PassStore::open(config("", "phone")),
-            Err(PassError::InvalidConfig { .. })
-        ));
-        assert!(matches!(
-            PassStore::open(config("A <b>", "phone")),
-            Err(PassError::InvalidConfig { .. })
-        ));
-        assert!(matches!(
-            PassStore::open(config("Alice", "")),
-            Err(PassError::InvalidConfig { .. })
-        ));
+        for path in ["same", "mine", "theirs", "agreed", "new-here", "new-there", "nowhere"] {
+            assert!(!sides.is_conflict(path), "{path}");
+        }
+        // Changed on both sides to different contents, or changed on one and removed on the other.
+        for path in ["both", "gone-here", "gone-there"] {
+            assert!(sides.is_conflict(path), "{path}");
+        }
     }
 }

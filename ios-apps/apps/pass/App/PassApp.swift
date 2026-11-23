@@ -25,13 +25,17 @@ struct RootView: View {
         @Bindable var model = model
         Group {
             switch model.stage {
-            case .ready where model.isUnlocked:
-                StoreView()
-            case .ready:
-                LockView()
-            default:
-                // Until there is a key, a relay and a store, the settings are the app.
+            case .needsKey, .needsDropZone:
+                // Until there is a key and someone to sync with, the settings are the app.
                 NavigationStack { SettingsView() }
+            case .needsStore, .ready:
+                if !model.isUnlocked {
+                    LockView()
+                } else if model.stage == .ready {
+                    StoreView()
+                } else {
+                    NavigationStack { FirstSyncView() }
+                }
             }
         }
         // What the app switcher shows of the app: nothing.
@@ -68,7 +72,7 @@ struct RootView: View {
     }
 }
 
-/// The store is there and locked: Face ID, or the passphrase. Syncing needs neither.
+/// Locked: Face ID, or the passphrase. Nothing else happens without the key, not even a sync.
 struct LockView: View {
     @Environment(AppModel.self) private var model
     @State private var passphrase = ""
@@ -96,11 +100,6 @@ struct LockView: View {
                     if let info = model.keyInfo {
                         Text(info.userIds.first ?? groupedFingerprint(info.fingerprint))
                     }
-                }
-                Section {
-                    SyncRow()
-                } footer: {
-                    Text("Syncing needs no key: the entries stay encrypted.")
                 }
             }
             .navigationTitle("Locked")
@@ -132,5 +131,29 @@ struct LockView: View {
         let typed = passphrase
         passphrase = ""
         await unlock { await model.unlock(passphrase: typed) }
+    }
+}
+
+/// Everything is set up but the store itself: sync, then look at what the owner published.
+struct FirstSyncView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Form {
+            Section {
+                SyncRow()
+            } footer: {
+                Text("On the computer: pass sync push. What it published is fetched here, shown, and only taken once you accept it.")
+            }
+        }
+        .navigationTitle("The store")
+        .toolbar {
+            NavigationLink {
+                SettingsView()
+            } label: {
+                Image(systemName: "gear")
+            }
+        }
+        .task { await model.refresh() }
     }
 }
