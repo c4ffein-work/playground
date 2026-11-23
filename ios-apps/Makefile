@@ -1,26 +1,30 @@
-# Linux or macOS: test, e2e, bindings, swift-test.   macOS only: apple, xcode.
-COMPANION_PY ?= $(CURDIR)/../clones/companion/src/companion.py
+# Linux or macOS: test, e2e, bindings, swift-test, check.   macOS only: apple, xcode.
+# An app is a directory in apps/, with its core in crates/<app>-core.
+APPS := $(notdir $(wildcard apps/*))
+APP ?= companion
+export COMPANION_PY ?= $(CURDIR)/../clones/companion/src/companion.py
 
 help:
-	@echo "make test        Rust unit tests + TLS pinning tests (no network)"
-	@echo "make e2e         Rust client against a real companion server (COMPANION_PY=$(COMPANION_PY))"
-	@echo "make bindings    generate the Swift bindings into apps/companion/Package/Generated"
-	@echo "make swift-test  Swift package tests against a real companion server (Docker when there is no swift)"
-	@echo "make check       all of the above, plus fmt and clippy"
-	@echo "make apple       [macOS] build the Rust core as an xcframework"
-	@echo "make xcode       [macOS] apple + generate and open apps/companion/Companion.xcodeproj (needs xcodegen)"
+	@echo "apps: $(APPS)"
+	@echo "make test        Rust tests that need nothing outside this repo"
+	@echo "make e2e         Rust tests against the real thing (the ignored ones: see each crate's tests/)"
+	@echo "make bindings    generate the Swift bindings of every app into apps/<app>/Package/Generated"
+	@echo "make swift-test  every app's Swift package tests (apps/<app>/swift-test.sh; Docker when there is no swift)"
+	@echo "make check       fmt, clippy, and all of the above"
+	@echo "make apple       [macOS] build every Rust core as an xcframework"
+	@echo "make xcode       [macOS] apple + generate and open apps/\$$APP/*.xcodeproj (needs xcodegen; APP=$(APP))"
 
 test:
 	cargo test
 
 e2e:
-	COMPANION_PY=$(COMPANION_PY) cargo test -p companion-core --test e2e -- --ignored
+	cargo test -- --ignored
 
 bindings:
-	scripts/bindings.sh companion-core companion
+	@set -e; for app in $(APPS); do scripts/bindings.sh $$app-core $$app; done
 
 swift-test: bindings
-	COMPANION_PY=$(COMPANION_PY) scripts/swift-test.sh
+	@set -e; for app in $(APPS); do echo "== $$app"; apps/$$app/swift-test.sh; done
 
 check:
 	cargo fmt --check
@@ -28,9 +32,9 @@ check:
 	$(MAKE) test e2e swift-test
 
 apple:
-	scripts/build-apple.sh companion-core companion
+	@set -e; for app in $(APPS); do scripts/build-apple.sh $$app-core $$app; done
 
 xcode: apple
-	cd apps/companion && xcodegen generate && open Companion.xcodeproj
+	cd apps/$(APP) && xcodegen generate && open *.xcodeproj
 
 .PHONY: help test e2e bindings swift-test check apple xcode

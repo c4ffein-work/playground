@@ -34,8 +34,11 @@ pub enum TlsTrust {
 impl From<&TlsTrust> for Trust {
     fn from(trust: &TlsTrust) -> Self {
         match trust.clone() {
-            TlsTrust::PinnedWithCa { sha256, extra_ca_pem } => Trust::PinnedWithCa { sha256, extra_ca_pem },
-            TlsTrust::PinnedOnly { sha256 } => Trust::PinnedOnly { sha256 },
+            TlsTrust::PinnedWithCa { sha256, extra_ca_pem } => Trust::PinnedWithCa {
+                pins: vec![sha256],
+                extra_ca_pem,
+            },
+            TlsTrust::PinnedOnly { sha256 } => Trust::PinnedOnly { pins: vec![sha256] },
         }
     }
 }
@@ -216,13 +219,11 @@ impl CompanionClient {
             Ok(response) => (response.status(), response),
             Err(ureq::Error::Status(status, response)) => (status, response),
             Err(ureq::Error::Transport(transport)) => {
-                if let (Some(pinned), Some(served)) = (&self.http.pin, self.http.seen.get()) {
-                    if *pinned != served {
-                        return Err(CompanionError::PinMismatch {
-                            pinned: pinned.clone(),
-                            served,
-                        });
-                    }
+                if let Some(served) = self.http.pin_mismatch() {
+                    return Err(CompanionError::PinMismatch {
+                        pinned: self.http.pins.join(", "),
+                        served,
+                    });
                 }
                 return Err(CompanionError::Network {
                     message: transport.to_string(),

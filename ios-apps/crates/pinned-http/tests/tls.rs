@@ -115,7 +115,7 @@ fn fingerprint_is_the_leaf_sha256() {
 fn pinned_only_accepts_the_pinned_certificate() {
     let s = serve();
     let trust = Trust::PinnedOnly {
-        sha256: s.leaf_sha256.clone(),
+        pins: vec![s.leaf_sha256.clone()],
     };
     assert_eq!(get(&s.url, &trust).unwrap(), "ok");
     // The pin identifies the certificate: the name it was reached by does not matter.
@@ -129,7 +129,16 @@ fn pinned_only_accepts_the_pinned_certificate() {
         .map(|c| std::str::from_utf8(c).unwrap())
         .collect::<Vec<_>>()
         .join(":");
-    assert_eq!(get(&s.url, &Trust::PinnedOnly { sha256: openssl_style }).unwrap(), "ok");
+    assert_eq!(
+        get(
+            &s.url,
+            &Trust::PinnedOnly {
+                pins: vec![openssl_style]
+            }
+        )
+        .unwrap(),
+        "ok"
+    );
 }
 
 #[test]
@@ -137,17 +146,17 @@ fn a_wrong_pin_is_refused_and_the_served_one_is_reported() {
     let s = serve();
     for trust in [
         Trust::PinnedOnly {
-            sha256: "ab".repeat(32),
+            pins: vec!["ab".repeat(32)],
         },
         Trust::PinnedWithCa {
-            sha256: "ab".repeat(32),
+            pins: vec!["ab".repeat(32)],
             extra_ca_pem: Some(s.ca_pem.clone()),
         },
     ] {
         let pinned = agent(&s.url, Some(&trust)).unwrap();
         assert!(pinned.agent.get(&s.url).call().is_err());
         assert_eq!(pinned.seen.get().as_deref(), Some(s.leaf_sha256.as_str()));
-        assert_ne!(pinned.seen.get(), pinned.pin);
+        assert_eq!(pinned.pin_mismatch().as_deref(), Some(s.leaf_sha256.as_str()));
     }
 }
 
@@ -157,7 +166,7 @@ fn pinned_with_ca_also_verifies_chain_and_name() {
     let sha256 = s.leaf_sha256.clone();
 
     let with_ca = Trust::PinnedWithCa {
-        sha256: sha256.clone(),
+        pins: vec![sha256.clone()],
         extra_ca_pem: Some(s.ca_pem.clone()),
     };
     assert_eq!(get(&s.url, &with_ca).unwrap(), "ok");
@@ -169,11 +178,38 @@ fn pinned_with_ca_also_verifies_chain_and_name() {
     );
 
     let public_roots_only = Trust::PinnedWithCa {
-        sha256,
+        pins: vec![sha256],
         extra_ca_pem: None,
     };
     let err = get(&s.url, &public_roots_only).unwrap_err();
     assert!(err.contains("UnknownIssuer"), "right pin, unknown CA: {err}");
+}
+
+#[test]
+fn any_of_the_pins_is_accepted() {
+    // During a rotation: the certificate to come, and the one served today.
+    let s = serve();
+    let trust = Trust::PinnedOnly {
+        pins: vec!["cd".repeat(32), s.leaf_sha256.clone()],
+    };
+    let pinned = agent(&s.url, Some(&trust)).unwrap();
+    assert_eq!(pinned.agent.get(&s.url).call().unwrap().into_string().unwrap(), "ok");
+    assert_eq!(pinned.pin_mismatch(), None);
+}
+
+#[test]
+fn web_agent_verifies_against_public_roots_only() {
+    let s = serve();
+    let err = pinned_http::web_agent(0)
+        .unwrap()
+        .get(&s.url)
+        .call()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("UnknownIssuer"),
+        "a private CA is not a public site: {err}"
+    );
 }
 
 #[test]

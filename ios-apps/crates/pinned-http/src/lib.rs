@@ -3,7 +3,10 @@
 //! Same model as the Python tools this comes from (`make_pinned_ssl_context`
 //! in c4ffein/python-snippets): the pin is the SHA-256 of the DER leaf
 //! certificate, checked during the handshake, on top of the usual
-//! verification. There is no way to get an https agent without a pin.
+//! verification. [`agent`] gives no https agent without a pin.
+//!
+//! A pin is a list: any of its hashes is accepted, because the old and the new
+//! certificate overlap during a rotation.
 //!
 //! Two trust modes:
 //! - [`Trust::PinnedWithCa`]: the pin, plus chain and hostname verification
@@ -13,6 +16,9 @@
 //!   certificate's key, so the peer has to hold its private key.
 //!
 //! Plain http needs no trust at all: [`agent`] with `None`.
+//!
+//! [`web_agent`] is the exception, for what cannot be pinned: any public site
+//! (an RSS feed), verified against the Mozilla roots as a browser would.
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -35,11 +41,11 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(60);
 pub enum Trust {
     /// Pin + chain and hostname verification (Mozilla roots, plus `extra_ca_pem` when given).
     PinnedWithCa {
-        sha256: String,
+        pins: Vec<String>,
         extra_ca_pem: Option<String>,
     },
     /// Pin only: for a self-signed certificate.
-    PinnedOnly { sha256: String },
+    PinnedOnly { pins: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,9 +93,32 @@ impl SeenCertificate {
 
 pub struct PinnedAgent {
     pub agent: ureq::Agent,
-    /// The normalized pin, `None` over plain http.
-    pub pin: Option<String>,
+    /// The normalized pins, empty over plain http.
+    pub pins: Vec<String>,
     pub seen: SeenCertificate,
+}
+
+impl PinnedAgent {
+    /// After a failed request: the certificate that was served, when it is none of the pinned ones.
+    /// `None` when the failure is something else.
+    pub fn pin_mismatch(&self) -> Option<String> {
+        self.seen
+            .get()
+            .filter(|served| !self.pins.is_empty() && !self.pins.contains(served))
+    }
+}
+
+/// How many pins a trust may hold: the old and the new certificate, a few more, never many.
+pub const MAX_PINS: usize = 16;
+
+fn normalize_pins(pins: &[String]) -> Result<Vec<String>, Error> {
+    if pins.is_empty() {
+        return Err(Error::InvalidPin("no pin given".into()));
+    }
+    if pins.len() > MAX_PINS {
+        return Err(Error::InvalidPin(format!("{} pins, at most {MAX_PINS}", pins.len())));
+    }
+    pins.iter().map(|pin| normalize_pin(pin)).collect()
 }
 
 /// Lowercases and validates a pin: 64 hex characters, `:` and spaces tolerated
@@ -165,8 +194,8 @@ fn webpki_verifier(
 /// What the verifier does once it has hashed the leaf certificate.
 #[derive(Debug)]
 enum Mode {
-    /// Refuse anything but this hash.
-    Pin(String),
+    /// Refuse anything but these hashes.
+    Pin(Vec<String>),
     /// Accept anything: only to read a fingerprint, never to send a request.
     Record,
 }
@@ -198,8 +227,8 @@ impl ServerCertVerifier for Verifier {
             .as_ref()
             .map(|v| v.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now));
         match &self.mode {
-            Mode::Pin(pin) => {
-                if &got != pin {
+            Mode::Pin(pins) => {
+                if !pins.contains(&got) {
                     return Err(rustls::Error::General(format!(
                         "certificate does not match the pin (served {got})"
                     )));
@@ -275,7 +304,7 @@ pub fn agent(base_url: &str, trust: Option<&Trust>) -> Result<PinnedAgent, Error
     match (https, trust) {
         (false, None) => Ok(PinnedAgent {
             agent: builder.build(),
-            pin: None,
+            pins: Vec::new(),
             seen,
         }),
         (false, Some(_)) => Err(Error::SchemeMismatch(
@@ -286,15 +315,15 @@ pub fn agent(base_url: &str, trust: Option<&Trust>) -> Result<PinnedAgent, Error
         )),
         (true, Some(trust)) => {
             let provider = provider();
-            let (sha256, chain) = match trust {
-                Trust::PinnedWithCa { sha256, extra_ca_pem } => {
-                    (sha256, Some(webpki_verifier(extra_ca_pem.as_deref(), &provider)?))
+            let (pins, chain) = match trust {
+                Trust::PinnedWithCa { pins, extra_ca_pem } => {
+                    (pins, Some(webpki_verifier(extra_ca_pem.as_deref(), &provider)?))
                 }
-                Trust::PinnedOnly { sha256 } => (sha256, None),
+                Trust::PinnedOnly { pins } => (pins, None),
             };
-            let pin = normalize_pin(sha256)?;
+            let pins = normalize_pins(pins)?;
             let config = client_config(Verifier {
-                mode: Mode::Pin(pin.clone()),
+                mode: Mode::Pin(pins.clone()),
                 chain,
                 chain_ok: Arc::default(),
                 seen: seen.clone(),
@@ -302,11 +331,32 @@ pub fn agent(base_url: &str, trust: Option<&Trust>) -> Result<PinnedAgent, Error
             })?;
             Ok(PinnedAgent {
                 agent: builder.tls_config(Arc::new(config)).build(),
-                pin: Some(pin),
+                pins,
                 seen,
             })
         }
     }
+}
+
+/// An agent for any public site, where there is nothing to pin (an RSS feed, a link):
+/// https is verified against the Mozilla roots, chain and hostname, as a browser would.
+/// Plain http is allowed too. Follows up to `redirects` redirects.
+///
+/// Not for an API that takes credentials: that one has a known certificate, use [`agent`].
+pub fn web_agent(redirects: u32) -> Result<ureq::Agent, Error> {
+    let provider = provider();
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Tls(e.to_string()))?
+        .with_root_certificates(roots(None)?)
+        .with_no_client_auth();
+    Ok(ureq::AgentBuilder::new()
+        .redirects(redirects)
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout_read(IO_TIMEOUT)
+        .timeout_write(IO_TIMEOUT)
+        .tls_config(Arc::new(config))
+        .build())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,7 +536,7 @@ mod tests {
     #[test]
     fn scheme_and_trust_must_agree() {
         let pin = Trust::PinnedOnly {
-            sha256: "ab".repeat(32),
+            pins: vec!["ab".repeat(32)],
         };
         assert!(agent("http://a.example", None).is_ok());
         assert!(matches!(
@@ -499,13 +549,27 @@ mod tests {
         ));
         assert!(agent("https://a.example", Some(&pin)).is_ok());
         assert!(matches!(agent("ftp://a.example", None), Err(Error::InvalidUrl(_))));
-        let bad = Trust::PinnedOnly { sha256: "nope".into() };
+        let none = Trust::PinnedOnly { pins: vec![] };
+        assert!(matches!(
+            agent("https://a.example", Some(&none)),
+            Err(Error::InvalidPin(_))
+        ));
+        let many = Trust::PinnedOnly {
+            pins: vec!["ab".repeat(32); MAX_PINS + 1],
+        };
+        assert!(matches!(
+            agent("https://a.example", Some(&many)),
+            Err(Error::InvalidPin(_))
+        ));
+        let bad = Trust::PinnedOnly {
+            pins: vec!["nope".into()],
+        };
         assert!(matches!(
             agent("https://a.example", Some(&bad)),
             Err(Error::InvalidPin(_))
         ));
         let bad_ca = Trust::PinnedWithCa {
-            sha256: "ab".repeat(32),
+            pins: vec!["ab".repeat(32)],
             extra_ca_pem: Some("not pem".into()),
         };
         assert!(matches!(

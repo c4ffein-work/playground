@@ -25,7 +25,8 @@ apps/companion/
   App/               SwiftUI views: Files, Pad, Live, Settings
   ShareExtension/    "Companion" in the share sheet
   project.yml        XcodeGen spec (no .xcodeproj in git)
-scripts/             bindings.sh, build-apple.sh, swift-test.sh
+  swift-test.sh      the package tests, against a real server
+scripts/             bindings.sh, build-apple.sh, swift.sh (swift, in Docker when there is none)
 ```
 
 The rule: a view holds no logic. What can be decided without UIKit is decided in `CompanionKit`
@@ -72,7 +73,11 @@ extension share the settings through that app group, and the client secret throu
 
 ## Adding an app
 
+An app `<name>` is `crates/<name>-core` plus `apps/<name>/`: the Makefile finds it by that naming.
+
 1. `crates/<name>-core`: the logic, with `uniffi::setup_scaffolding!()` and `crate-type = ["lib", "staticlib", "cdylib"]`.
-   Network access goes through `pinned-http`.
-2. `apps/<name>/`: copy the shape of `apps/companion` (`Package/`, `App/`, `project.yml`).
-3. `scripts/bindings.sh <name>-core <name>` and `scripts/build-apple.sh <name>-core <name>` take it from there.
+   Network access goes through `pinned-http`: `agent` for an API with a known certificate, `web_agent` for arbitrary sites.
+   Tests that need something outside the repo are `#[ignore]`d and run by `make e2e`.
+2. `apps/<name>/`: the shape of `apps/companion`: `Package/` (bindings + everything that is not a view, tested on Linux),
+   `App/` (views only), `project.yml`, and a `swift-test.sh` that runs the package tests through `scripts/swift.sh`.
+3. `apps/<name>/README.md`: what the app does and what state it is in.

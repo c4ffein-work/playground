@@ -2,12 +2,10 @@
 # Runs the tests of the companion Swift package against a real companion server:
 # Swift -> UniFFI -> Rust -> companion.py. Starts the server on a free port and stops it after.
 #   COMPANION_PY   path to companion.py (default: ../clones/companion/src/companion.py)
-#   SWIFT_IMAGE    Docker image used when there is no `swift` here (default: swift:6.1-noble)
 set -eu
-root=$(cd "$(dirname "$0")/.." && pwd)
+root=$(cd "$(dirname "$0")/../.." && pwd)
 package="$root/apps/companion/Package"
 : "${COMPANION_PY:=$root/../clones/companion/src/companion.py}"
-: "${SWIFT_IMAGE:=swift:6.1-noble}"
 [ -f "$COMPANION_PY" ] || { echo "no companion.py at $COMPANION_PY: set COMPANION_PY" >&2; exit 1; }
 
 state=$(mktemp -d)
@@ -34,9 +32,4 @@ for _ in range(100):
 sys.exit("the companion server did not start")
 PY
 
-if command -v swift >/dev/null 2>&1; then
-    (cd "$package" && swift test)
-else
-    docker run --rm --network host -v "$root":"$root" -w "$package" \
-        -e COMPANION_E2E_URL -e COMPANION_E2E_ID -e COMPANION_E2E_SECRET "$SWIFT_IMAGE" swift test
-fi
+cd "$package" && "$root/scripts/swift.sh" test
