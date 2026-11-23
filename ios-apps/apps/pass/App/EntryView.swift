@@ -58,7 +58,7 @@ struct EntryView: View {
                 Section {
                     Label("Not readable by this device", systemImage: "lock.slash")
                 } footer: {
-                    Text("It is encrypted to other keys than this device's. It can still be renamed or deleted here: the owner sees that before taking it.")
+                    Text("It is encrypted to other keys than this device's. It can still be renamed or deleted here: the other devices see that before taking it.")
                 }
             } else {
                 ProgressView()

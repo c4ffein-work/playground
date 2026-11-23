@@ -26,7 +26,7 @@ struct RootView: View {
         Group {
             switch model.stage {
             case .needsKey, .needsDropZone:
-                // Until there is a key and someone to sync with, the settings are the app.
+                // Until there is a key and a drop zone, the settings are the app.
                 NavigationStack { SettingsView() }
             case .needsStore, .ready:
                 if !model.isUnlocked {
@@ -134,16 +134,34 @@ struct LockView: View {
     }
 }
 
-/// Everything is set up but the store itself: sync, then look at what the owner published.
+/// Everything is set up but the store itself: sync and take what another device published, or
+/// make the store here.
 struct FirstSyncView: View {
     @Environment(AppModel.self) private var model
+    @State private var readers: Set<String> = []
+    @State private var busy = false
 
     var body: some View {
         Form {
+            SyncSection()
             Section {
-                SyncRow()
+                ForEach(model.settings.deviceNames, id: \.self) { name in
+                    Toggle(name == model.settings.deviceName ? "\(name) (this device)" : name, isOn: Binding(
+                        get: { readers.contains(name) },
+                        set: { if $0 { readers.insert(name) } else { readers.remove(name) } }))
+                }
+                Button("Make the store here") {
+                    Task {
+                        busy = true
+                        defer { busy = false }
+                        await model.createStore(readers: Array(readers))
+                    }
+                }
+                .disabled(busy || readers.isEmpty)
+            } header: {
+                Text("Or start a new store")
             } footer: {
-                Text("On the computer: pass sync push. What it published is fetched here, shown, and only taken once you accept it.")
+                Text("Only when no device has a store yet: two stores made apart do not merge. Its readers are the devices chosen; folders can have their own later.")
             }
         }
         .navigationTitle("The store")
@@ -154,6 +172,9 @@ struct FirstSyncView: View {
                 Image(systemName: "gear")
             }
         }
-        .task { await model.refresh() }
+        .task {
+            readers = Set(model.settings.deviceNames)
+            await model.refresh()
+        }
     }
 }
