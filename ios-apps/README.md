@@ -8,7 +8,7 @@ one thin SwiftUI shell per app, over one Rust workspace exposed to Swift through
 | [Companion](apps/companion) | [companion](https://github.com/c4ffein/companion) | files, pad and presentation of a companion server; share sheet |
 | [bank](apps/bank/README.md) | [bank](https://github.com/c4ffein/bank) | Qonto accounts and transactions, find the ones with no receipt and attach one. Tested against a mock only |
 | [feed](apps/feed/README.md) | [feed](https://github.com/c4ffein/feed) | RSS/Atom reader: offline cache, read state, articles rewritten from an allowlist before display |
-| [pass](apps/pass/README.md) | [pass](https://github.com/c4ffein/pass) | password-store without gpg or git: decrypt, edit, signed commits, sync with a relay over SSH or HTTPS |
+| [pass](apps/pass/README.md) | [pass](https://github.com/c4ffein/pass) | password-store without gpg or git: decrypt, edit, see who can read what; devices trade signed, encrypted bundles through a [drop zone](apps/pass/dropzone/README.md) ([protocol](apps/pass/SYNC.md)) |
 | [2fa](apps/twofa/README.md) | [2fa](https://github.com/c4ffein/2fa) | TOTP/HOTP codes, same keychain file as the CLI, QR import |
 
 Each app's README says what it does and what was tested. The sections below describe the first one, Companion.

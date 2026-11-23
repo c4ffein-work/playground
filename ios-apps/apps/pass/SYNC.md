@@ -33,9 +33,12 @@ An SFTP-only account. After login the working directory is the one directory the
 A binary OpenPGP message, **signed by the publishing device's key, then encrypted to the key of
 every device** (the publisher included). What `gpg --sign --encrypt --recipient A --recipient B`
 writes. Publishers should not compress (`--compress-algo none`: a bundle is already packed);
-readers accept zip and zlib anyway. A reader refuses a file over 256 MiB.
+readers accept zip and zlib anyway. The signature uses SHA-256 or stronger (`--digest-algo SHA512`:
+left to itself gpg can pick SHA-1); a reader refuses a weaker one. A reader refuses a file over
+256 MiB, and stops decrypting when what comes out passes 256 MiB: anyone can encrypt anything to a
+device's public key, so that bound holds before any signature is looked at.
 
-Its plaintext is a **git bundle** (version 2) holding **exactly one reference,
+Its plaintext is a **git bundle** (version 2, SHA-1 objects) holding **exactly one reference,
 `refs/pass-sync/<name>`**, with its full history: no prerequisite commits. For the owner that
 reference is the tip of the store's branch. For a member it is the tip of that member's own
 line of work.
@@ -50,7 +53,9 @@ Then the reader stores that tip as its own `refs/pass-sync/D`. That is all recei
 branch moves, no file changes in the working tree.
 
 The signature's time is shown to the user ("published 3 days ago"). A tip that is an ancestor of the
-one already held for D is an old file served again: it is reported as such and ignored.
+one already held for D is an old file served again: it is reported as such and ignored. A tip that
+is neither ahead of nor behind the one held (D rewrote its history) is taken like any other: D
+signed it, and whoever merges it sees what it does.
 
 ## Who may change what
 
@@ -59,17 +64,23 @@ one already held for D is an old file served again: it is reported as such and i
 - **Only the owner changes who can read**, and anything that is not an entry. A member's commits may
   add, change, rename and remove `*.gpg` files, and nothing else: no `.gpg-id`, no `.gpg-id.sig`,
   no `.gitattributes`, nothing under `.extensions/`.
-- A member writes an entry encrypted to the recipients of its governing `.gpg-id` (so it must
-  hold their public keys), and signs each of its commits with its OpenPGP key.
+- A member writes an entry encrypted to the recipients of its governing `.gpg-id`, and signs each
+  of its commits with its OpenPGP key. The public keys it has are the devices': where a `.gpg-id`
+  lists a key that is no device's, the member reads (if it is listed) but does not write.
+- A member never re-encrypts what it did not change. After the owner changes a `.gpg-id`, bringing
+  every entry below it in line is the owner's job (`pass init` does it); until then a member shows
+  the entries whose file and `.gpg-id` disagree.
 
 ## The member's side (the phone)
 
-The member's line of work is the owner's history plus its own commits.
+The member's line of work is the owner's history plus its own commits. It reads the owner's file
+only, and needs its OpenPGP key unlocked for anything that touches the drop zone.
 
 - **Taking the owner's update** (its `refs/pass-sync/<owner>` moved) is never automatic. The member
   shows what the update does: the commits, the entries added, changed, renamed and removed (with
   both versions decrypted on demand, when it can read them), and any change of recipients, entry
-  by entry and directory by directory. The user accepts or leaves it for later.
+  by entry and directory by directory. The user accepts or leaves it for later. The very first one, which brings the
+  whole store, goes through the same screen.
 - On accept:
   - no commit of its own outstanding: it moves forward to the owner's tip;
   - otherwise it **merges** the owner's tip into its line, as a merge commit signed like the
@@ -78,7 +89,8 @@ The member's line of work is the owner's history plus its own commits.
     chooses between the two, having seen both. Anything that is not an entry is taken from the
     owner as it is.
 - After any commit of its own, and after any accepted update, it publishes its tip.
-- It can also drop its own outstanding commits and go back to the owner's tip.
+- It can also drop its own outstanding commits and go back to the owner's state it last accepted
+  (not to an update it has not reviewed), then publishes that.
 
 ## The owner's side (the computer)
 
