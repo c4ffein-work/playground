@@ -3,7 +3,12 @@
 iOS apps for some of the [c4ffein Python cli utils](https://github.com/c4ffein/c4ffein/blob/main/repos/repos-python-cli-utils.md):
 one thin SwiftUI shell per app, over one Rust workspace exposed to Swift through [UniFFI](https://github.com/mozilla/uniffi-rs).
 
-First app: **Companion**, a native client for a [companion](https://github.com/c4ffein/companion) server.
+| App | Port of | |
+| :-- | :-- | :-- |
+| [Companion](apps/companion) | [companion](https://github.com/c4ffein/companion) | files, pad and presentation of a companion server; share sheet |
+| [2fa](apps/twofa/README.md) | [2fa](https://github.com/c4ffein/2fa) | TOTP/HOTP codes, same keychain file as the CLI, QR import |
+
+Each app's README says what it does and what was tested. The sections below describe the first one, Companion.
 
 ## Status
 

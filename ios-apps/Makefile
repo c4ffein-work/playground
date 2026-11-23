@@ -3,6 +3,7 @@
 APPS := $(notdir $(wildcard apps/*))
 APP ?= companion
 export COMPANION_PY ?= $(CURDIR)/../clones/companion/src/companion.py
+export TWOFA_PY ?= $(CURDIR)/../clones/2fa/2fa.py
 
 help:
 	@echo "apps: $(APPS)"
