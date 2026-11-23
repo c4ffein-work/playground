@@ -72,7 +72,9 @@ Three kinds of path, and nothing else:
   (`*.gpg diff=gpg`), or absent.
 
 A device does not publish a tip that holds anything else (`.extensions/`, `.gpg-id.sig`, a symbolic
-link, a note), and does not take one: the update is refused whole, naming the paths. Extensions
+link, a note), and does not take one: the update is refused whole, naming the paths. This and the
+rules on readers below are checked when a file is received: a tip that breaks one is not stored,
+and the device goes on with the last good one it holds. Extensions
 are code: they stay out of git, on the device that runs them.
 
 ## Readers
@@ -81,8 +83,9 @@ An entry is encrypted to the keys listed in the nearest `.gpg-id` above it. **An
 a `.gpg-id`**, with two things holding always:
 
 - **Readers are devices.** Every line of every `.gpg-id` of a tip must name exactly one key, and
-  that key must be a device's: its fingerprint or 16-hex key id (primary or encryption subkey),
-  or a text found in the user ID of one device's key and no other's. A tip where a line names
+  that key must be a device's: its 40-hex fingerprint or 16-hex key id (primary key or a subkey,
+  with or without `0x`), or else a text found, whatever the case, in the user ID of one device's
+  key and no other's. An empty `.gpg-id` names nobody: refused. A tip where a line names
   anything else is refused whole. A device that writes a `.gpg-id` writes full fingerprints.
   Likewise an entry encrypted to a key that is no device's: refused whole.
 - **Saying is not doing.** A `.gpg-id` says who should read; an entry is read by those its file is
@@ -115,7 +118,9 @@ Then it publishes.
 ### Entries
 
 Two versions of an entry are **the same** when their bytes are equal, or when this device can
-decrypt both and their plaintexts are equal (a re-encryption changes nothing).
+decrypt both and their plaintexts are equal (a re-encryption changes nothing). A device that
+cannot read an entry cannot tell: to it a re-encryption is a change like any other, and a move
+that re-encrypted is a removal and an addition.
 
 Within one side, an entry removed at one name and one added at another with the same content
 (as just defined) is a **move**: the same entry under a new name. Matching is one to one, in name

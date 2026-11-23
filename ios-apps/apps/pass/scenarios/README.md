@@ -71,6 +71,7 @@ rm NAME                       remove an entry, or a folder with a trailing slash
 mv FROM TO                    move an entry, or a folder with trailing slashes
 ls                            every entry name, sorted
 readers DIR                   the readers that govern a folder, its own or inherited (trailing slash, / for the root): device names, sorted
+readers-file DIR              the readers named by the folder's own .gpg-id; fails when it has none
 set-readers DIR DEVICE...     change them, re-encrypting what this device reads; "set-readers DIR" alone removes the file
 stale                         the stale entries, sorted
 sync                          publish, and receive every other device's file: one line per device,
