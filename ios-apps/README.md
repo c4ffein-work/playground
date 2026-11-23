@@ -6,6 +6,7 @@ one thin SwiftUI shell per app, over one Rust workspace exposed to Swift through
 | App | Port of | |
 | :-- | :-- | :-- |
 | [Companion](apps/companion) | [companion](https://github.com/c4ffein/companion) | files, pad and presentation of a companion server; share sheet |
+| [feed](apps/feed/README.md) | [feed](https://github.com/c4ffein/feed) | RSS/Atom reader: offline cache, read state, articles rewritten from an allowlist before display |
 | [2fa](apps/twofa/README.md) | [2fa](https://github.com/c4ffein/2fa) | TOTP/HOTP codes, same keychain file as the CLI, QR import |
 
 Each app's README says what it does and what was tested. The sections below describe the first one, Companion.
