@@ -112,12 +112,7 @@ class Device:
             return False, str(refusal)
 
     def reads(self, name):
-        directory = name.rsplit('/', 1)[0] + '/' if '/' in name else '/'
-        while True:
-            readers = self.readers(directory)
-            if readers is not None:
-                return self.name in readers
-            directory = directory.rstrip('/').rsplit('/', 1)[0] + '/' if '/' in directory.rstrip('/') else '/'
+        return self.name in self.readers(name.rsplit('/', 1)[0] + '/' if '/' in name else '/')
 
 
 class PyDevice(Device):
@@ -193,9 +188,9 @@ class PyDevice(Device):
         return os.path.join(self.store, directory.strip('/'), '.gpg-id')
 
     def readers(self, directory):
-        """The readers a folder's own file names, or None when it has none."""
-        if not os.path.isfile(self.readers_file(directory)):
-            return None
+        """The readers that govern a folder, its own or inherited."""
+        while not os.path.isfile(self.readers_file(directory)):
+            directory = os.path.dirname(directory.strip('/'))
         names = {device.fingerprint: device.name for device in self.fleet.values()}
         with open(self.readers_file(directory)) as lines:
             return sorted(names.get(line.strip(), '?') for line in lines if line.strip())
@@ -328,8 +323,8 @@ class CoreDevice(Device):
         return self.lines('ls')
 
     def readers(self, directory):
-        found, names = self.can('lines', 'readers-file', directory)
-        return sorted(names) if found else None
+        """The readers that govern a folder, its own or inherited."""
+        return sorted(self.lines('readers', directory))
 
     def set_readers(self, directory, readers):
         self.device('set-readers', directory, *readers)
@@ -602,7 +597,8 @@ def s11(make):
 
 
 def s12(make):
-    for choice, expected in (('mine', 's'), ('theirs', 'B')):
+    # Neither entry is lost to the other: "theirs" is b's y, and the moved one back where b has it.
+    for choice, expected in (('mine', {'y': 's'}), ('theirs', {'y': 'B', 'seed': 's'})):
         fleet = started(make)
         fleet.a.mv('seed', 'y')
         fleet.b.insert('y', 'B')
@@ -611,7 +607,7 @@ def s12(make):
         unchanged(fleet.a, 'take', 'b')
         fleet.a.take('b', **{choice: ['y']})
         settle(fleet.all())
-        check(fleet.all(), {'y': expected})
+        check(fleet.all(), expected)
 
 
 def shared_folder(make, count=2, shared=('a', 'b')):

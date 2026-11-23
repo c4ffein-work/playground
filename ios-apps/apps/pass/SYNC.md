@@ -131,7 +131,11 @@ For each entry, following it through moves:
 | anything else (two contents, two names, a removal against a change, two new entries of one name) | | **a choice**: mine or theirs, whole |
 
 A choice is named by the entry's name on this device's side, or on theirs if this device has
-removed it. Without a choice for each, nothing is taken. Having landed, an entry whose file does
+removed it. Without a choice for each, nothing is taken.
+
+Two different entries can end under one name (one side moved `x` to `y`, the other added a `y`):
+a choice too, named `y`, which decides for both entries. Each ends as the chosen side has it, so
+neither is lost to the other: "theirs" is their `y`, and `x` back where they have it. Having landed, an entry whose file does
 not match its new directory's readers is stale, and is handled as above.
 
 ### Readers files

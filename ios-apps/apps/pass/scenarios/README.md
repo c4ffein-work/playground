@@ -33,7 +33,7 @@ and report nothing stale and nothing left to take.
 | 09 | `a` and `b` move the same entry to different names | `conflict`; the chosen name only |
 | 10 | `a` and `b` both make the same change (same new content, typed on each) | no conflict |
 | 11 | `a` and `b` each add an entry of the same name with different contents | `conflict` |
-| 12 | `a` moves `x` to `y`; `b` adds a new `y` | `conflict` on `y` |
+| 12 | `a` moves `x` to `y`; `b` adds a new `y` | `conflict` on `y`. Mine: `y` is the moved entry. Theirs: `y` is `b`'s, and the moved one is back at `x`: neither is lost to the other |
 | 13 | `shared/` gets its own readers `a b`, the root stays `a`; `b` syncs | `b` reads `shared/*`, lists the rest and cannot read it |
 | 14 | `b`, a reader of `shared/` only, adds an entry at the root | `a` reads it; `b` cannot read what it wrote |
 | 15 | grant: `a` adds `c` to the readers of `shared/` and re-encrypts | `c` reads `shared/*` after taking; nothing stale |
@@ -70,11 +70,13 @@ show NAME                     its content
 rm NAME                       remove an entry, or a folder with a trailing slash
 mv FROM TO                    move an entry, or a folder with trailing slashes
 ls                            every entry name, sorted
-readers DIR                   the readers of a folder (trailing slash, / for the root): device names, sorted
+readers DIR                   the readers that govern a folder, its own or inherited (trailing slash, / for the root): device names, sorted
 set-readers DIR DEVICE...     change them, re-encrypting what this device reads; "set-readers DIR" alone removes the file
 stale                         the stale entries, sorted
 sync                          publish, and receive every other device's file: one line per device,
                               "NAME: N to take" | "NAME: nothing to take" | "NAME: REFUSED ..." | "NAME: IGNORED ..." | "NAME: nothing published"
+                              (an empty store publishes nothing, without complaint; a store that cannot be
+                              published still receives, then fails with the reason)
 pending DEVICE                what taking its update would do: the lines of SYNC.md
 take DEVICE [--mine NAME]... [--theirs NAME]...
 drop DEVICE                   forget this device's own changes: go to DEVICE's tip
