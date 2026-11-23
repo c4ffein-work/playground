@@ -37,8 +37,8 @@ targets:
         # export-compliance question is the owner's to answer when uploading a build.
         NSFaceIDUsageDescription: Pass uses Face ID to unlock the password store.
         # The Rust core opens plain sockets: App Transport Security does not apply to it,
-        # the local network permission does (a relay on the home network).
-        NSLocalNetworkUsageDescription: Pass syncs with the git relay on your network.
+        # the local network permission does (a drop zone on the home network).
+        NSLocalNetworkUsageDescription: Pass syncs with the drop zone on your network.
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft

@@ -1381,6 +1381,15 @@ fn what_is_not_the_owners_file_is_refused() {
     std::fs::write(world.path("flipped.gpg"), &flipped).unwrap();
     computer.put(&world.path("flipped.gpg"));
     assert!(phone.refused().contains("refused"));
+    // Small on the wire, huge once decompressed: anyone can make one for this device's public key.
+    let bomb = world.path("bomb");
+    let zeros = std::fs::File::create(&bomb).unwrap();
+    zeros.set_len(256 * 1024 * 1024 + 4096).unwrap();
+    drop(zeros);
+    let sealed_bomb = computer.seal(&bomb, &mallory.fingerprint, &everyone, &["--compress-algo", "zlib"]);
+    assert!(std::fs::metadata(&sealed_bomb).unwrap().len() < 1024 * 1024);
+    computer.put(&sealed_bomb);
+    assert!(phone.refused().contains("over 256 MiB"));
     // Far too big: refused by its size, before it is read.
     let huge = scene.zone.files().join("pc.bundle.gpg");
     let grown = std::fs::File::options().write(true).open(&huge).unwrap();

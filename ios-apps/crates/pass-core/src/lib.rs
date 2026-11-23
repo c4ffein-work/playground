@@ -1023,7 +1023,9 @@ impl PassStore {
         let owner = from;
         let reference = self.reference_of(from);
         // 1. It decrypts, and is signed by the owner's key.
-        let (bundle, published_at) = identity.inner.open_sealed(&file, &owner.certificate)?;
+        let (bundle, published_at) = identity
+            .inner
+            .open_sealed(&file, &owner.certificate, MAX_PUBLISHED_FILE)?;
         // 2. One reference, the owner's.
         let header = bundle::read_header(&bundle, &reference)?;
         let held = git::reference(repo, &reference);

@@ -5,7 +5,7 @@
 //! implementation reads: a v3 session key per recipient and SEIPD v1 with AES-256,
 //! uncompressed, as `pass` asks of gpg (`--compress-algo=none`).
 
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 use pgp::composed::{
     ArmorOptions, DecryptionOptions, Deserializable, DetachedSignature, EncryptionCaps, Esk, KeyType, Message,
@@ -425,11 +425,13 @@ impl SecretIdentity {
 
     /// Decrypts a message and checks that it carries a valid signature by `signer`.
     /// Returns what was signed, and when (seconds since 1970). Anything else is an
-    /// error: there is no "decrypted but not verified" result.
+    /// error: there is no "decrypted but not verified" result. What decrypts (and
+    /// decompresses) to more than `limit` bytes is refused before it is all in memory.
     pub(crate) fn open_sealed(
         &self,
         ciphertext: &[u8],
         signer: &Certificate,
+        limit: u64,
     ) -> Result<(Zeroizing<Vec<u8>>, i64), PassError> {
         let untrusted = |why: &str| PassError::UntrustedFile {
             message: why.to_string(),
@@ -453,10 +455,14 @@ impl SecretIdentity {
             return Err(untrusted("it is not signed"));
         }
         // The data is read to its end first: that is also what checks the integrity of the encryption.
-        let data = message
-            .as_data_vec()
-            .map(Zeroizing::new)
+        // With a limit: anyone can encrypt to this device, and a few bytes can decompress to gigabytes.
+        let mut data = Zeroizing::new(Vec::new());
+        std::io::Read::take(&mut message, limit + 1)
+            .read_to_end(&mut data)
             .map_err(|_| untrusted("it does not decrypt to the end (cut short, or tampered with)"))?;
+        if data.len() as u64 > limit {
+            return Err(PassError::TooLarge);
+        }
         let by_primary = message.verify(&signer.key);
         let signature = match by_primary {
             Ok(signature) => Some(signature),
