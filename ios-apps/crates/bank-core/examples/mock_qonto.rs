@@ -1,5 +1,5 @@
 //! The mock of the Qonto API (`tests/mock/mod.rs`), as a program: for the tests of the Swift package.
-//!   cargo run -p bank-core --example mock_qonto -- <file to write the URL to>
+//!   cargo run -p bank-core --example mock_qonto -- <file to write the URL to> [transactions per page]
 //! Serves the sample data on a free port of 127.0.0.1 until it is killed. The credentials it accepts
 //! are `mock::SLUG` and `mock::SECRET`.
 
@@ -9,8 +9,12 @@ mod mock;
 fn main() {
     let url_file = std::env::args()
         .nth(1)
-        .expect("usage: mock_qonto <file to write the URL to>");
-    let server = mock::serve(mock::State::sample());
+        .expect("usage: mock_qonto <file to write the URL to> [transactions per page]");
+    let mut state = mock::State::sample();
+    if let Some(page_size) = std::env::args().nth(2) {
+        state.page_size = page_size.parse().expect("transactions per page: a number");
+    }
+    let server = mock::serve(state);
     // Written whole, then renamed: whoever waits for the file never reads half a URL.
     let partial = format!("{url_file}.part");
     std::fs::write(&partial, &server.url).unwrap();
