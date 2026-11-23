@@ -68,8 +68,8 @@ Three kinds of path, and nothing else:
   Its name is its path without `.gpg`;
 - a **readers file**: a regular file named `.gpg-id`, at the root or in a directory no part of
   whose path starts with a dot. The root has one;
-- `.gitattributes` at the root, which `pass git init` writes. It is taken when a device first
-  adopts the store and never changes afterwards.
+- `.gitattributes` at the root, holding exactly the one line `pass git init` writes
+  (`*.gpg diff=gpg`), or absent.
 
 A device does not publish a tip that holds anything else (`.extensions/`, `.gpg-id.sig`, a symbolic
 link, a note), and does not take one: the update is refused whole, naming the paths. Extensions
