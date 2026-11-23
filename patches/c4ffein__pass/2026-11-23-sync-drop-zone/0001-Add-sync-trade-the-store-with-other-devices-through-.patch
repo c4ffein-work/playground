@@ -1,4 +1,4 @@
-From d3294c57a7caede295ac1d7ae105bc4035b26a58 Mon Sep 17 00:00:00 2001
+From c9e420d97d21ce5e9e5a4578540a5897301805c7 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Mon, 23 Nov 2026 14:44:02 +0000
 Subject: [PATCH] Add sync: trade the store with other devices through a drop
@@ -8,21 +8,23 @@ A drop zone is a directory every device can reach and nobody has to trust:
 a local path, or sftp://user@host[:port][/dir]. Each device publishes one
 file there, <device>.bundle.gpg: a git bundle of its whole history under the
 single reference refs/pass-sync/<device>, signed with the device's OpenPGP
-key and encrypted to every device.
+key (SHA-512) and encrypted to every device.
 
     pass sync setup device-name drop-zone own-key-fingerprint
     pass sync peer [--remove] device-name [key-fingerprint]
     pass sync push | fetch [device-name...]
     pass sync log | diff | merge device-name
 
-This side is the owner of the store. It takes a file only when it decrypts,
-carries one valid signature by the key configured for that device, and holds
-that device's reference alone with its full history; an older file served
-again is ignored. It merges a device's commits only as a fast-forward, only
-when each is signed by that device or by this one, and only when they change
-nothing but entries: no .gpg-id, nothing under .extensions/, no symlink.
+This side is the owner of the store. It takes a file only when it decrypts
+to no more than 256 MiB, carries one valid signature by the key configured
+for that device (not a SHA-1 one), and holds that device's reference alone
+with its full history; an older file served again is ignored. It merges a
+device's commits only as a fast-forward, only when each is signed by that
+device or by this one, and only when they change nothing but entries: no
+.gpg-id, nothing under .extensions/, no symlink.
 
 The settings live in the store's git configuration (pass-sync.*).
+PASSWORD_STORE_GPG_OPTS applies to the gpg calls, as elsewhere.
 
 Also exit quietly when whoever reads the output goes away (| grep -q),
 instead of a BrokenPipeError traceback.
@@ -31,9 +33,9 @@ Tests: u0008-sync-tests.sh, the other device played with git and gpg alone.
 ---
  Makefile                                      |   5 +-
  README.md                                     |  30 ++
- pass.py                                       | 405 ++++++++++++++++++
- .../additional-tests/u0008-sync-tests.sh      | 226 ++++++++++
- 4 files changed, 665 insertions(+), 1 deletion(-)
+ pass.py                                       | 413 ++++++++++++++++++
+ .../additional-tests/u0008-sync-tests.sh      | 232 ++++++++++
+ 4 files changed, 679 insertions(+), 1 deletion(-)
  create mode 100755 test_tricks/additional-tests/u0008-sync-tests.sh
 
 diff --git a/Makefile b/Makefile
@@ -105,7 +107,7 @@ index 27d8c55..69dba60 100644
  
  The Python implementation is designed to be fully compatible with the original bash script and should pass all the tests in `submodules/password-store/tests/`. Additional tests have also been written in an automated way, see [the documentation about Claude Code](chat_history/00-INDEX.md)
 diff --git a/pass.py b/pass.py
-index 44b24d1..bde29a4 100755
+index 44b24d1..b5a1ebf 100755
 --- a/pass.py
 +++ b/pass.py
 @@ -449,6 +449,17 @@ def cmd_usage():
@@ -126,7 +128,7 @@ index 44b24d1..bde29a4 100755
      {EXECUTABLE_NAME} help
          Show this text.
      {EXECUTABLE_NAME} version
-@@ -1613,6 +1624,394 @@ def cmd_git(argv):
+@@ -1613,6 +1624,402 @@ def cmd_git(argv):
      else:
          die("Error: the password store is not a git repository. Try \"pass git init\".")
  
@@ -365,9 +367,12 @@ index 44b24d1..bde29a4 100755
 +    try:
 +        bundle, message = os.path.join(tmpdir, 'bundle'), os.path.join(tmpdir, 'message')
 +        sync_git('bundle', 'create', '--version=2', bundle, sync_ref(name))
-+        command = [GPG, '--batch', '--yes', '--quiet', '--no-encrypt-to', '--compress-algo', 'none',
-+                   '--trust-model', 'always', '--local-user', config['key'] + '!', '--sign', '--encrypt',
-+                   '--recipient', config['key']]
++        # SHA-512 said out loud: left to itself gpg can fall back to SHA-1 for a recipient key that
++        # states no preference, and a careful reader refuses that.
++        command = [GPG] + PASSWORD_STORE_GPG_OPTS + [
++            '--batch', '--yes', '--quiet', '--no-encrypt-to', '--compress-algo', 'none', '--digest-algo', 'SHA512',
++            '--trust-model', 'always', '--local-user', config['key'] + '!', '--sign', '--encrypt',
++            '--recipient', config['key']]
 +        for fingerprint in config['peers'].values():
 +            command += ['--recipient', fingerprint]
 +        result = subprocess.run(command + ['--output', message, bundle], stderr=subprocess.PIPE, text=True)
@@ -388,8 +393,10 @@ index 44b24d1..bde29a4 100755
 +    if not os.path.isfile(message) or os.path.getsize(message) > SYNC_MAX_FILE_SIZE:
 +        return f"{name}: REFUSED, its file is larger than {SYNC_MAX_FILE_SIZE // (1024 * 1024)} MiB"
 +    # --status-fd is the only thing to believe: one valid signature, made by this device's key.
-+    result = subprocess.run([GPG, '--batch', '--yes', '--quiet', '--status-fd', '1', '--output', bundle,
-+                             '--decrypt', message], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    # --max-output: anyone can encrypt to our key, so what comes out is bounded before any signature counts.
++    result = subprocess.run([GPG] + PASSWORD_STORE_GPG_OPTS + [
++        '--batch', '--yes', '--quiet', '--status-fd', '1', '--max-output', str(SYNC_MAX_FILE_SIZE),
++        '--output', bundle, '--decrypt', message], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 +    status = [line.split(' ')[1:] for line in result.stdout.splitlines() if line.startswith('[GNUPG:] ')]
 +    valid = [fields for fields in status if fields[0] == 'VALIDSIG']
 +    bad = [fields[0] for fields in status if fields[0] in ('BADSIG', 'ERRSIG', 'EXPSIG', 'EXPKEYSIG', 'REVKEYSIG')]
@@ -398,6 +405,8 @@ index 44b24d1..bde29a4 100755
 +    if bad or len(valid) != 1 or valid[0][-1] != fingerprint:
 +        signer = valid[0][-1] if len(valid) == 1 and not bad else 'nobody we can check'
 +        return f"{name}: REFUSED, its file is signed by {signer}, not by its key {fingerprint}"
++    if valid[0][8] not in ('8', '9', '10'):  # SHA-256, SHA-384, SHA-512
++        return f"{name}: REFUSED, its file is signed with a weak digest (algorithm {valid[0][8]})"
 +    published = time.strftime('%Y-%m-%d %H:%M', time.localtime(int(valid[0][3])))
 +
 +    references, prerequisites = sync_bundle_references(bundle)
@@ -477,7 +486,8 @@ index 44b24d1..bde29a4 100755
 +            f.write('*.gpg diff=pass-sync\n')
 +        subprocess.run(['git', '-C', PASSWORD_STORE_DIR, '-c', f'core.attributesFile={attributes}',
 +                        '-c', 'diff.pass-sync.binary=true',
-+                        '-c', f'diff.pass-sync.textconv={GPG} --decrypt --quiet --yes --batch',
++                        '-c', 'diff.pass-sync.textconv=' + ' '.join(
++                            [GPG] + PASSWORD_STORE_GPG_OPTS + ['--decrypt', '--quiet', '--yes', '--batch']),
 +                        'diff', '--no-renames', 'HEAD', tip], check=False)
 +    finally:
 +        shutil.rmtree(tmpdir, ignore_errors=True)
@@ -521,7 +531,7 @@ index 44b24d1..bde29a4 100755
  def main():
      """Main function."""
      set_umask()
-@@ -1652,6 +2051,8 @@ def main():
+@@ -1652,6 +2059,8 @@ def main():
          cmd_copy_move("copy", sys.argv[2:])
      elif command == "git":
          cmd_git(sys.argv[2:])
@@ -530,7 +540,7 @@ index 44b24d1..bde29a4 100755
      else:
          # Not found - Use show command by default
          cmd_show([command] + sys.argv[2:])
-@@ -1667,3 +2068,7 @@ if __name__ == "__main__":
+@@ -1667,3 +2076,7 @@ if __name__ == "__main__":
      except KeyboardInterrupt:
          print("", file=sys.stderr)
          sys.exit(130)
@@ -540,10 +550,10 @@ index 44b24d1..bde29a4 100755
 +        sys.exit(141)
 diff --git a/test_tricks/additional-tests/u0008-sync-tests.sh b/test_tricks/additional-tests/u0008-sync-tests.sh
 new file mode 100755
-index 0000000..c6e31dc
+index 0000000..a29b3a3
 --- /dev/null
 +++ b/test_tricks/additional-tests/u0008-sync-tests.sh
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,232 @@
 +#!/usr/bin/env bash
 +
 +test_description='Test sync: trading the store with another device through a drop zone'
@@ -621,6 +631,7 @@ index 0000000..c6e31dc
 +	test "$(ls "$DROP")" = "pc.bundle.gpg" &&
 +	$GPG --batch --yes --quiet --status-fd 3 --output pc.bundle --decrypt "$DROP/pc.bundle.gpg" 3>status &&
 +	grep -q "VALIDSIG .* $KEY1\$" status &&
++	grep -q "VALIDSIG [0-9A-F]* [-0-9]* [0-9]* [0-9]* [0-9]* [0-9]* [0-9]* 10 " status &&
 +	test "$(grep -c "ENC_TO" status)" = 2 &&
 +	test "$(env -u GIT_DIR -u GIT_WORK_TREE git bundle list-heads pc.bundle)" = "$(head_of) refs/pass-sync/pc" &&
 +	"$PASS" sync status | grep -q "Published: the current state"
@@ -738,6 +749,11 @@ index 0000000..c6e31dc
 +		--output "$DROP/phone.bundle.gpg" &&
 +	test_must_fail "$PASS" sync fetch >out &&
 +	grep -q "REFUSED, its file is signed by nobody" out &&
++	phone_git bundle create --version=2 "$SHARNESS_TRASH_DIRECTORY/whole.bundle" refs/pass-sync/phone &&
++	$GPG --batch --yes --quiet --trust-model always --local-user $KEY2 --digest-algo SHA1 --sign --encrypt \
++		--recipient $KEY1 --output "$DROP/phone.bundle.gpg" "$SHARNESS_TRASH_DIRECTORY/whole.bundle" &&
++	test_must_fail "$PASS" sync fetch >out &&
++	grep -q "REFUSED" out &&
 +	echo "noise" >"$DROP/phone.bundle.gpg" &&
 +	test_must_fail "$PASS" sync fetch >out &&
 +	grep -q "REFUSED, its file does not decrypt" out &&
